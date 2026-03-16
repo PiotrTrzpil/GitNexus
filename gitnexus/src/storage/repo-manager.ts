@@ -64,6 +64,7 @@ export const getStoragePaths = (repoPath: string) => {
     storagePath,
     kuzuPath: path.join(storagePath, 'kuzu'),
     metaPath: path.join(storagePath, 'meta.json'),
+    fileHashPath: path.join(storagePath, 'file-hashes.json'),
   };
 };
 

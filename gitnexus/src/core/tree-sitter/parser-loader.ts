@@ -8,14 +8,16 @@ import CPP from 'tree-sitter-cpp';
 import CSharp from 'tree-sitter-c-sharp';
 import Go from 'tree-sitter-go';
 import Rust from 'tree-sitter-rust';
-import Kotlin from 'tree-sitter-kotlin';
 import PHP from 'tree-sitter-php';
 import Ruby from 'tree-sitter-ruby';
 import { createRequire } from 'node:module';
 import { SupportedLanguages } from '../../config/supported-languages.js';
 
-// tree-sitter-swift is an optionalDependency — may not be installed
 const _require = createRequire(import.meta.url);
+
+// Optional native bindings — may not have prebuilt binaries for all Node ABI versions
+let Kotlin: any = null;
+try { Kotlin = _require('tree-sitter-kotlin'); } catch {}
 let Swift: any = null;
 try { Swift = _require('tree-sitter-swift'); } catch {}
 

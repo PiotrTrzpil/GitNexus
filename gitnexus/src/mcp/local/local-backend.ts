@@ -19,6 +19,9 @@ import {
 } from '../../storage/repo-manager.js';
 // AI context generation is CLI-only (gitnexus analyze)
 // import { generateAIContextFiles } from '../../cli/ai-context.js';
+import { diffFile } from '../../core/diff/semantic-differ.js';
+import { planCommits, type CouplingEdge, type FileChangeSummary } from '../../core/diff/commit-planner.js';
+import { readSourceWithContext, readFileLines, formatWithLineNumbers } from '../source-reader.js';
 
 /**
  * Quick test-file detection for filtering impact results.
@@ -46,7 +49,7 @@ export const VALID_NODE_LABELS = new Set([
 ]);
 
 /** Valid relation types for impact analysis filtering */
-export const VALID_RELATION_TYPES = new Set(['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS']);
+export const VALID_RELATION_TYPES = new Set(['CALLS', 'HTTP_CALLS', 'ASYNC_CALLS', 'EMITS', 'SUBSCRIBES_TO', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS']);
 
 /** Regex to detect write operations in user-supplied Cypher queries */
 export const CYPHER_WRITE_RE = /\b(CREATE|DELETE|SET|MERGE|REMOVE|DROP|ALTER|COPY|DETACH)\b/i;
@@ -54,6 +57,57 @@ export const CYPHER_WRITE_RE = /\b(CREATE|DELETE|SET|MERGE|REMOVE|DROP|ALTER|COP
 /** Check if a Cypher query contains write operations */
 export function isWriteQuery(query: string): boolean {
   return CYPHER_WRITE_RE.test(query);
+}
+
+/**
+ * Group an array of items by their `filePath` field.
+ *
+ * Smart fallback: if every item comes from a different file (no actual grouping),
+ * returns the flat array as-is with `file` inlined per item.
+ * When items share files, returns `[{file, items: [...]}]`.
+ *
+ * Port of codebase-memory-mcp's groupItemsByFile.
+ */
+function groupByFile<T extends Record<string, any>>(
+  items: T[],
+  fileKey = 'filePath',
+): any[] {
+  if (items.length <= 1) return items;
+
+  const groups = new Map<string, T[]>();
+  const order: string[] = [];
+  for (const item of items) {
+    const file = item[fileKey] ?? '';
+    if (!groups.has(file)) {
+      groups.set(file, []);
+      order.push(file);
+    }
+    groups.get(file)!.push(item);
+  }
+
+  // If every item is from a different file, flat list is more compact
+  if (groups.size === items.length) return items;
+
+  return order.map(file => {
+    const fileItems = groups.get(file)!;
+    // Strip redundant filePath from each item since it's on the group
+    const cleaned = fileItems.map(item => {
+      const { [fileKey]: _, ...rest } = item;
+      return rest;
+    });
+    return { file, items: cleaned };
+  });
+}
+
+/**
+ * Extract the logical label from a GitNexus node ID.
+ * IDs are formatted as "Label:path:name:line" — the prefix before the first ":" is the label.
+ * KuzuDB's labels(n)[0] returns the table name (always "CodeElement" etc.), not the logical label.
+ */
+function extractLabelFromQn(qn: string): string {
+  if (!qn) return '';
+  const colonIdx = qn.indexOf(':');
+  return colonIdx > 0 ? qn.slice(0, colonIdx) : '';
 }
 
 /** Structured error logging for query failures — replaces empty catch blocks */
@@ -288,6 +342,12 @@ export class LocalBackend {
   // ─── Tool Dispatch ───────────────────────────────────────────────
 
   async callTool(method: string, params: any): Promise<any> {
+    if (method === 'set_output_format') {
+      const { setOutputFormat } = await import('../output-format.js');
+      const fmt = setOutputFormat(params?.format);
+      return `Output format set to ${fmt}`;
+    }
+
     if (method === 'list_repos') {
       return this.listRepos();
     }
@@ -310,6 +370,18 @@ export class LocalBackend {
         return this.detectChanges(repo, params);
       case 'rename':
         return this.rename(repo, params);
+      case 'semantic_diff':
+        return this.semanticDiff(repo, params);
+      case 'plan_commits':
+        return this.planCommits(repo, params);
+      case 'get_code_snippet':
+        return this.getCodeSnippet(repo, params);
+      case 'search_code':
+        return this.searchCode(repo, params);
+      case 'search_graph':
+        return this.searchGraph(repo, params);
+      case 'get_architecture':
+        return this.getArchitecture(repo, params);
       // Legacy aliases for backwards compatibility
       case 'search':
         return this.query(repo, params);
@@ -320,6 +392,406 @@ export class LocalBackend {
       default:
         throw new Error(`Unknown tool: ${method}`);
     }
+  }
+
+  // ─── Semantic Diff ───────────────────────────────────────────────
+
+  private async semanticDiff(repo: RepoHandle, params: {
+    file_paths?: string[];
+    ref?: string;
+    breaking_only?: boolean;
+  }): Promise<any> {
+    const ref = params.ref ?? 'HEAD';
+    const breakingOnly = params.breaking_only ?? false;
+
+    // Determine files to diff: explicit list or all changed files via git
+    let filePaths: string[] = params.file_paths ?? [];
+    if (filePaths.length === 0) {
+      // Fall back to git diff to find changed files
+      try {
+        const { execSync } = await import('child_process');
+        const raw = execSync('git diff --name-only HEAD', { cwd: repo.repoPath }).toString();
+        filePaths = raw.split('\n').map(l => l.trim()).filter(Boolean)
+          .map(rel => path.join(repo.repoPath, rel));
+      } catch (err) {
+        console.warn(`[semanticDiff] git diff failed for ${repo.repoPath}: ${(err as Error).message}`);
+        filePaths = [];
+      }
+    }
+
+    if (filePaths.length === 0) {
+      return { changes: [], summary: { total: 0, breaking: 0, byKind: {} } };
+    }
+
+    const allChanges = [];
+    for (const fp of filePaths) {
+      try {
+        const fileChanges = await diffFile(repo.repoPath, fp, 'M', ref);
+        allChanges.push(...fileChanges);
+      } catch {
+        // Non-fatal: skip unparseable or new files
+      }
+    }
+
+    const filtered = breakingOnly ? allChanges.filter(c => c.isBreaking) : allChanges;
+
+    const byKind: Record<string, number> = {};
+    for (const c of filtered) {
+      byKind[c.kind] = (byKind[c.kind] ?? 0) + 1;
+    }
+
+    return {
+      changes: filtered,
+      summary: {
+        total: filtered.length,
+        breaking: filtered.filter(c => c.isBreaking).length,
+        byKind,
+      },
+    };
+  }
+
+  // ─── Commit Planning ─────────────────────────────────────────────
+
+  private async planCommits(repo: RepoHandle, params: {
+    ref?: string;
+    scope?: 'unstaged' | 'staged' | 'all';
+  }): Promise<any> {
+    const ref = params.ref ?? 'HEAD';
+
+    // Get changed files for the chosen scope
+    let filePaths: string[] = [];
+    try {
+      const { execSync } = await import('child_process');
+      const scope = params.scope ?? 'unstaged';
+      let gitCmd: string;
+      if (scope === 'staged') {
+        gitCmd = 'git diff --cached --name-only';
+      } else if (scope === 'all') {
+        gitCmd = 'git diff HEAD --name-only';
+      } else {
+        gitCmd = 'git diff --name-only';
+      }
+      const raw = execSync(gitCmd, { cwd: repo.repoPath }).toString();
+      filePaths = raw.split('\n').map(l => l.trim()).filter(Boolean)
+        .map(rel => path.join(repo.repoPath, rel));
+    } catch (err) {
+      console.warn(`[planCommits] git diff failed for ${repo.repoPath}: ${(err as Error).message}`);
+      filePaths = [];
+    }
+
+    if (filePaths.length === 0) {
+      return { groups: [], ungrouped: [] };
+    }
+
+    // Collect symbol changes via semantic diff, grouped by file
+    const fileSummaries: FileChangeSummary[] = [];
+    for (const fp of filePaths) {
+      try {
+        const fileChanges = await diffFile(repo.repoPath, fp, 'M', ref);
+        if (fileChanges.length > 0) {
+          fileSummaries.push({ path: fp, changes: fileChanges });
+        }
+      } catch {
+        // Non-fatal: skip unparseable files
+      }
+    }
+
+    if (fileSummaries.length === 0) {
+      return { groups: [], ungrouped: [] };
+    }
+
+    // Fetch call graph edges for coupling signal
+    let couplings: CouplingEdge[] = [];
+    try {
+      await this.ensureInitialized(repo.id);
+      const rows = await this.cypher(repo, {
+        query: `MATCH (a)-[r:CodeRelation {type: 'CALLS'}]->(b) WHERE r.confidence >= 0.7 RETURN a.id AS sourceQN, b.id AS targetQN LIMIT 2000`,
+      });
+      couplings = (rows as any[]).map((r: any) => ({ fromQN: r.sourceQN, toQN: r.targetQN, type: 'CALLS' }));
+    } catch {
+      // Non-fatal: plan without graph edges
+    }
+
+    return planCommits(fileSummaries, couplings);
+  }
+
+  // ─── Code Snippet ─────────────────────────────────────────────────
+
+  private async getCodeSnippet(repo: RepoHandle, params: {
+    qualified_name: string;
+    context_lines?: number;
+    include_neighbors?: boolean;
+    repo?: string;
+  }): Promise<any> {
+    if (!params.qualified_name?.trim()) {
+      return { error: 'qualified_name parameter is required and cannot be empty.' };
+    }
+
+    await this.ensureInitialized(repo.id);
+
+    const qn = params.qualified_name.trim();
+    const contextLines = params.context_lines ?? 3;
+    const includeNeighbors = params.include_neighbors ?? false;
+
+    // Shared node fetch query
+    const nodeSelectClause = `
+      RETURN n.id AS qn, n.name AS name, labels(n)[0] AS label,
+             n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine,
+             n.description AS description
+      LIMIT 10
+    `;
+
+    // Tier 1: Exact QN match
+    let rows: any[] = [];
+    let matchMethod: string = 'exact_qn';
+    try {
+      rows = await executeParameterized(repo.id,
+        `MATCH (n) WHERE n.id = $qn ${nodeSelectClause}`,
+        { qn });
+    } catch (e) { logQueryError('get_code_snippet:exact_qn', e); }
+
+    // Tier 2: QN suffix match
+    if (rows.length === 0) {
+      matchMethod = 'qn_suffix';
+      const suffix = qn.startsWith('.') ? qn : `.${qn}`;
+      try {
+        rows = await executeParameterized(repo.id,
+          `MATCH (n) WHERE n.id ENDS WITH $suffix ${nodeSelectClause}`,
+          { suffix });
+      } catch (e) { logQueryError('get_code_snippet:qn_suffix', e); }
+    }
+
+    // Tier 3: Name match
+    if (rows.length === 0) {
+      matchMethod = 'name';
+      try {
+        rows = await executeParameterized(repo.id,
+          `MATCH (n) WHERE n.name = $name ${nodeSelectClause}`,
+          { name: qn });
+      } catch (e) { logQueryError('get_code_snippet:name', e); }
+    }
+
+    // Tier 4: Fuzzy suggestions — return top-10 name matches (exclude infrastructure nodes)
+    if (rows.length === 0) {
+      matchMethod = 'suggestions';
+      let suggestions: any[] = [];
+      try {
+        suggestions = await executeParameterized(repo.id,
+          `MATCH (n) WHERE n.name CONTAINS $fragment
+           AND NOT labels(n)[0] IN ['File', 'Folder', 'Community', 'Process']
+           RETURN n.id AS qn, n.name AS name, labels(n)[0] AS label, n.filePath AS file
+           LIMIT 10`,
+          { fragment: qn.split('.').pop() ?? qn });
+      } catch (e) { logQueryError('get_code_snippet:suggestions', e); }
+      return {
+        match_method: 'suggestions',
+        alternatives: suggestions.map(r => ({
+          name: r.name ?? r[1],
+          qn: r.qn ?? r[0],
+          label: extractLabelFromQn(r.qn ?? r[0]),
+          file: r.file ?? r[3],
+        })),
+      };
+    }
+
+    // If multiple matches, pick the first but surface alternatives
+    const node = rows[0];
+    const nodeName: string = node.name ?? node[1];
+    const nodeQn: string = node.qn ?? node[0];
+    const nodeLabel: string = extractLabelFromQn(node.qn ?? node[0]);
+    const nodeFilePath: string = node.filePath ?? node[3];
+    const startLine: number = node.startLine ?? node[4];
+    const endLine: number = node.endLine ?? node[5];
+    const description: string | undefined = node.description ?? node[6];
+
+    const alternatives = rows.length > 1
+      ? rows.slice(1).map(r => ({
+          name: r.name ?? r[1],
+          qn: r.qn ?? r[0],
+          label: extractLabelFromQn(r.qn ?? r[0]),
+          file: r.filePath ?? r[3],
+        }))
+      : undefined;
+
+    // Read source from disk
+    let source: string = '';
+    try {
+      const result = await readSourceWithContext(repo.repoPath, nodeFilePath, startLine, endLine, contextLines);
+      if (result) {
+        source = result.source;
+      }
+    } catch (e) { logQueryError('get_code_snippet:read_source', e); }
+
+    // Count callers (inbound CALLS edges)
+    let callers = 0;
+    let callerNames: string[] | undefined;
+    try {
+      const callerRows = await executeParameterized(repo.id,
+        `MATCH (caller)-[r:CodeRelation {type: 'CALLS'}]->(n {id: $qn})
+         RETURN caller.name AS name, COUNT(*) AS cnt`,
+        { qn: nodeQn });
+      callers = callerRows.length;
+      if (includeNeighbors) {
+        callerNames = callerRows.map(r => r.name ?? r[0]).filter(Boolean);
+      }
+    } catch (e) { logQueryError('get_code_snippet:callers', e); }
+
+    // Count callees (outbound CALLS edges)
+    let callees = 0;
+    let calleeNames: string[] | undefined;
+    try {
+      const calleeRows = await executeParameterized(repo.id,
+        `MATCH (n {id: $qn})-[r:CodeRelation {type: 'CALLS'}]->(callee)
+         RETURN callee.name AS name, COUNT(*) AS cnt`,
+        { qn: nodeQn });
+      callees = calleeRows.length;
+      if (includeNeighbors) {
+        calleeNames = calleeRows.map(r => r.name ?? r[0]).filter(Boolean);
+      }
+    } catch (e) { logQueryError('get_code_snippet:callees', e); }
+
+    return {
+      name: nodeName,
+      qn: nodeQn,
+      label: nodeLabel,
+      file: nodeFilePath,
+      lines: `${startLine}-${endLine}`,
+      source,
+      ...(description ? { description } : {}),
+      callers,
+      callees,
+      ...(includeNeighbors && callerNames ? { caller_names: callerNames } : {}),
+      ...(includeNeighbors && calleeNames ? { callee_names: calleeNames } : {}),
+      match_method: matchMethod,
+      ...(alternatives ? { alternatives } : {}),
+    };
+  }
+
+  /**
+   * search_code — text/regex search across indexed files.
+   *
+   * 1. Fetches indexed file paths from KuzuDB (File nodes)
+   * 2. Optionally filters by file_pattern glob (supports * and ?)
+   * 3. Reads each file from disk line-by-line
+   * 4. Matches via RegExp or string.includes()
+   * 5. Paginates results and attaches context lines
+   */
+  private async searchCode(repo: RepoHandle, params: {
+    pattern: string;
+    file_pattern?: string;
+    max_results?: number;
+    offset?: number;
+    context_lines?: number;
+    regex?: boolean;
+    case_sensitive?: boolean;
+    repo?: string;
+  }): Promise<any> {
+    if (!params.pattern?.trim()) {
+      return { error: 'pattern parameter is required and cannot be empty.' };
+    }
+
+    await this.ensureInitialized(repo.id);
+
+    const pattern = params.pattern.trim();
+    const limit = Math.min(params.max_results ?? 20, 100);
+    const offset = params.offset ?? 0;
+    const contextLines = params.context_lines ?? 2;
+    const useRegex = params.regex ?? false;
+    const caseSensitive = params.case_sensitive ?? true;
+
+    // Build matcher function
+    let matcher: (line: string) => boolean;
+    if (useRegex) {
+      const flags = caseSensitive ? '' : 'i';
+      let re: RegExp;
+      try {
+        re = new RegExp(pattern, flags);
+      } catch (e) {
+        return { error: `Invalid regex: ${(e as Error).message}` };
+      }
+      matcher = (line: string) => re.test(line);
+    } else if (caseSensitive) {
+      matcher = (line: string) => line.includes(pattern);
+    } else {
+      const lower = pattern.toLowerCase();
+      matcher = (line: string) => line.toLowerCase().includes(lower);
+    }
+
+    // Get indexed file paths from KuzuDB
+    let filePaths: string[] = [];
+    try {
+      const rows = await executeQuery(repo.id, `MATCH (f:File) RETURN f.filePath AS fp`);
+      filePaths = rows.map((r: any) => r.fp ?? r[0]).filter(Boolean);
+    } catch (e) {
+      logQueryError('search_code:file-list', e);
+      return { error: 'Failed to retrieve indexed file list.' };
+    }
+
+    // Exclude non-source files by default (docs, configs, generated files)
+    const NON_SOURCE_EXTENSIONS = new Set(['.md', '.txt', '.json', '.yaml', '.yml', '.toml', '.lock', '.csv', '.svg', '.html', '.css']);
+    filePaths = filePaths.filter(p => {
+      const dot = p.lastIndexOf('.');
+      if (dot < 0) return true;
+      return !NON_SOURCE_EXTENSIONS.has(p.slice(dot).toLowerCase());
+    });
+
+    // Filter by file_pattern if provided
+    if (params.file_pattern) {
+      const fp = params.file_pattern;
+      // Convert simple glob to regex: * → .*, ? → .
+      const globRe = new RegExp('^' + fp.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$');
+      filePaths = filePaths.filter(p => {
+        const basename = p.split('/').pop() ?? p;
+        return globRe.test(p) || globRe.test(basename);
+      });
+    }
+
+    // Scan files — collect all matches, then paginate
+    const allMatches: Array<{ file: string; line: number; content: string; lines: string[] }> = [];
+
+    for (const filePath of filePaths) {
+      const lines = await readFileLines(repo.repoPath, filePath);
+      if (!lines) continue;
+
+      for (let i = 0; i < lines.length; i++) {
+        if (matcher(lines[i])) {
+          allMatches.push({
+            file: filePath,
+            line: i + 1,
+            content: lines[i].trimEnd().slice(0, 200),
+            lines, // keep ref for context extraction
+          });
+        }
+      }
+    }
+
+    const totalMatches = allMatches.length;
+    const page = allMatches.slice(offset, offset + limit);
+
+    // Build response matches with optional context lines
+    const matches = page.map(m => {
+      const entry: any = {
+        file: m.file,
+        line: m.line,
+        content: m.content,
+      };
+      if (contextLines > 0) {
+        const firstCtx = Math.max(0, m.line - 1 - contextLines);
+        const lastCtx = Math.min(m.lines.length, m.line + contextLines);
+        const slice = m.lines.slice(firstCtx, lastCtx);
+        entry.context = formatWithLineNumbers(slice, firstCtx + 1).split('\n');
+      }
+      return entry;
+    });
+
+    return {
+      pattern,
+      total_matches: totalMatches,
+      limit,
+      offset,
+      has_more: offset + limit < totalMatches,
+      matches,
+    };
   }
 
   // ─── Tool Implementations ────────────────────────────────────────
@@ -431,6 +903,7 @@ export class LocalBackend {
 
       // Optionally fetch content
       let content: string | undefined;
+      let diskSource: string | undefined;
       if (includeContent) {
         try {
           const contentRows = await executeParameterized(repo.id, `
@@ -441,6 +914,16 @@ export class LocalBackend {
             content = contentRows[0].content ?? contentRows[0][0];
           }
         } catch (e) { logQueryError('query:content-fetch', e); }
+
+        // Also read disk-fresh source with context lines
+        if (sym.filePath && sym.startLine != null && sym.endLine != null) {
+          try {
+            const diskResult = await readSourceWithContext(repo.repoPath, sym.filePath, sym.startLine, sym.endLine, 2);
+            if (diskResult) {
+              diskSource = diskResult.source;
+            }
+          } catch (e) { logQueryError('query:disk-source', e); }
+        }
       }
 
       const symbolEntry = {
@@ -452,6 +935,7 @@ export class LocalBackend {
         endLine: sym.endLine,
         ...(module ? { module } : {}),
         ...(includeContent && content ? { content } : {}),
+        ...(includeContent && diskSource ? { source: diskSource } : {}),
       };
       
       if (processRows.length === 0) {
@@ -528,8 +1012,8 @@ export class LocalBackend {
     
     return {
       processes,
-      process_symbols: dedupedSymbols,
-      definitions: definitions.slice(0, 20), // cap standalone definitions
+      process_symbols: groupByFile(dedupedSymbols),
+      definitions: groupByFile(definitions.slice(0, 20)), // cap standalone definitions
     };
   }
 
@@ -883,14 +1367,43 @@ export class LocalBackend {
       };
     }
     
-    // Step 3: Build full context
+    // Step 3: Class/Interface hint — redirect to methods
     const sym = symbols[0];
     const symId = sym.id || sym[0];
+    const symKind = extractLabelFromQn(symId);
+
+    if (symKind === 'Class' || symKind === 'Interface') {
+      try {
+        const methodRows = await executeParameterized(repo.id, `
+          MATCH (n {id: $symId})-[r:CodeRelation {type: 'HAS_METHOD'}]->(m)
+          RETURN m.name AS name, m.id AS uid, labels(m)[0] AS kind, m.startLine AS line
+          ORDER BY m.startLine
+          LIMIT 30
+        `, { symId });
+        if (methodRows.length > 0) {
+          const methods = methodRows.map((r: any) => ({
+            name: r.name || r[0],
+            uid: r.uid || r[1],
+            kind: r.kind || r[2],
+            line: r.line || r[3],
+          }));
+          return {
+            status: 'class_node',
+            message: `${sym.name || sym[1]} is a ${symKind} — context/impact work best on functions/methods. Use one of its methods:`,
+            file: sym.filePath || sym[3],
+            methods,
+          };
+        }
+      } catch (e) { logQueryError('context:class-methods', e); }
+      // Fall through to normal context if no methods found
+    }
+
+    // Step 4: Build full context
 
     // Categorized incoming refs
     const incomingRows = await executeParameterized(repo.id, `
       MATCH (caller)-[r:CodeRelation]->(n {id: $symId})
-      WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS']
+      WHERE r.type IN ['CALLS', 'HTTP_CALLS', 'ASYNC_CALLS', 'EMITS', 'SUBSCRIBES_TO', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS']
       RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
       LIMIT 30
     `, { symId });
@@ -898,7 +1411,7 @@ export class LocalBackend {
     // Categorized outgoing refs
     const outgoingRows = await executeParameterized(repo.id, `
       MATCH (n {id: $symId})-[r:CodeRelation]->(target)
-      WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS']
+      WHERE r.type IN ['CALLS', 'HTTP_CALLS', 'ASYNC_CALLS', 'EMITS', 'SUBSCRIBES_TO', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS']
       RETURN r.type AS relType, target.id AS uid, target.name AS name, target.filePath AS filePath, labels(target)[0] AS kind
       LIMIT 30
     `, { symId });
@@ -912,19 +1425,24 @@ export class LocalBackend {
       `, { symId });
     } catch (e) { logQueryError('context:process-participation', e); }
     
-    // Helper to categorize refs
+    // Helper to categorize refs and group by file within each category
     const categorize = (rows: any[]) => {
       const cats: Record<string, any[]> = {};
       for (const row of rows) {
         const relType = (row.relType || row[0] || '').toLowerCase();
+        const uid = row.uid || row[1];
         const entry = {
-          uid: row.uid || row[1],
+          uid,
           name: row.name || row[2],
           filePath: row.filePath || row[3],
-          kind: row.kind || row[4],
+          kind: extractLabelFromQn(uid),
         };
         if (!cats[relType]) cats[relType] = [];
         cats[relType].push(entry);
+      }
+      // Group each category's items by file
+      for (const key of Object.keys(cats)) {
+        cats[key] = groupByFile(cats[key]);
       }
       return cats;
     };
@@ -1143,7 +1661,7 @@ export class LocalBackend {
         changed_files: changedFiles.length,
         risk_level: risk,
       },
-      changed_symbols: changedSymbols,
+      changed_symbols: groupByFile(changedSymbols),
       affected_processes: Array.from(affectedProcesses.values()),
     };
   }
@@ -1321,6 +1839,7 @@ export class LocalBackend {
     relationTypes?: string[];
     includeTests?: boolean;
     minConfidence?: number;
+    include_content?: boolean;
   }): Promise<any> {
     await this.ensureInitialized(repo.id);
     
@@ -1328,8 +1847,8 @@ export class LocalBackend {
     const maxDepth = params.maxDepth || 3;
     const rawRelTypes = params.relationTypes && params.relationTypes.length > 0
       ? params.relationTypes.filter(t => VALID_RELATION_TYPES.has(t))
-      : ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS'];
-    const relationTypes = rawRelTypes.length > 0 ? rawRelTypes : ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS'];
+      : ['CALLS', 'HTTP_CALLS', 'ASYNC_CALLS', 'EMITS', 'SUBSCRIBES_TO', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS'];
+    const relationTypes = rawRelTypes.length > 0 ? rawRelTypes : ['CALLS', 'HTTP_CALLS', 'ASYNC_CALLS', 'EMITS', 'SUBSCRIBES_TO', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS'];
     const includeTests = params.includeTests ?? false;
     const minConfidence = params.minConfidence ?? 0;
 
@@ -1346,7 +1865,33 @@ export class LocalBackend {
     
     const sym = targets[0];
     const symId = sym.id || sym[0];
-    
+    const symKind = extractLabelFromQn(symId);
+
+    // Class/Interface hint — redirect to methods for better results
+    if (symKind === 'Class' || symKind === 'Interface') {
+      try {
+        const methodRows = await executeParameterized(repo.id, `
+          MATCH (n {id: $symId})-[r:CodeRelation {type: 'HAS_METHOD'}]->(m)
+          RETURN m.name AS name, m.id AS uid, labels(m)[0] AS kind, m.startLine AS line
+          ORDER BY m.startLine
+          LIMIT 30
+        `, { symId });
+        if (methodRows.length > 0) {
+          return {
+            status: 'class_node',
+            message: `${sym.name || sym[1]} is a ${symKind} — impact analysis works best on functions/methods. Use one of its methods:`,
+            file: sym.filePath || sym[3],
+            methods: methodRows.map((r: any) => ({
+              name: r.name || r[0],
+              uid: r.uid || r[1],
+              kind: r.kind || r[2],
+              line: r.line || r[3],
+            })),
+          };
+        }
+      } catch (e) { logQueryError('impact:class-methods', e); }
+    }
+
     const impacted: any[] = [];
     const visited = new Set<string>([symId]);
     let frontier = [symId];
@@ -1417,7 +1962,6 @@ export class LocalBackend {
           WHERE s.id IN [${allIds}]
           RETURN c.heuristicLabel AS name, COUNT(DISTINCT s.id) AS hits
           ORDER BY hits DESC
-          LIMIT 20
         `).catch(() => []),
         d1Ids ? executeQuery(repo.id, `
           MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
@@ -1444,16 +1988,54 @@ export class LocalBackend {
       });
     }
 
-    // Risk scoring
+    // Risk scoring — with explanation of what triggered the level
     const processCount = affectedProcesses.length;
     const moduleCount = affectedModules.length;
     let risk = 'LOW';
+    const riskReasons: string[] = [];
+
+    if (directCount >= 30) riskReasons.push(`${directCount} direct callers`);
+    if (processCount >= 5) riskReasons.push(`${processCount} execution flows affected`);
+    if (moduleCount >= 5) riskReasons.push(`${moduleCount} modules affected`);
+    if (impacted.length >= 200) riskReasons.push(`${impacted.length} total impacted symbols`);
+
     if (directCount >= 30 || processCount >= 5 || moduleCount >= 5 || impacted.length >= 200) {
       risk = 'CRITICAL';
     } else if (directCount >= 15 || processCount >= 3 || moduleCount >= 3 || impacted.length >= 100) {
       risk = 'HIGH';
+      if (directCount >= 15) riskReasons.push(`${directCount} direct callers`);
+      if (processCount >= 3) riskReasons.push(`${processCount} execution flows affected`);
+      if (impacted.length >= 100) riskReasons.push(`${impacted.length} total impacted`);
     } else if (directCount >= 5 || impacted.length >= 30) {
       risk = 'MEDIUM';
+      if (directCount >= 5) riskReasons.push(`${directCount} direct callers`);
+      if (impacted.length >= 30) riskReasons.push(`${impacted.length} total impacted`);
+    }
+
+    // Check if callers are concentrated in one module or spread across many
+    const callerDirs = new Set<string>();
+    for (const item of (grouped[1] || [])) {
+      if (item.filePath) {
+        const parts = item.filePath.split('/');
+        callerDirs.add(parts.slice(0, Math.min(3, parts.length - 1)).join('/'));
+      }
+    }
+    const callerSpread = callerDirs.size;
+
+    // Optionally enrich depth-1 items with disk-fresh source (cap at depth 1 to avoid excessive I/O)
+    if (params.include_content && grouped[1]) {
+      for (const item of grouped[1]) {
+        if (item.filePath && item.startLine != null && item.endLine != null) {
+          try {
+            const diskResult = await readSourceWithContext(repo.repoPath, item.filePath, item.startLine, item.endLine, 2);
+            if (diskResult) {
+              item.source = diskResult.source;
+            } else if (item.content) {
+              item.source = item.content;
+            }
+          } catch (e) { logQueryError('impact:disk-source', e); }
+        }
+      }
     }
 
     return {
@@ -1466,6 +2048,10 @@ export class LocalBackend {
       direction,
       impactedCount: impacted.length,
       risk,
+      risk_reasons: riskReasons.length > 0 ? riskReasons : ['few dependents'],
+      caller_spread: callerSpread <= 1 ? 'concentrated (single module)' :
+        callerSpread <= 3 ? `moderate (${callerSpread} directories)` :
+        `wide (${callerSpread} directories)`,
       summary: {
         direct: directCount,
         processes_affected: processCount,
@@ -1473,7 +2059,9 @@ export class LocalBackend {
       },
       affected_processes: affectedProcesses,
       affected_modules: affectedModules,
-      byDepth: grouped,
+      byDepth: Object.fromEntries(
+        Object.entries(grouped).map(([depth, items]) => [depth, groupByFile(items as any[])])
+      ),
     };
   }
 
@@ -1631,5 +2219,487 @@ export class LocalBackend {
     this.repos.clear();
     this.contextCache.clear();
     this.initializedRepos.clear();
+  }
+
+  // ─── File Watcher Support ─────────────────────────────────────────
+
+  /**
+   * Return repo metadata needed for the file watcher (path + file count).
+   * Used by startMCPServer() to configure adaptive polling intervals.
+   */
+  async getWatchableRepos(): Promise<Array<{ path: string; fileCount: number }>> {
+    const entries = await listRegisteredRepos({ validate: true });
+    return entries.map(e => ({
+      path: e.path,
+      fileCount: e.stats?.files ?? 0,
+    }));
+  }
+
+  /**
+   * Re-run the analysis pipeline for a repo and reload the KuzuDB connection.
+   * Called by the file watcher when changes are detected.
+   */
+  async reindexRepo(repoPath: string): Promise<void> {
+    const { runPipelineFromRepo } = await import('../../core/ingestion/pipeline.js');
+    const { loadGraphToKuzu } = await import('../../core/kuzu/kuzu-adapter.js');
+    const { getStoragePaths, saveMeta, registerRepo } = await import('../../storage/repo-manager.js');
+    const { getCurrentCommit } = await import('../../storage/git.js');
+
+    const resolved = path.resolve(repoPath);
+    const { storagePath } = getStoragePaths(resolved);
+
+    // Close existing KuzuDB connection for this repo so we can reload
+    const handle = [...this.repos.values()].find(h => h.repoPath === resolved);
+    if (handle) {
+      try { await closeKuzu(handle.id); } catch (err) {
+        console.warn(`[reindexRepo] closeKuzu warning for ${resolved}: ${(err as Error).message}`);
+      }
+      this.initializedRepos.delete(handle.id);
+    }
+
+    // Re-run pipeline (no UI progress needed)
+    const result = await runPipelineFromRepo(resolved, () => {});
+
+    // Persist to KuzuDB
+    await loadGraphToKuzu(result.graph, resolved, storagePath);
+
+    // Update meta
+    const meta = {
+      repoPath: resolved,
+      lastCommit: getCurrentCommit(resolved),
+      indexedAt: new Date().toISOString(),
+      stats: {
+        files: result.totalFileCount,
+        nodes: result.graph.nodeCount,
+      },
+    };
+    await saveMeta(storagePath, meta);
+    await registerRepo(resolved, meta);
+  }
+
+  // ─── search_graph ────────────────────────────────────────────────
+
+  /**
+   * Structured graph node search with degree/label/pattern filters.
+   * Translates structured params into a single Cypher query with WHERE clauses.
+   */
+  private async searchGraph(repo: RepoHandle, params: {
+    name_pattern?: string;
+    label?: string;
+    file_pattern?: string;
+    min_degree?: number;
+    max_degree?: number;
+    direction?: 'inbound' | 'outbound' | 'both';
+    sort_by?: 'degree' | 'name';
+    limit?: number;
+    offset?: number;
+    exclude_labels?: string[];
+    exclude_entry_points?: boolean;
+  }): Promise<any> {
+    await this.ensureInitialized(repo.id);
+
+    const limit = Math.min(params.limit ?? 20, 100);
+    const offset = params.offset ?? 0;
+    const direction = params.direction ?? 'both';
+    const sortBy = params.sort_by ?? 'degree';
+    const excludeLabels = params.exclude_labels ?? ['Community', 'Process', 'Folder'];
+
+    // Validate label if provided
+    if (params.label && !VALID_NODE_LABELS.has(params.label)) {
+      return { error: `Invalid label: ${params.label}. Valid labels: ${[...VALID_NODE_LABELS].join(', ')}` };
+    }
+
+    // Build MATCH clause — use specific label if provided, else generic node
+    const matchClause = params.label ? `MATCH (n:\`${params.label}\`)` : 'MATCH (n)';
+
+    // Build WHERE clauses
+    const whereClauses: string[] = [];
+
+    if (params.name_pattern) {
+      whereClauses.push(`n.name =~ $namePattern`);
+    }
+
+    if (params.file_pattern) {
+      whereClauses.push(`n.filePath CONTAINS $filePattern`);
+    }
+
+    if (!params.label && excludeLabels.length > 0) {
+      // Exclude infrastructure labels when no specific label is requested
+      const excluded = excludeLabels
+        .filter(l => VALID_NODE_LABELS.has(l))
+        .map(l => `'${l}'`)
+        .join(', ');
+      if (excluded) {
+        whereClauses.push(`NOT labels(n)[0] IN [${excluded}]`);
+      }
+    }
+
+    if (params.exclude_entry_points) {
+      whereClauses.push(`(n.isEntryPoint IS NULL OR n.isEntryPoint = false)`);
+    }
+
+    const whereStr = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
+
+    // Order clause
+    const orderStr = sortBy === 'name' ? 'ORDER BY name' : 'ORDER BY total_degree DESC';
+
+    const queryParams: Record<string, any> = {};
+    if (params.name_pattern) queryParams.namePattern = params.name_pattern;
+    if (params.file_pattern) queryParams.filePattern = params.file_pattern;
+
+    // Degree filtering and sorting require a two-step approach in KuzuDB:
+    // 1. Fetch candidate nodes that match filters
+    // 2. Compute degrees per node via separate queries
+    // For simplicity, fetch nodes first then compute degrees in JS.
+
+    // Count query for total (without degree filtering — degree filter applied post-hoc)
+    let total = 0;
+    try {
+      const countQuery = `${matchClause} ${whereStr} RETURN COUNT(n) AS cnt`;
+      const countRows = await executeParameterized(repo.id, countQuery, queryParams);
+      total = countRows[0]?.cnt ?? countRows[0]?.[0] ?? 0;
+    } catch (e) { logQueryError('searchGraph:count', e); }
+
+    // Data query — fetch more than needed to allow post-hoc degree filtering
+    const fetchLimit = (params.min_degree !== undefined || params.max_degree !== undefined)
+      ? Math.min(total, 500) : limit + offset;
+    let results: any[] = [];
+    try {
+      const dataQuery = `
+        ${matchClause} ${whereStr}
+        RETURN n.id AS qn, n.name AS name, labels(n)[0] AS label,
+               n.filePath AS file, n.startLine AS startLine, n.endLine AS endLine
+        ${sortBy === 'name' ? 'ORDER BY n.name' : ''}
+        LIMIT ${fetchLimit}
+      `;
+      const rows = await executeParameterized(repo.id, dataQuery, queryParams);
+      const rawResults = await Promise.all(rows.map(async (r: any) => {
+        const qn = r.qn ?? r[0] ?? '';
+        const startLine = r.startLine ?? r[4];
+        const endLine = r.endLine ?? r[5];
+        const lines = (startLine != null && endLine != null)
+          ? `${startLine}-${endLine}`
+          : (startLine != null ? String(startLine) : '');
+
+        // Compute degrees for this node
+        let in_degree = 0, out_degree = 0;
+        try {
+          const degRows = await executeParameterized(repo.id,
+            `MATCH (caller)-[:CodeRelation]->(n {id: $nid}) RETURN COUNT(caller) AS cnt`, { nid: qn });
+          in_degree = degRows[0]?.cnt ?? degRows[0]?.[0] ?? 0;
+        } catch {}
+        try {
+          const degRows = await executeParameterized(repo.id,
+            `MATCH (n {id: $nid})-[:CodeRelation]->(callee) RETURN COUNT(callee) AS cnt`, { nid: qn });
+          out_degree = degRows[0]?.cnt ?? degRows[0]?.[0] ?? 0;
+        } catch {}
+
+        const total_degree = direction === 'inbound' ? in_degree
+          : direction === 'outbound' ? out_degree : in_degree + out_degree;
+
+        if (params.min_degree !== undefined && total_degree < params.min_degree) return null;
+        if (params.max_degree !== undefined && total_degree > params.max_degree) return null;
+
+        return { name: r.name ?? r[1] ?? '', qn, label: extractLabelFromQn(qn),
+          file: r.file ?? r[3] ?? '', lines, in_degree, out_degree, total_degree };
+      }));
+
+      let filtered = rawResults.filter(Boolean) as any[];
+      if (sortBy === 'degree') filtered.sort((a, b) => b.total_degree - a.total_degree);
+      total = filtered.length;
+      results = filtered.slice(offset, offset + limit).map(({ total_degree, ...rest }) => rest);
+    } catch (e) { logQueryError('searchGraph:data', e); }
+
+    return {
+      total,
+      results,
+      has_more: offset + results.length < total,
+    };
+  }
+
+  // ─── get_architecture ────────────────────────────────────────────
+
+  /**
+   * Multi-aspect architecture view via aspect-specific Cypher queries.
+   */
+  private async getArchitecture(repo: RepoHandle, params: {
+    aspects?: string[];
+  }): Promise<any> {
+    await this.ensureInitialized(repo.id);
+
+    const requested = params.aspects ?? ['all'];
+    const all = requested.includes('all');
+    const wants = (aspect: string) => all || requested.includes(aspect);
+
+    const result: Record<string, any> = {};
+
+    if (wants('languages')) {
+      try {
+        // Language derived from file extensions (language property not stored in KuzuDB)
+        const rows = await executeQuery(repo.id, `MATCH (f:File) RETURN f.filePath AS fp`);
+        const extCounts = new Map<string, number>();
+        const extToLang: Record<string, string> = {
+          '.ts': 'TypeScript', '.tsx': 'TypeScript (TSX)', '.js': 'JavaScript', '.jsx': 'JavaScript (JSX)',
+          '.py': 'Python', '.go': 'Go', '.rs': 'Rust', '.java': 'Java', '.kt': 'Kotlin',
+          '.c': 'C', '.cpp': 'C++', '.h': 'C/C++ Header', '.cs': 'C#', '.rb': 'Ruby',
+          '.php': 'PHP', '.swift': 'Swift', '.vue': 'Vue', '.svelte': 'Svelte',
+        };
+        for (const r of rows) {
+          const fp = (r.fp ?? r[0]) as string;
+          const dot = fp.lastIndexOf('.');
+          if (dot < 0) continue;
+          const ext = fp.slice(dot).toLowerCase();
+          const lang = extToLang[ext];
+          if (lang) extCounts.set(lang, (extCounts.get(lang) ?? 0) + 1);
+        }
+        result.languages = [...extCounts.entries()]
+          .sort((a, b) => b[1] - a[1])
+          .map(([language, file_count]) => ({ language, file_count }));
+      } catch (e) {
+        logQueryError('getArchitecture:languages', e);
+        result.languages = [];
+      }
+    }
+
+    if (wants('packages')) {
+      try {
+        const rows = await executeQuery(repo.id, `
+          MATCH (f:File)
+          WHERE f.filePath IS NOT NULL
+          WITH split(f.filePath, '/')[0] AS topDir, COUNT(f) AS fileCount
+          WHERE topDir <> '' AND topDir IS NOT NULL
+          RETURN topDir AS name, fileCount
+          ORDER BY fileCount DESC
+          LIMIT 30
+        `);
+        result.packages = rows.map((r: any) => ({
+          name: r.name ?? r[0],
+          file_count: r.fileCount ?? r[1],
+        }));
+      } catch (e) {
+        logQueryError('getArchitecture:packages', e);
+        result.packages = [];
+      }
+    }
+
+    if (wants('entry_points')) {
+      try {
+        // Real entry points: functions/classes in index/main files, CLI commands, route handlers
+        // Not just "all exported symbols" — that's the public API, not entry points
+        const rows = await executeQuery(repo.id, `
+          MATCH (n) WHERE n.isExported = true
+          AND NOT labels(n)[0] IN ['File', 'Folder', 'Community', 'Process', 'Const']
+          AND (
+            n.filePath ENDS WITH '/index.ts'
+            OR n.filePath ENDS WITH '/main.ts'
+            OR n.filePath ENDS WITH '/index.js'
+            OR n.filePath ENDS WITH '/main.js'
+            OR n.filePath CONTAINS '/cli/'
+            OR n.filePath CONTAINS '/commands/'
+            OR n.filePath CONTAINS '/routes/'
+            OR n.filePath CONTAINS '/handlers/'
+            OR n.filePath CONTAINS '/pages/'
+            OR n.filePath CONTAINS '/views/'
+          )
+          RETURN n.id AS qn, n.name AS name, n.filePath AS filePath
+          LIMIT 30
+        `);
+        result.entry_points = groupByFile(rows.map((r: any) => ({
+          name: r.name ?? r[1],
+          label: extractLabelFromQn(r.qn ?? r[0]),
+          filePath: r.filePath ?? r[2],
+        })));
+      } catch (e) {
+        logQueryError('getArchitecture:entry_points', e);
+        result.entry_points = [];
+      }
+    }
+
+    if (wants('routes')) {
+      try {
+        const rows = await executeQuery(repo.id, `
+          MATCH (n:Route)
+          RETURN n.name AS name, n.filePath AS filePath
+          LIMIT 30
+        `);
+        result.routes = groupByFile(rows.map((r: any) => ({
+          name: r.name ?? r[0],
+          filePath: r.filePath ?? r[1],
+        })));
+      } catch (e) {
+        logQueryError('getArchitecture:routes', e);
+        result.routes = [];
+      }
+    }
+
+    if (wants('hotspots')) {
+      try {
+        // Count inbound CALLS per target, fetch top 40 (we'll split infra vs app)
+        const rows = await executeQuery(repo.id, `
+          MATCH (caller)-[r:CodeRelation {type: 'CALLS'}]->(n)
+          RETURN n.id AS qn, n.name AS name,
+                 n.filePath AS filePath, n.startLine AS startLine,
+                 COUNT(caller) AS caller_count
+          ORDER BY caller_count DESC
+          LIMIT 40
+        `);
+
+        // Classify: infrastructure = called from 5+ distinct directories (shared utility)
+        // Application = callers concentrated in fewer directories (domain coupling)
+        const infra: any[] = [];
+        const app: any[] = [];
+        for (const r of rows) {
+          const qn = r.qn ?? r[0];
+          const name = r.name ?? r[1];
+          const file = r.filePath ?? r[2];
+          const callerCount = r.caller_count ?? r[3];
+          const label = extractLabelFromQn(qn);
+          const entry = { name, label, file, caller_count: callerCount };
+
+          // Heuristic: functions in utility/core/shared paths, or with very generic names
+          const isInfraPath = file && (
+            file.includes('/core/') || file.includes('/utils/') || file.includes('/utilities/') ||
+            file.includes('/helpers/') || file.includes('/lib/') || file.includes('/shared/') ||
+            file.includes('event-bus') || file.includes('logger') || file.includes('log-')
+          );
+
+          if (isInfraPath) {
+            infra.push(entry);
+          } else {
+            app.push(entry);
+          }
+        }
+
+        result.hotspots = {
+          application: app.slice(0, 15),
+          infrastructure: infra.slice(0, 10),
+        };
+      } catch (e) {
+        logQueryError('getArchitecture:hotspots', e);
+        result.hotspots = { application: [], infrastructure: [] };
+      }
+    }
+
+    if (wants('boundaries')) {
+      try {
+        // Directory-based module boundaries — uses file path segments, NOT cluster labels.
+        // Extracts the module directory (2nd or 3rd path segment) as the boundary unit.
+        const rows = await executeQuery(repo.id, `
+          MATCH (a)-[r:CodeRelation {type: 'CALLS'}]->(b)
+          WHERE a.filePath IS NOT NULL AND b.filePath IS NOT NULL
+            AND a.filePath <> b.filePath
+          RETURN a.filePath AS from_file, b.filePath AS to_file
+        `);
+
+        // Derive module from file path: use first 2 significant segments
+        // e.g. "src/game/features/logistics/dispatcher.ts" → "game/features/logistics"
+        // e.g. "src/components/use-renderer/index.ts" → "components/use-renderer"
+        const deriveModule = (fp: string): string => {
+          const parts = fp.split('/');
+          // Skip common prefixes like 'src', 'lib', 'app'
+          const start = (parts[0] === 'src' || parts[0] === 'lib' || parts[0] === 'app') ? 1 : 0;
+          // Take up to 3 segments after prefix for granularity
+          const significant = parts.slice(start, start + 3);
+          // Drop the filename (last segment if it has an extension)
+          if (significant.length > 1 && significant[significant.length - 1].includes('.')) {
+            significant.pop();
+          }
+          return significant.join('/') || parts[0];
+        };
+
+        const pairCounts = new Map<string, number>();
+        for (const row of rows) {
+          const fromFile = (row.from_file ?? row[0]) as string;
+          const toFile = (row.to_file ?? row[1]) as string;
+          const fromMod = deriveModule(fromFile);
+          const toMod = deriveModule(toFile);
+          if (fromMod === toMod) continue; // skip intra-module
+          const key = `${fromMod}\0${toMod}`;
+          pairCounts.set(key, (pairCounts.get(key) ?? 0) + 1);
+        }
+
+        // Filter out test→test and test→source dependencies (noise for architecture analysis)
+        const isTestModule = (mod: string) =>
+          mod.startsWith('tests/') || mod.startsWith('test/') || mod.startsWith('__tests__/') || mod.includes('/test/');
+
+        result.boundaries = [...pairCounts.entries()]
+          .map(([key, count]) => {
+            const [from, to] = key.split('\0');
+            return { from_module: from, to_module: to, call_count: count };
+          })
+          .filter(b => !isTestModule(b.from_module)) // exclude test→anything
+          .sort((a, b) => b.call_count - a.call_count)
+          .slice(0, 30);
+      } catch (e) {
+        logQueryError('getArchitecture:boundaries', e);
+        result.boundaries = [];
+      }
+    }
+
+    if (wants('services')) {
+      try {
+        // Cross-service HTTP/async calls — directory-based module boundaries
+        const rows = await executeQuery(repo.id, `
+          MATCH (a)-[r:CodeRelation]->(b)
+          WHERE r.type IN ['HTTP_CALLS', 'ASYNC_CALLS']
+            AND a.filePath IS NOT NULL AND b.filePath IS NOT NULL
+          RETURN a.filePath AS from_file, b.filePath AS to_file,
+                 r.type AS call_type
+        `);
+
+        const deriveModule = (fp: string): string => {
+          const parts = fp.split('/');
+          const start = (parts[0] === 'src' || parts[0] === 'lib' || parts[0] === 'app') ? 1 : 0;
+          const significant = parts.slice(start, start + 3);
+          if (significant.length > 1 && significant[significant.length - 1].includes('.')) {
+            significant.pop();
+          }
+          return significant.join('/') || parts[0];
+        };
+
+        const pairCounts = new Map<string, { callType: string; count: number }>();
+        for (const row of rows) {
+          const fromMod = deriveModule((row.from_file ?? row[0]) as string);
+          const toMod = deriveModule((row.to_file ?? row[1]) as string);
+          const callType = (row.call_type ?? row[2]) as string;
+          const key = `${fromMod}\0${toMod}\0${callType}`;
+          const entry = pairCounts.get(key);
+          if (entry) entry.count++;
+          else pairCounts.set(key, { callType, count: 1 });
+        }
+
+        result.services = [...pairCounts.entries()]
+          .map(([key, { callType, count }]) => {
+            const parts = key.split('\0');
+            return { from_module: parts[0], to_module: parts[1], call_type: callType, call_count: count };
+          })
+          .sort((a, b) => b.call_count - a.call_count)
+          .slice(0, 30);
+      } catch (e) {
+        logQueryError('getArchitecture:services', e);
+        result.services = [];
+      }
+    }
+
+    if (wants('clusters')) {
+      try {
+        const rows = await executeQuery(repo.id, `
+          MATCH (n)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
+          RETURN c.heuristicLabel AS label, COUNT(n) AS member_count
+          ORDER BY member_count DESC
+        `);
+        result.clusters = rows
+          .map((r: any) => ({
+            label: r.label ?? r[0],
+            member_count: r.member_count ?? r[1],
+          }))
+          .filter((c: any) => c.label && !c.label.startsWith('Cluster_')); // hide unnamed clusters
+      } catch (e) {
+        logQueryError('getArchitecture:clusters', e);
+        result.clusters = [];
+      }
+    }
+
+    return result;
   }
 }

@@ -189,6 +189,7 @@ const processParsingSequential = async (
       else if (captureMap['definition.impl']) nodeLabel = 'Impl';
       else if (captureMap['definition.type']) nodeLabel = 'TypeAlias';
       else if (captureMap['definition.const']) nodeLabel = 'Const';
+      else if (captureMap['definition.error']) nodeLabel = 'Const';
       else if (captureMap['definition.static']) nodeLabel = 'Static';
       else if (captureMap['definition.typedef']) nodeLabel = 'Typedef';
       else if (captureMap['definition.macro']) nodeLabel = 'Macro';

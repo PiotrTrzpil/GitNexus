@@ -9,7 +9,6 @@ import CPP from 'tree-sitter-cpp';
 import CSharp from 'tree-sitter-c-sharp';
 import Go from 'tree-sitter-go';
 import Rust from 'tree-sitter-rust';
-import Kotlin from 'tree-sitter-kotlin';
 import PHP from 'tree-sitter-php';
 import Ruby from 'tree-sitter-ruby';
 import { createRequire } from 'node:module';
@@ -17,8 +16,12 @@ import { SupportedLanguages } from '../../../config/supported-languages.js';
 import { LANGUAGE_QUERIES } from '../tree-sitter-queries.js';
 import { getTreeSitterBufferSize, TREE_SITTER_MAX_BUFFER } from '../constants.js';
 
-// tree-sitter-swift is an optionalDependency — may not be installed
 const _require = createRequire(import.meta.url);
+
+// Optional native bindings — may not have prebuilt for all Node ABI versions
+let Kotlin: any = null;
+try { Kotlin = _require('tree-sitter-kotlin'); } catch {}
+
 let Swift: any = null;
 try { Swift = _require('tree-sitter-swift'); } catch {}
 import { 
@@ -102,6 +105,10 @@ export interface ExtractedCall {
   receiverName?: string;
   /** Resolved type name of the receiver (e.g., 'User' for user.save() when user: User) */
   receiverTypeName?: string;
+  /** Event edge type: 'EMITS' | 'SUBSCRIBES_TO' (set by event pattern detection) */
+  eventType?: string;
+  /** Event/channel name extracted from first string arg (e.g., 'user.created') */
+  eventName?: string;
 }
 
 export interface ExtractedHeritage {
@@ -220,6 +227,7 @@ const getLabelFromCaptures = (captureMap: Record<string, any>): string | null =>
   if (captureMap['definition.impl']) return 'Impl';
   if (captureMap['definition.type']) return 'TypeAlias';
   if (captureMap['definition.const']) return 'Const';
+  if (captureMap['definition.error']) return 'Const'; // Error throws/raises stored as Const nodes with string value
   if (captureMap['definition.static']) return 'Static';
   if (captureMap['definition.typedef']) return 'Typedef';
   if (captureMap['definition.macro']) return 'Macro';
@@ -485,7 +493,43 @@ function findClosureBody(argsNode: any): any | null {
   return null;
 }
 
-/** Extract first string argument from arguments node */
+// ─── Event pattern detection (mirrors call-processor.ts) ─────────────────────
+
+const EMIT_METHODS = new Set([
+  'emit', '$emit', 'fire', 'trigger', 'dispatch', 'send', 'publish',
+  'publishEvent', 'postNotification', 'post', 'notify', 'raise', 'next',
+]);
+
+const SUBSCRIBE_METHODS = new Set([
+  'on', '$on', 'once', '$once', 'addEventListener', 'addListener',
+  'subscribe', 'observe', 'watch', 'listen', 'register',
+  'addObserver', 'connect', 'off', '$off', 'removeEventListener', 'removeListener',
+]);
+
+function classifyEventMethod(calledName: string): string | null {
+  if (EMIT_METHODS.has(calledName)) return 'EMITS';
+  if (SUBSCRIBE_METHODS.has(calledName)) return 'SUBSCRIBES_TO';
+  return null;
+}
+
+/** Extract first string literal argument from a call expression node */
+function extractFirstStringArgFromCall(callNode: any): string {
+  const args = callNode.childForFieldName?.('arguments');
+  if (!args) return '';
+  for (const child of args.namedChildren ?? []) {
+    if (['string', 'string_fragment', 'template_string', 'string_literal',
+         'interpreted_string_literal', 'raw_string_literal'].includes(child.type)) {
+      let text = child.text ?? '';
+      if ((text.startsWith('"') && text.endsWith('"')) ||
+          (text.startsWith("'") && text.endsWith("'"))) text = text.slice(1, -1);
+      if (text.startsWith('`') && text.endsWith('`')) text = text.slice(1, -1);
+      return text;
+    }
+  }
+  return '';
+}
+
+/** Extract first string argument from arguments node (PHP-specific) */
 function extractFirstStringArg(argsNode: any): string | null {
   if (!argsNode) return null;
   for (const child of argsNode.children ?? []) {
@@ -954,6 +998,32 @@ const processFileGroup = (
             // kind === 'call' — fall through to normal call processing below
           }
 
+          // Event pattern interception — emit/on/subscribe BEFORE noise filter
+          const evtType = classifyEventMethod(calledName);
+          if (evtType) {
+            const callNode = captureMap['call'];
+            const eventName = extractFirstStringArgFromCall(callNode);
+            if (eventName) {
+              const sourceId = findEnclosingFunctionId(callNode, file.path)
+                || generateId('File', file.path);
+              const callForm = inferCallForm(callNode, callNameNode);
+              const receiverName = callForm === 'member' ? extractReceiverName(callNameNode) : undefined;
+              const receiverTypeName = receiverName ? typeEnv.lookup(receiverName, callNode) : undefined;
+              result.calls.push({
+                filePath: file.path,
+                calledName,
+                sourceId,
+                argCount: countCallArguments(callNode),
+                ...(callForm !== undefined ? { callForm } : {}),
+                ...(receiverName !== undefined ? { receiverName } : {}),
+                ...(receiverTypeName !== undefined ? { receiverTypeName } : {}),
+                eventType: evtType,
+                eventName,
+              });
+            }
+            continue;
+          }
+
           if (!isBuiltInOrNoise(calledName)) {
             const callNode = captureMap['call'];
             const sourceId = findEnclosingFunctionId(callNode, file.path)
@@ -1027,6 +1097,22 @@ const processFileGroup = (
       const nodeId = generateId(nodeLabel, `${file.path}:${nodeName}`);
 
       let description: string | undefined;
+      // Extract string literal value for Const nodes (string constants + error messages)
+      if (captureMap['string.value']) {
+        let strText = captureMap['string.value'].text || '';
+        // Strip quotes
+        if ((strText.startsWith('"') && strText.endsWith('"')) ||
+            (strText.startsWith("'") && strText.endsWith("'"))) {
+          strText = strText.slice(1, -1);
+        }
+        if (strText.startsWith('`') && strText.endsWith('`')) {
+          strText = strText.slice(1, -1);
+        }
+        if (strText.length > 0 && strText.length <= 500) {
+          const prefix = captureMap['definition.error'] ? 'error: ' : 'value: ';
+          description = prefix + strText;
+        }
+      }
       if (language === SupportedLanguages.PHP) {
         if (nodeLabel === 'Property' && captureMap['definition.property']) {
           description = extractPhpPropertyDescription(nodeName, captureMap['definition.property']) ?? undefined;

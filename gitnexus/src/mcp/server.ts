@@ -26,6 +26,8 @@ import {
 import { GITNEXUS_TOOLS } from './tools.js';
 import type { LocalBackend } from './local/local-backend.js';
 import { getResourceDefinitions, getResourceTemplates, readResource } from './resources.js';
+import { startWatcher } from '../core/watcher/file-watcher.js';
+import { formatResult } from './output-format.js';
 
 /**
  * Next-step hints appended to tool responses.
@@ -167,7 +169,7 @@ export function createMCPServer(backend: LocalBackend): Server {
 
     try {
       const result = await backend.callTool(name, args);
-      const resultText = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+      const resultText = formatResult(result);
       const hint = getNextStepHint(name, args as Record<string, any> | undefined);
 
       return {
@@ -280,11 +282,27 @@ export async function startMCPServer(backend: LocalBackend): Promise<void> {
   const transport = new CompatibleStdioServerTransport();
   await server.connect(transport);
 
+  // ── File watcher ──────────────────────────────────────────────────
+  // Start adaptive polling loop after backend is initialized.
+  // onReindex triggers a pipeline re-run for the changed repo.
+  let stopWatcher: (() => void) | undefined;
+  try {
+    const repos = await backend.getWatchableRepos();
+    if (repos.length > 0) {
+      stopWatcher = startWatcher(repos, {
+        onReindex: (repoPath: string) => backend.reindexRepo(repoPath),
+      });
+    }
+  } catch {
+    // Watcher is optional — non-fatal if it fails to start
+  }
+
   // Graceful shutdown helper
   let shuttingDown = false;
   const shutdown = async () => {
     if (shuttingDown) return;
     shuttingDown = true;
+    try { stopWatcher?.(); } catch {}
     try { await backend.disconnect(); } catch {}
     try { await server.close(); } catch {}
     process.exit(0);

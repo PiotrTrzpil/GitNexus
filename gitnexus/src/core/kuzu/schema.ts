@@ -16,7 +16,9 @@ export const NODE_TABLES = [
   'File', 'Folder', 'Function', 'Class', 'Interface', 'Method', 'CodeElement', 'Community', 'Process',
   // Multi-language support
   'Struct', 'Enum', 'Macro', 'Typedef', 'Union', 'Namespace', 'Trait', 'Impl',
-  'TypeAlias', 'Const', 'Static', 'Property', 'Record', 'Delegate', 'Annotation', 'Constructor', 'Template', 'Module'
+  'TypeAlias', 'Const', 'Static', 'Property', 'Record', 'Delegate', 'Annotation', 'Constructor', 'Template', 'Module',
+  // CBM feature port
+  'Route',
 ] as const;
 export type NodeTableName = typeof NODE_TABLES[number];
 
@@ -26,7 +28,7 @@ export type NodeTableName = typeof NODE_TABLES[number];
 export const REL_TABLE_NAME = 'CodeRelation';
 
 // Valid relation types
-export const REL_TYPES = ['CONTAINS', 'DEFINES', 'IMPORTS', 'CALLS', 'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'OVERRIDES', 'MEMBER_OF', 'STEP_IN_PROCESS'] as const;
+export const REL_TYPES = ['CONTAINS', 'DEFINES', 'IMPORTS', 'CALLS', 'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'OVERRIDES', 'MEMBER_OF', 'STEP_IN_PROCESS', 'FILE_CHANGES_WITH', 'HTTP_CALLS', 'ASYNC_CALLS', 'EMITS', 'SUBSCRIBES_TO'] as const;
 export type RelType = typeof REL_TYPES[number];
 
 // ============================================================================
@@ -164,6 +166,22 @@ CREATE NODE TABLE Process (
 // description: optional metadata (e.g. Eloquent $fillable fields, relationship targets)
 const CODE_ELEMENT_BASE = (name: string) => `
 CREATE NODE TABLE \`${name}\` (
+  id STRING,
+  name STRING,
+  filePath STRING,
+  startLine INT64,
+  endLine INT64,
+  content STRING,
+  description STRING,
+  PRIMARY KEY (id)
+)`;
+
+// ============================================================================
+// ROUTE NODE TABLE (for HTTP route discovery)
+// ============================================================================
+
+export const ROUTE_SCHEMA = `
+CREATE NODE TABLE Route (
   id STRING,
   name STRING,
   filePath STRING,
@@ -364,6 +382,9 @@ CREATE REL TABLE ${REL_TABLE_NAME} (
   FROM \`Constructor\` TO \`Typedef\`,
   FROM \`Template\` TO Community,
   FROM \`Module\` TO Community,
+  FROM Route TO Community,
+  FROM Function TO \`Route\`,
+  FROM Method TO \`Route\`,
   FROM Function TO Process,
   FROM Method TO Process,
   FROM Class TO Process,
@@ -447,6 +468,8 @@ export const NODE_SCHEMA_QUERIES = [
   CONSTRUCTOR_SCHEMA,
   TEMPLATE_SCHEMA,
   MODULE_SCHEMA,
+  // CBM feature port
+  ROUTE_SCHEMA,
 ];
 
 export const REL_SCHEMA_QUERIES = [

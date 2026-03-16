@@ -6,6 +6,7 @@
 import { Command } from 'commander';
 import { createRequire } from 'node:module';
 import { createLazyAction } from './lazy-action.js';
+import { setOutputFormat } from '../mcp/output-format.js';
 
 const _require = createRequire(import.meta.url);
 const pkg = _require('../../package.json');
@@ -77,6 +78,7 @@ program
 
 // ─── Direct Tool Commands (no MCP overhead) ────────────────────────
 // These invoke LocalBackend directly for use in eval, scripts, and CI.
+// All tool commands support --format yaml|json (default: yaml).
 
 program
   .command('query <search_query>')
@@ -86,7 +88,8 @@ program
   .option('-g, --goal <text>', 'What you want to find')
   .option('-l, --limit <n>', 'Max processes to return (default: 5)')
   .option('--content', 'Include full symbol source code')
-  .action(createLazyAction(() => import('./tool.js'), 'queryCommand'));
+  .option('--format <fmt>', 'Output format: yaml (default) or json', 'yaml')
+  .action((query: string, opts: any) => { if (opts.format) setOutputFormat(opts.format); return createLazyAction(() => import('./tool.js'), 'queryCommand')(query, opts); });
 
 program
   .command('context [name]')
@@ -95,7 +98,8 @@ program
   .option('-u, --uid <uid>', 'Direct symbol UID (zero-ambiguity lookup)')
   .option('-f, --file <path>', 'File path to disambiguate common names')
   .option('--content', 'Include full symbol source code')
-  .action(createLazyAction(() => import('./tool.js'), 'contextCommand'));
+  .option('--format <fmt>', 'Output format: yaml (default) or json', 'yaml')
+  .action((name: string, opts: any) => { if (opts.format) setOutputFormat(opts.format); return createLazyAction(() => import('./tool.js'), 'contextCommand')(name, opts); });
 
 program
   .command('impact <target>')
@@ -104,13 +108,15 @@ program
   .option('-r, --repo <name>', 'Target repository')
   .option('--depth <n>', 'Max relationship depth (default: 3)')
   .option('--include-tests', 'Include test files in results')
-  .action(createLazyAction(() => import('./tool.js'), 'impactCommand'));
+  .option('--format <fmt>', 'Output format: yaml (default) or json', 'yaml')
+  .action((target: string, opts: any) => { if (opts.format) setOutputFormat(opts.format); return createLazyAction(() => import('./tool.js'), 'impactCommand')(target, opts); });
 
 program
   .command('cypher <query>')
   .description('Execute raw Cypher query against the knowledge graph')
   .option('-r, --repo <name>', 'Target repository')
-  .action(createLazyAction(() => import('./tool.js'), 'cypherCommand'));
+  .option('--format <fmt>', 'Output format: yaml (default) or json', 'yaml')
+  .action((query: string, opts: any) => { if (opts.format) setOutputFormat(opts.format); return createLazyAction(() => import('./tool.js'), 'cypherCommand')(query, opts); });
 
 // ─── Eval Server (persistent daemon for SWE-bench) ─────────────────
 

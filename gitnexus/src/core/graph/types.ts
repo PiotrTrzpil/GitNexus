@@ -82,6 +82,11 @@ export type RelationshipType =
   | 'HAS_METHOD'
   | 'MEMBER_OF'
   | 'STEP_IN_PROCESS'
+  | 'HTTP_CALLS'
+  | 'ASYNC_CALLS'
+  | 'EMITS'
+  | 'SUBSCRIBES_TO'
+  | 'FILE_CHANGES_WITH'
 
 export interface GraphNode {
   id:  string,

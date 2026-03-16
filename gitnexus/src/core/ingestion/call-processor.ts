@@ -20,9 +20,58 @@ import {
   findEnclosingClassId,
 } from './utils.js';
 import { buildTypeEnv } from './type-env.js';
+import type { RelationshipType } from '../graph/types.js';
 import { getTreeSitterBufferSize } from './constants.js';
 import type { ExtractedCall, ExtractedHeritage, ExtractedRoute, FileConstructorBindings } from './workers/parse-worker.js';
 import { callRouters } from './call-routing.js';
+
+// ─── Event pattern detection ──────────────────────────────────────────────────
+// Detect emit/on/subscribe/dispatch patterns and classify as EMITS or SUBSCRIBES_TO.
+// These method names are in the noise filter (BUILT_IN_NAMES) so they'd normally
+// be skipped — we intercept them before that filter and create typed edges.
+
+const EMIT_METHODS = new Set([
+  'emit', '$emit', 'fire', 'trigger', 'dispatch', 'send', 'publish',
+  'publishEvent', 'postNotification', 'post', 'notify', 'raise',
+  'next',             // RxJS Subject.next()
+]);
+
+const SUBSCRIBE_METHODS = new Set([
+  'on', '$on', 'once', '$once', 'addEventListener', 'addListener',
+  'subscribe', 'observe', 'watch', 'listen', 'register',
+  'addObserver', 'connect',
+  'off', '$off', 'removeEventListener', 'removeListener',  // track unsubscribe too
+]);
+
+function classifyEventMethod(calledName: string): RelationshipType | null {
+  if (EMIT_METHODS.has(calledName)) return 'EMITS';
+  if (SUBSCRIBE_METHODS.has(calledName)) return 'SUBSCRIBES_TO';
+  return null;
+}
+
+/**
+ * Extract the first string literal argument from a call expression AST node.
+ * Returns the unquoted string, or '' if none found.
+ */
+function extractFirstStringArg(callNode: Parser.SyntaxNode): string {
+  const args = callNode.childForFieldName('arguments');
+  if (!args) return '';
+  for (const child of args.namedChildren) {
+    if (['string', 'string_fragment', 'template_string', 'string_literal',
+         'interpreted_string_literal', 'raw_string_literal'].includes(child.type)) {
+      let text = child.text;
+      if ((text.startsWith('"') && text.endsWith('"')) ||
+          (text.startsWith("'") && text.endsWith("'"))) {
+        text = text.slice(1, -1);
+      }
+      if (text.startsWith('`') && text.endsWith('`')) {
+        text = text.slice(1, -1);
+      }
+      return text;
+    }
+  }
+  return '';
+}
 
 /**
  * Walk up the AST from a node to find the enclosing function/method.
@@ -179,9 +228,45 @@ export const processCalls = async (
         }
       }
 
+      // ── Event pattern interception ──────────────────────────────────
+      // Check for emit/on/subscribe/dispatch BEFORE the noise filter,
+      // because these names are in the noise list but carry semantic value.
+      const eventType = classifyEventMethod(calledName);
+      if (eventType) {
+        const callNode: Parser.SyntaxNode = captureMap['call'];
+        const eventName = extractFirstStringArg(callNode);
+        if (eventName) {
+          const enclosingFuncId = findEnclosingFunction(callNode, file.path, ctx);
+          const sourceId = enclosingFuncId || generateId('File', file.path);
+          const relId = generateId(eventType, `${sourceId}:${calledName}:${eventName}`);
+
+          // Resolve the receiver (e.g., the EventEmitter / bus instance)
+          const callForm = inferCallForm(callNode, nameNode);
+          const receiverName = callForm === 'member' ? extractReceiverName(nameNode) : undefined;
+          const receiverTypeName = receiverName && typeEnv ? typeEnv.lookup(receiverName, callNode) : undefined;
+          const resolved = resolveCallTarget({
+            calledName, argCount: countCallArguments(callNode),
+            callForm, receiverTypeName,
+          }, file.path, ctx);
+
+          // Target: resolved callee if found, otherwise the enclosing file
+          const targetId = resolved?.nodeId ?? generateId('File', file.path);
+
+          graph.addRelationship({
+            id: relId,
+            sourceId,
+            targetId,
+            type: eventType,
+            confidence: resolved?.confidence ?? 0.8,
+            reason: `event:${eventName}`,
+          });
+        }
+        return; // handled — don't fall through to noise filter or CALLS
+      }
+
       if (isBuiltInOrNoise(calledName)) return;
 
-      const callNode = captureMap['call'];
+      const callNode: Parser.SyntaxNode = captureMap['call'];
       const callForm = inferCallForm(callNode, nameNode);
       const receiverName = callForm === 'member' ? extractReceiverName(nameNode) : undefined;
       const receiverTypeName = receiverName && typeEnv ? typeEnv.lookup(receiverName, callNode) : undefined;
@@ -199,13 +284,16 @@ export const processCalls = async (
       const sourceId = enclosingFuncId || generateId('File', file.path);
       const relId = generateId('CALLS', `${sourceId}:${calledName}->${resolved.nodeId}`);
 
+      const firstArg = extractFirstStringArg(callNode);
+      const reason = firstArg ? `${resolved.reason}|arg:${firstArg}` : resolved.reason;
+
       graph.addRelationship({
         id: relId,
         sourceId,
         targetId: resolved.nodeId,
         type: 'CALLS',
         confidence: resolved.confidence,
-        reason: resolved.reason,
+        reason,
       });
     });
 
@@ -424,6 +512,20 @@ export const processCallsFromExtracted = async (
 
       const resolved = resolveCallTarget(effectiveCall, effectiveCall.filePath, ctx);
       if (!resolved) continue;
+
+      // Event pattern: use typed edge (EMITS / SUBSCRIBES_TO) with event name
+      if (effectiveCall.eventType && effectiveCall.eventName) {
+        const evtRelId = generateId(effectiveCall.eventType, `${effectiveCall.sourceId}:${effectiveCall.calledName}:${effectiveCall.eventName}`);
+        graph.addRelationship({
+          id: evtRelId,
+          sourceId: effectiveCall.sourceId,
+          targetId: resolved.nodeId,
+          type: effectiveCall.eventType as RelationshipType,
+          confidence: resolved.confidence,
+          reason: `event:${effectiveCall.eventName}`,
+        });
+        continue;
+      }
 
       const relId = generateId('CALLS', `${effectiveCall.sourceId}:${effectiveCall.calledName}->${resolved.nodeId}`);
       graph.addRelationship({

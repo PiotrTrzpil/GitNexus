@@ -75,6 +75,32 @@ export const TYPESCRIPT_QUERIES = `
   (class_heritage
     (implements_clause
       (type_identifier) @heritage.implements))) @heritage.impl
+
+; String constants: const FOO = "bar"
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (string) @string.value)) @definition.const
+
+; Exported string constants: export const FOO = "bar"
+(export_statement
+  declaration: (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name
+      value: (string) @string.value))) @definition.const
+
+; Template string constants
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (template_string) @string.value)) @definition.const
+
+; Error throws: throw new Error("message")
+(throw_statement
+  (new_expression
+    constructor: (identifier) @name
+    arguments: (arguments
+      (string) @string.value))) @definition.error
 `;
 
 // JavaScript queries - works with tree-sitter-javascript
@@ -134,6 +160,32 @@ export const JAVASCRIPT_QUERIES = `
   name: (identifier) @heritage.class
   (class_heritage
     (identifier) @heritage.extends)) @heritage
+
+; String constants: const FOO = "bar"
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (string) @string.value)) @definition.const
+
+; Exported string constants
+(export_statement
+  declaration: (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name
+      value: (string) @string.value))) @definition.const
+
+; Template string constants
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (template_string) @string.value)) @definition.const
+
+; Error throws: throw new Error("message")
+(throw_statement
+  (new_expression
+    constructor: (identifier) @name
+    arguments: (arguments
+      (string) @string.value))) @definition.error
 `;
 
 // Python queries - works with tree-sitter-python
@@ -165,6 +217,19 @@ export const PYTHON_QUERIES = `
   name: (identifier) @heritage.class
   superclasses: (argument_list
     (identifier) @heritage.extends)) @heritage
+
+; String constants: FOO = "bar" (module-level assignment)
+(expression_statement
+  (assignment
+    left: (identifier) @name
+    right: (string) @string.value)) @definition.const
+
+; Error raises: raise ValueError("message")
+(raise_statement
+  (call
+    function: (identifier) @name
+    arguments: (argument_list
+      (string) @string.value))) @definition.error
 `;
 
 // Java queries - works with tree-sitter-java
@@ -258,6 +323,21 @@ export const GO_QUERIES = `
 
 ; Struct literal construction: User{Name: "Alice"}
 (composite_literal type: (type_identifier) @call.name) @call
+
+; String constants: const Foo = "bar" or var Foo = "bar"
+(const_declaration
+  (const_spec
+    name: (identifier) @name
+    value: (expression_list (interpreted_string_literal) @string.value))) @definition.const
+
+; Error returns with string messages: fmt.Errorf("message"), errors.New("message")
+(call_expression
+  function: (selector_expression
+    operand: (identifier)
+    field: (field_identifier) @name)
+  arguments: (argument_list
+    (interpreted_string_literal) @string.value)
+  (#match? @name "^(Errorf|New|Wrap|Wrapf)$")) @definition.error
 `;
 
 // C++ queries - works with tree-sitter-cpp

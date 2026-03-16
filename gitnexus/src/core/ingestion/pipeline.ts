@@ -21,6 +21,11 @@ import { createWorkerPool, WorkerPool } from './workers/worker-pool.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { classifyFiles } from './incremental.js';
+import { loadFileHashes, saveFileHashes } from '../../storage/file-hashes.js';
+import { runHTTPLinking } from './http-linker.js';
+import { passGitCoupling } from './git-coupling.js';
+import { getStoragePaths } from '../../storage/repo-manager.js';
 
 const isDev = process.env.NODE_ENV === 'development';
 
@@ -93,13 +98,43 @@ export const runPipelineFromRepo = async (
       stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
     });
 
+    // ── Phase 2.5: Incremental classification ─────────────────────────
+    // Classify files as changed/unchanged/dependent using content hashing.
+    // On first index all files are classified as changed (full parse).
+    // On subsequent runs only changed + dependent files are re-parsed.
+    const storagePaths = getStoragePaths(repoPath);
+    let incrementalFilePaths: Set<string> | null = null;
+    let currentFileHashes: import('./incremental.js').FileHash[] | null = null;
+    try {
+      const storedHashes = await loadFileHashes(storagePaths.storagePath);
+      const classification = await classifyFiles(repoPath, scannedFiles, storedHashes);
+      currentFileHashes = classification.currentHashes;
+      if (classification.unchangedPaths.length > 0) {
+        // There are unchanged files — run in incremental mode
+        const parseSet = new Set([...classification.changedPaths]);
+        incrementalFilePaths = parseSet;
+        if (isDev) {
+          console.log(`⚡ Incremental: ${classification.changedPaths.length} changed, ${classification.unchangedPaths.length} skipped`);
+        }
+      }
+    } catch (err: any) {
+      if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') {
+        // No stored hashes yet — fall back to full parse
+      } else {
+        throw err;
+      }
+    }
+
     // ── Phase 3+4: Chunked read + parse ────────────────────────────────
     // Group parseable files into byte-budget chunks so only ~20MB of source
     // is in memory at a time. Each chunk is: read → parse → extract → free.
 
     const parseableScanned = scannedFiles.filter(f => {
       const lang = getLanguageFromFilename(f.path);
-      return lang && isLanguageAvailable(lang);
+      if (!lang || !isLanguageAvailable(lang)) return false;
+      // Incremental mode: skip unchanged files that have no dependents
+      if (incrementalFilePaths !== null && !incrementalFilePaths.has(f.path)) return false;
+      return true;
     });
 
     // Warn about files skipped due to unavailable parsers
@@ -322,6 +357,25 @@ export const runPipelineFromRepo = async (
     (importCtx as any).suffixIndex = null;
     (importCtx as any).normalizedFileList = null;
 
+    // ── Phase 4.7: HTTP Route Linking ────────────────────────────────
+    // Discovers cross-service HTTP call → route handler edges.
+    // Runs after all calls and heritage are resolved so the full call graph is available.
+    onProgress({
+      phase: 'parsing',
+      percent: 81,
+      message: 'Linking HTTP routes...',
+      stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
+    });
+
+    try {
+      const httpLinks = await runHTTPLinking(graph, repoPath);
+      if (isDev) {
+        console.log(`🌐 HTTP linking: ${httpLinks.length} cross-service links found`);
+      }
+    } catch {
+      // HTTP linking is optional — non-fatal
+    }
+
     // ── Phase 4.5: Method Resolution Order ──────────────────────────────
     onProgress({
       phase: 'parsing',
@@ -381,6 +435,24 @@ export const runPipelineFromRepo = async (
         reason: 'leiden-algorithm',
       });
     });
+
+    // ── Phase 5.5: Git Change Coupling ────────────────────────────────
+    // Mines git history for co-change pairs and stores FILE_CHANGES_WITH edges.
+    onProgress({
+      phase: 'communities',
+      percent: 93,
+      message: 'Mining git change coupling...',
+      stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
+    });
+
+    try {
+      const edgeCount = await passGitCoupling(repoPath, graph);
+      if (isDev) {
+        console.log(`🔗 Git coupling: ${edgeCount} file co-change edges added`);
+      }
+    } catch {
+      // Git coupling is optional — non-fatal if no git history
+    }
 
     // ── Phase 6: Processes ─────────────────────────────────────────────
     onProgress({
@@ -454,6 +526,15 @@ export const runPipelineFromRepo = async (
     });
 
     astCache.clear();
+
+    // Persist file hashes for incremental indexing on the next run
+    if (currentFileHashes) {
+      try {
+        await saveFileHashes(storagePaths.storagePath, currentFileHashes);
+      } catch {
+        // Non-fatal — worst case next run is a full index
+      }
+    }
 
     return { graph, repoPath, totalFileCount: totalFiles, communityResult, processResult };
   } catch (error) {

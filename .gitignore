@@ -53,6 +53,10 @@ coverage/
 
 # Assets (screenshots, images)
 assets/
+.screenshots/
+
+# Playwright CLI artifacts
+.playwright-cli/
 
 # Generated files (should not be indexed)
 repomix-output*

@@ -15,6 +15,7 @@
  */
 
 import { LocalBackend } from '../mcp/local/local-backend.js';
+import { formatResult } from '../mcp/output-format.js';
 
 let _backend: LocalBackend | null = null;
 
@@ -30,7 +31,7 @@ async function getBackend(): Promise<LocalBackend> {
 }
 
 function output(data: any): void {
-  const text = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
+  const text = formatResult(data);
   // stderr because KuzuDB captures stdout at OS level
   process.stderr.write(text + '\n');
 }
