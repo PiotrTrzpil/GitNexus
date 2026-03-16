@@ -8,12 +8,15 @@ import {
 } from './import-processor.js';
 import { processCalls, processCallsFromExtracted, processRoutesFromExtracted } from './call-processor.js';
 import { processHeritage, processHeritageFromExtracted } from './heritage-processor.js';
+import { processCfgFromExtracted } from './cfg-processor.js';
 import { computeMRO } from './mro-processor.js';
+import { processSemanticEdges } from './semantic-edge-processor.js';
 import { processCommunities } from './community-processor.js';
 import { processProcesses } from './process-processor.js';
 import { createResolutionContext } from './resolution-context.js';
 import { createASTCache } from './ast-cache.js';
 import { PipelineProgress, PipelineResult } from '../../types/pipeline.js';
+import type { ExtractedFieldAccess, ExtractedTypeUsage, ExtractedThrow, ExtractedParameter } from './workers/parse-worker.js';
 import { walkRepositoryPaths, readFileContents } from './filesystem-walker.js';
 import { getLanguageFromFilename } from './utils.js';
 import { isLanguageAvailable } from '../tree-sitter/parser-loader.js';
@@ -209,6 +212,12 @@ export const runPipelineFromRepo = async (
 
     let filesParsedSoFar = 0;
 
+    // Accumulate semantic data across all chunks for the semantic-edges phase
+    const allFieldAccesses: ExtractedFieldAccess[] = [];
+    const allTypeUsages: ExtractedTypeUsage[] = [];
+    const allThrows: ExtractedThrow[] = [];
+    const allParameters: ExtractedParameter[] = [];
+
     // AST cache sized for one chunk (sequential fallback uses it for import/call/heritage)
     const maxChunkFiles = chunks.reduce((max, c) => Math.max(max, c.length), 0);
     astCache = createASTCache(maxChunkFiles);
@@ -254,6 +263,12 @@ export const runPipelineFromRepo = async (
         const chunkBasePercent = 20 + ((filesParsedSoFar / totalParseable) * 62);
 
         if (chunkWorkerData) {
+          // Accumulate semantic extraction data for the semantic-edges phase
+          allFieldAccesses.push(...chunkWorkerData.fieldAccesses);
+          allTypeUsages.push(...chunkWorkerData.typeUsages);
+          allThrows.push(...chunkWorkerData.throws);
+          allParameters.push(...chunkWorkerData.parameters);
+
           // Imports
           await processImportsFromExtracted(graph, allPathObjects, chunkWorkerData.imports, ctx, (current, total) => {
             onProgress({
@@ -307,6 +322,20 @@ export const runPipelineFromRepo = async (
                   percent: Math.round(chunkBasePercent),
                   message: `Resolving routes (chunk ${chunkIdx + 1}/${numChunks})...`,
                   detail: `${current}/${total} routes`,
+                  stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
+                });
+              },
+            ),
+            processCfgFromExtracted(
+              graph,
+              chunkWorkerData.cfgData ?? [],
+              ctx,
+              (current, total) => {
+                onProgress({
+                  phase: 'parsing',
+                  percent: Math.round(chunkBasePercent),
+                  message: `Resolving CFG (chunk ${chunkIdx + 1}/${numChunks})...`,
+                  detail: `${current}/${total} functions`,
                   stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
                 });
               },
@@ -388,6 +417,33 @@ export const runPipelineFromRepo = async (
     if (isDev && mroResult.entries.length > 0) {
       console.log(`🔀 MRO: ${mroResult.entries.length} classes analyzed, ${mroResult.ambiguityCount} ambiguities found, ${mroResult.overrideEdges} OVERRIDES edges`);
     }
+
+    // ── Phase 4.8: Semantic Edges ─────────────────────────────────────
+    // Resolves READS_FIELD, WRITES_FIELD, USES_TYPE, THROWS, and PARAM_OF edges
+    // from data extracted during the parse phase.
+    onProgress({
+      phase: 'semantic-edges',
+      percent: 82,
+      message: 'Resolving semantic edges...',
+      stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
+    });
+
+    await processSemanticEdges(
+      graph,
+      allFieldAccesses,
+      allTypeUsages,
+      allThrows,
+      ctx,
+      (current, total) => {
+        const pct = total > 0 ? current / total : 0;
+        onProgress({
+          phase: 'semantic-edges',
+          percent: Math.round(82 + pct * 2),
+          message: `Resolving semantic edges (${current}/${total})...`,
+          stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
+        });
+      },
+    );
 
     // ── Phase 5: Communities ───────────────────────────────────────────
     onProgress({

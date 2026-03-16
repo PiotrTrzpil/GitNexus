@@ -1,0 +1,51 @@
+{
+  "name": "@gitnexus/oxc-cfg",
+  "version": "1.4.0",
+  "description": "NAPI binding: oxc-based control flow graph analysis for GitNexus",
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "*.node"
+  ],
+  "napi": {
+    "name": "oxc-cfg",
+    "triples": {
+      "defaults": false,
+      "additional": [
+        "x86_64-apple-darwin",
+        "aarch64-apple-darwin",
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-pc-windows-msvc"
+      ]
+    }
+  },
+  "scripts": {
+    "artifacts": "napi artifacts",
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform",
+    "prepublishOnly": "napi prepublish -t npm",
+    "version": "napi version"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.0.0"
+  },
+  "optionalDependencies": {
+    "@gitnexus/oxc-cfg-darwin-arm64": "1.4.0",
+    "@gitnexus/oxc-cfg-darwin-x64": "1.4.0",
+    "@gitnexus/oxc-cfg-linux-x64-gnu": "1.4.0",
+    "@gitnexus/oxc-cfg-linux-arm64-gnu": "1.4.0",
+    "@gitnexus/oxc-cfg-win32-x64-msvc": "1.4.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/abhigyanpatwari/GitNexus.git",
+    "directory": "gitnexus/native/oxc-cfg-napi"
+  }
+}

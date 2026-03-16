@@ -360,6 +360,81 @@ Each result: { name, qn, label, file, lines, in_degree, out_degree }`,
     },
   },
   {
+    name: 'quality_query',
+    description: `Run a pre-built code quality or layer analysis query against the knowledge graph.
+Returns raw data — the caller decides what is a smell.
+
+WHEN TO USE: Answering structural code quality questions without writing Cypher:
+complexity hotspots, encapsulation violations, DI injection analysis, parameter optionality,
+field access patterns, call-chain conditionality (hot path vs guarded branches).
+
+Presets and required/optional parameters:
+- high_complexity          — functions with complexity > threshold (threshold required)
+- many_optionals           — functions with > threshold optional params (threshold required)
+- dead_code                — functions with 0 inbound CALLS (excluding entry points + test files)
+- cross_class_field_access — all READS_FIELD/WRITES_FIELD edges that cross class boundaries
+- encapsulation_violations — cross-class access to private or protected fields
+- unused_injections        — constructor params never referenced by sibling methods
+- overused_injections      — constructor params referenced by > 80% of class methods
+- params_by_type           — parameters that use a given type (type required)
+- param_fan_in             — types ranked by how many parameters reference them
+- type_coupling            — classes/interfaces ranked by inbound USES_TYPE count
+- layer_violations         — calls from "leaf" nodes (low fan-in) to "entry" nodes (low fan-out)
+- god_functions            — functions with high complexity + high fan-out + many params
+- throw_diversity          — functions that throw > threshold distinct exception types (threshold required)
+- accessor_vs_direct       — field accesses that bypass getters (direct read where a getter exists)
+- conditional_calls        — CALLS edges from a given function with conditionality metadata (function required)
+- hot_path                 — unconditional call chain from a given function (function required)
+- guarded_paths            — conditional call chain from a given function, grouped by guard (function required)
+
+Returns: { preset, results: [...], count }`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        preset: {
+          type: 'string',
+          description: 'Quality query preset name',
+          enum: [
+            'high_complexity',
+            'many_optionals',
+            'dead_code',
+            'cross_class_field_access',
+            'encapsulation_violations',
+            'unused_injections',
+            'overused_injections',
+            'params_by_type',
+            'param_fan_in',
+            'type_coupling',
+            'layer_violations',
+            'god_functions',
+            'throw_diversity',
+            'accessor_vs_direct',
+            'conditional_calls',
+            'hot_path',
+            'guarded_paths',
+          ],
+        },
+        threshold: {
+          type: 'number',
+          description: 'Numeric threshold for presets that need one (e.g., complexity > threshold, optional param count > threshold, throw types > threshold)',
+        },
+        function: {
+          type: 'string',
+          description: 'Function/method name for presets that target a specific function: conditional_calls, hot_path, guarded_paths',
+        },
+        type: {
+          type: 'string',
+          description: 'Type name for the params_by_type preset',
+        },
+        repo: {
+          type: 'string',
+          description: 'Repository name or path. Omit if only one repo is indexed.',
+        },
+      },
+      required: ['preset'],
+    },
+  },
+  {
     name: 'get_architecture',
     description: `Multi-aspect architecture overview of the indexed repository.
 Each aspect runs targeted Cypher queries and assembles a structured summary.

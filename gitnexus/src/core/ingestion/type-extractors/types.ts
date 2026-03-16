@@ -1,10 +1,36 @@
 import type { SyntaxNode } from '../utils.js';
+import type { ExtractedParameter, PromotedProperty } from '../parameter-extraction.js';
 
 /** Extracts type bindings from a declaration node into the env map */
 export type TypeBindingExtractor = (node: SyntaxNode, env: Map<string, string>) => void;
 
 /** Extracts type bindings from a parameter node into the env map */
 export type ParameterExtractor = (node: SyntaxNode, env: Map<string, string>) => void;
+
+/**
+ * Extracts full parameter detail from a function/method/constructor parameter node.
+ * Returns an ExtractedParameter record (or undefined if the parameter cannot be resolved,
+ * e.g. bare destructuring patterns). Also returns any PromotedProperty produced by
+ * TypeScript constructor-promotion (`constructor(private name: string)`).
+ *
+ * Called once per individual parameter node (not per parameter list). The ordinal
+ * and parentId are provided by the caller (parse worker), which owns the loop state.
+ *
+ * @param paramNode  - The individual parameter AST node
+ * @param parentId   - generateId of the enclosing function/method/constructor
+ * @param funcName   - Name of the enclosing function (used to scope the parameter id)
+ * @param filePath   - Absolute source file path
+ * @param ordinal    - 0-indexed position of this parameter in the parameter list
+ * @param classId    - generateId of the enclosing class, or null for free functions
+ */
+export type ParameterDetailExtractor = (
+  paramNode: SyntaxNode,
+  parentId: string,
+  funcName: string,
+  filePath: string,
+  ordinal: number,
+  classId: string | null,
+) => { parameter: ExtractedParameter; promotedProperty?: PromotedProperty } | undefined;
 
 /** Minimal interface for checking whether a name is a known class/struct.
  *  Narrower than ReadonlySet — only `.has()` is used by extractors. */

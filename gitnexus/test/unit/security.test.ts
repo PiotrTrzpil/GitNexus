@@ -96,12 +96,11 @@ describe('isWriteQuery', () => {
 // ─── Relation type allowlist ──────────────────────────────────────────
 
 describe('VALID_RELATION_TYPES', () => {
-  it('contains exactly the expected 4 types', () => {
-    expect(VALID_RELATION_TYPES.size).toBe(4);
-    expect(VALID_RELATION_TYPES.has('CALLS')).toBe(true);
-    expect(VALID_RELATION_TYPES.has('IMPORTS')).toBe(true);
-    expect(VALID_RELATION_TYPES.has('EXTENDS')).toBe(true);
-    expect(VALID_RELATION_TYPES.has('IMPLEMENTS')).toBe(true);
+  it('contains all expected relation types', () => {
+    expect(VALID_RELATION_TYPES.size).toBe(8);
+    for (const t of ['CALLS', 'HTTP_CALLS', 'ASYNC_CALLS', 'EMITS', 'SUBSCRIBES_TO', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS']) {
+      expect(VALID_RELATION_TYPES.has(t)).toBe(true);
+    }
   });
 
   it('rejects invalid relation types', () => {

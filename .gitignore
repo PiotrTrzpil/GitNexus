@@ -72,3 +72,7 @@ gitnexus/test/fixtures/mini-repo/.gitignore
 gitnexus/test/fixtures/lang-resolution/**/obj
 gitnexus/test/fixtures/lang-resolution/**/bin
 GitNexus.sln
+
+# Native build artifacts
+**/target/
+*.node

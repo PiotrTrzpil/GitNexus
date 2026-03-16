@@ -25,10 +25,15 @@ try { Kotlin = _require('tree-sitter-kotlin'); } catch {}
 let Swift: any = null;
 try { Swift = _require('tree-sitter-swift'); } catch {}
 
-// tree-sitter-kotlin is an optionalDependency — may not be installed
-let Kotlin: any = null;
-try { Kotlin = _require('tree-sitter-kotlin'); } catch {}
-import { 
+let analyzeCfg: ((filename: string, sourceCode: string, options?: any) => any) | null = null;
+try {
+  const oxcCfg = _require('@gitnexus/oxc-cfg');
+  analyzeCfg = oxcCfg.analyzeCfg;
+} catch {
+  console.warn('[@gitnexus/oxc-cfg] Native CFG module not found — control flow graph analysis will be skipped. Build it with: cd native/oxc-cfg-napi && pnpm install && pnpm build');
+}
+
+import {
   getLanguageFromFilename,
   FUNCTION_NODE_TYPES,
   extractFunctionName,
@@ -49,6 +54,9 @@ import { generateId } from '../../../lib/utils.js';
 import { extractNamedBindings } from '../named-binding-extraction.js';
 import { appendKotlinWildcard } from '../resolvers/index.js';
 import { callRouters } from '../call-routing.js';
+import { computeComplexity } from '../complexity.js';
+import { extractVisibility, extractIsAccessor, extractIsReadonly, extractIsStatic, extractIsAbstract } from '../visibility-extraction.js';
+import { extractParameters, type PromotedProperty } from '../parameter-extraction.js';
 
 // ============================================================================
 // Types for serializable results
@@ -69,6 +77,19 @@ interface ParsedNode {
     description?: string;
     parameterCount?: number;
     returnType?: string;
+    // Semantic depth fields
+    sloc?: number;
+    complexity?: number;
+    visibility?: 'public' | 'protected' | 'private';
+    isAccessor?: boolean;
+    isReadonly?: boolean;
+    isStatic?: boolean;
+    isAbstract?: boolean;
+    // Parameter node fields
+    ordinal?: number;
+    isOptional?: boolean;
+    hasDefault?: boolean;
+    isRest?: boolean;
   };
 }
 
@@ -76,7 +97,7 @@ interface ParsedRelationship {
   id: string;
   sourceId: string;
   targetId: string;
-  type: 'DEFINES' | 'HAS_METHOD';
+  type: 'DEFINES' | 'HAS_METHOD' | 'PARAM_OF';
   confidence: number;
   reason: string;
 }
@@ -115,6 +136,57 @@ export interface ExtractedCall {
   eventType?: string;
   /** Event/channel name extracted from first string arg (e.g., 'user.created') */
   eventName?: string;
+  /** True if call site is nested inside a branching construct */
+  isConditional?: boolean;
+  /** Short guard expression text, truncated to 120 chars */
+  guardExpression?: string;
+  /** Number of enclosing branching constructs (0 = unconditional) */
+  branchDepth?: number;
+}
+
+export interface ExtractedParameter {
+  filePath: string;
+  /** generateId('Parameter', `${filePath}:${funcName}:${paramName}`) */
+  id: string;
+  /** ID of the parent function/method/constructor node */
+  parentId: string;
+  name: string;
+  startLine: number;
+  endLine: number;
+  ordinal: number;
+  type?: string;
+  isOptional: boolean;
+  hasDefault: boolean;
+  isRest: boolean;
+  visibility?: 'public' | 'protected' | 'private';
+}
+
+export interface ExtractedFieldAccess {
+  filePath: string;
+  /** generateId of the accessing function */
+  sourceId: string;
+  /** Name of the accessed field/property */
+  fieldName: string;
+  /** Name of the receiver (e.g., 'user' in user.name) */
+  receiverName: string;
+  /** Resolved type of the receiver — filled by type env when available */
+  receiverType?: string;
+  /** 'read' | 'write' */
+  accessKind: 'read' | 'write';
+}
+
+export interface ExtractedTypeUsage {
+  filePath: string;
+  sourceId: string;
+  typeName: string;
+  /** 'param' | 'return' | 'generic' | 'cast' */
+  usageKind: string;
+}
+
+export interface ExtractedThrow {
+  filePath: string;
+  sourceId: string;
+  exceptionName: string;
 }
 
 export interface ExtractedHeritage {
@@ -142,6 +214,28 @@ export interface FileConstructorBindings {
   bindings: ConstructorBinding[];
 }
 
+/** Serializable CFG data for one file, attached to ParseWorkerResult */
+export interface ExtractedFileCfg {
+  filePath: string;
+  functions: ExtractedFunctionCfg[];
+}
+
+/**
+ * Per-function CFG after NAPI call, ready for postMessage transfer.
+ * Same shape as FunctionCfg but with symbolId for tree-sitter node matching.
+ */
+export interface ExtractedFunctionCfg {
+  /** Function name */
+  name: string;
+  /** generateId of the corresponding Function/Method node (matched by name+line) */
+  symbolId: string | null;
+  startLine: number;
+  endLine: number;
+  className: string | null;
+  blocks: any[];
+  edges: any[];
+}
+
 export interface ParseWorkerResult {
   nodes: ParsedNode[];
   relationships: ParsedRelationship[];
@@ -151,6 +245,11 @@ export interface ParseWorkerResult {
   heritage: ExtractedHeritage[];
   routes: ExtractedRoute[];
   constructorBindings: FileConstructorBindings[];
+  parameters: ExtractedParameter[];
+  fieldAccesses: ExtractedFieldAccess[];
+  typeUsages: ExtractedTypeUsage[];
+  throws: ExtractedThrow[];
+  cfgData: ExtractedFileCfg[];
   skippedLanguages: Record<string, number>;
   fileCount: number;
 }
@@ -268,6 +367,301 @@ const getLabelFromCaptures = (captureMap: Record<string, any>): string | null =>
 // Process a batch of files
 // ============================================================================
 
+// ============================================================================
+// Type builtin filter (for USES_TYPE — skip primitive/standard-lib types)
+// ============================================================================
+
+const BUILTIN_TYPES = new Set([
+  'string', 'number', 'boolean', 'void', 'any', 'unknown', 'never', 'null', 'undefined',
+  'object', 'symbol', 'bigint',
+  // Generic containers — filter by name only (the type arg may be non-builtin but we record that separately)
+  'Promise', 'Array', 'Map', 'Set', 'Record', 'ReadonlyArray', 'Readonly',
+  'Partial', 'Required', 'Pick', 'Omit', 'Exclude', 'Extract', 'NonNullable',
+  'ReturnType', 'InstanceType', 'Parameters', 'ConstructorParameters',
+  // JS built-in globals
+  'Error', 'TypeError', 'RangeError', 'ReferenceError', 'SyntaxError', 'URIError',
+  'EvalError', 'Date', 'RegExp', 'Function', 'Object',
+  'Response', 'Request', 'URL', 'URLSearchParams',
+  'Buffer', 'Stream', 'EventEmitter',
+  // Misc keywords that appear as types in some grammars
+  'this', 'typeof', 'keyof',
+]);
+
+function isBuiltinType(typeName: string): boolean {
+  if (!typeName) return true;
+  // Strip array suffix (e.g., 'string[]' → 'string')
+  const base = typeName.replace(/\[\]$/, '').replace(/^readonly\s+/, '').trim();
+  // Strip generic params (e.g., 'Promise<User>' → 'Promise')
+  const noGenerics = base.replace(/<.*>/, '');
+  return BUILTIN_TYPES.has(noGenerics);
+}
+
+// ============================================================================
+// Field access extraction (member_expression walk)
+// ============================================================================
+
+/**
+ * Walk the AST for member_expression nodes (e.g., user.name, this.field).
+ * Emit ExtractedFieldAccess records distinguishing reads from writes.
+ * Assignment targets (left side of assignment_expression) → 'write', else → 'read'.
+ */
+function extractFieldAccesses(
+  rootNode: any,
+  filePath: string,
+  _language: SupportedLanguages,
+  result: ParseWorkerResult,
+): void {
+  function walk(node: any): void {
+    if (node.type === 'member_expression' || node.type === 'field_access' || node.type === 'member_access_expression') {
+      const objectNode = node.childForFieldName?.('object') ?? node.children?.[0];
+      const propertyNode = node.childForFieldName?.('property') ?? node.children?.find((c: any) =>
+        c.type === 'property_identifier' || c.type === 'identifier' || c.type === 'private_property_identifier'
+      );
+
+      if (objectNode && propertyNode) {
+        const receiverName = objectNode.text ?? '';
+        const fieldName = propertyNode.text ?? '';
+
+        if (fieldName && receiverName) {
+          // Determine access kind: is this node the left side of an assignment?
+          const accessKind = isAssignmentTarget(node) ? 'write' : 'read';
+
+          // Find enclosing function for sourceId
+          const sourceId = findEnclosingFunctionId(node, filePath) || generateId('File', filePath);
+
+          result.fieldAccesses.push({
+            filePath,
+            sourceId,
+            fieldName,
+            receiverName,
+            accessKind,
+          });
+        }
+      }
+    }
+
+    for (const child of node.children ?? []) {
+      walk(child);
+    }
+  }
+
+  walk(rootNode);
+}
+
+/**
+ * Check if an AST node is the target (left side) of an assignment expression.
+ * Handles: =, +=, -=, *=, /=, &&=, ||=, ??=, etc.
+ */
+function isAssignmentTarget(node: any): boolean {
+  const parent = node.parent;
+  if (!parent) return false;
+
+  const assignmentTypes = new Set([
+    'assignment_expression',
+    'augmented_assignment_expression',
+    'assignment_statement',   // Python
+  ]);
+
+  if (assignmentTypes.has(parent.type)) {
+    // Check if our node is the left child
+    const left = parent.childForFieldName?.('left') ?? parent.children?.[0];
+    return left === node;
+  }
+
+  return false;
+}
+
+// ============================================================================
+// Throw statement extraction
+// ============================================================================
+
+/**
+ * Walk AST for throw_statement nodes. Extract the exception class name from
+ * `new ErrorType(...)` patterns. Associate with the enclosing function.
+ */
+function extractThrowStatements(
+  rootNode: any,
+  filePath: string,
+  result: ParseWorkerResult,
+): void {
+  function walk(node: any): void {
+    if (node.type === 'throw_statement' || node.type === 'raise_statement') {
+      const exceptionName = extractExceptionName(node);
+      if (exceptionName) {
+        const sourceId = findEnclosingFunctionId(node, filePath) || generateId('File', filePath);
+        result.throws.push({
+          filePath,
+          sourceId,
+          exceptionName,
+        });
+      }
+    }
+
+    for (const child of node.children ?? []) {
+      walk(child);
+    }
+  }
+
+  walk(rootNode);
+}
+
+/**
+ * Extract constructor name from `throw new SomeError(...)` pattern.
+ * Returns the class name (e.g. 'SomeError') or null if not a new expression.
+ */
+function extractExceptionName(throwNode: any): string | null {
+  // Walk children to find a new_expression
+  function findNewExpression(node: any): any {
+    if (node.type === 'new_expression' || node.type === 'object_creation_expression') return node;
+    for (const child of node.children ?? []) {
+      const found = findNewExpression(child);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  const newExpr = findNewExpression(throwNode);
+  if (!newExpr) return null;
+
+  // The constructor type is typically the first named child after 'new'
+  const typeNode = newExpr.childForFieldName?.('constructor') ??
+    newExpr.children?.find((c: any) =>
+      c.type === 'identifier' || c.type === 'type_identifier' ||
+      c.type === 'member_expression' || c.type === 'qualified_name'
+    );
+
+  return typeNode?.text ?? null;
+}
+
+// ============================================================================
+// Call conditionality helpers
+// ============================================================================
+
+/** AST node types that count as branching constructs for conditionality detection */
+const BRANCHING_NODE_TYPES = new Set([
+  'if_statement',
+  'else_clause',
+  'switch_case',
+  'ternary_expression',
+  'catch_clause',
+  'logical_expression',
+]);
+
+/** AST node types that are function boundaries — stop walking up when we hit these */
+const FUNCTION_BOUNDARY_TYPES = new Set([
+  'function_declaration',
+  'function',
+  'arrow_function',
+  'method_definition',
+  'function_definition',      // Python
+  'method_declaration',       // Java/C#/Go
+  'function_item',            // Rust
+  'func_literal',             // Go
+  'lambda_expression',
+  'anonymous_function',
+  'constructor_declaration',
+  'constructor_definition',
+]);
+
+/**
+ * Walk up from a call_expression node to count enclosing branching constructs
+ * until reaching a function boundary. Returns conditionality metadata.
+ * Loop bodies (for/while/do) are intentionally excluded — a call inside a loop
+ * is always-executed. try blocks are also excluded — only catch is conditional.
+ */
+function computeCallConditionality(callNode: any): {
+  isConditional: boolean;
+  guardExpression?: string;
+  branchDepth: number;
+} {
+  let branchDepth = 0;
+  let nearestGuardNode: any = null;
+  let current = callNode.parent;
+
+  while (current) {
+    if (FUNCTION_BOUNDARY_TYPES.has(current.type)) break;
+
+    if (BRANCHING_NODE_TYPES.has(current.type)) {
+      branchDepth++;
+      if (nearestGuardNode === null) {
+        nearestGuardNode = current;
+      }
+    }
+
+    current = current.parent;
+  }
+
+  if (branchDepth === 0) {
+    return { isConditional: false, branchDepth: 0 };
+  }
+
+  const guardExpression = extractGuardExpression(nearestGuardNode);
+  return {
+    isConditional: true,
+    guardExpression,
+    branchDepth,
+  };
+}
+
+/**
+ * Extract a short human-readable description of a guard expression from the
+ * nearest enclosing branching construct node.
+ */
+function extractGuardExpression(node: any): string | undefined {
+  if (!node) return undefined;
+
+  if (node.type === 'if_statement') {
+    // Get the condition field — tree-sitter uses named field 'condition'
+    const condition = node.childForFieldName?.('condition') ?? node.children?.find((c: any) => c.type === 'parenthesized_expression');
+    if (condition) {
+      const text = condition.text ?? '';
+      const normalized = `if ${text}`;
+      return normalized.length > 120 ? normalized.slice(0, 117) + '...' : normalized;
+    }
+    return 'if (...)';
+  }
+
+  if (node.type === 'else_clause') {
+    return 'else';
+  }
+
+  if (node.type === 'catch_clause') {
+    return 'catch';
+  }
+
+  if (node.type === 'switch_case') {
+    const value = node.childForFieldName?.('value') ?? node.children?.find((c: any) => c.type !== 'case' && c.type !== ':' && c.type !== 'default');
+    if (value) {
+      const text = `case ${value.text ?? ''}`;
+      return text.length > 120 ? text.slice(0, 117) + '...' : text;
+    }
+    return 'switch case';
+  }
+
+  if (node.type === 'ternary_expression') {
+    // Get the condition (left of ?)
+    const condition = node.childForFieldName?.('condition') ?? node.children?.[0];
+    if (condition) {
+      const text = `${condition.text ?? ''} ?`;
+      return text.length > 120 ? text.slice(0, 117) + '...' : text;
+    }
+    return '? (ternary)';
+  }
+
+  if (node.type === 'logical_expression' || node.type === 'binary_expression') {
+    // Short-circuit: extract left operand + operator
+    const left = node.childForFieldName?.('left') ?? node.children?.[0];
+    const operator = node.children?.find((c: any) => c.type === '&&' || c.type === '||' || c.type === '??');
+    if (left && operator) {
+      const text = `${left.text ?? ''} ${operator.type} ...`;
+      return text.length > 120 ? text.slice(0, 117) + '...' : text;
+    }
+    return node.text?.slice(0, 120) ?? 'logical expression';
+  }
+
+  return undefined;
+}
+
 const processBatch = (files: ParseWorkerInput[], onProgress?: (filesProcessed: number) => void): ParseWorkerResult => {
   const result: ParseWorkerResult = {
     nodes: [],
@@ -278,6 +672,11 @@ const processBatch = (files: ParseWorkerInput[], onProgress?: (filesProcessed: n
     heritage: [],
     routes: [],
     constructorBindings: [],
+    parameters: [],
+    fieldAccesses: [],
+    typeUsages: [],
+    throws: [],
+    cfgData: [],
     skippedLanguages: {},
     fileCount: 0,
   };
@@ -1038,6 +1437,7 @@ const processFileGroup = (
               const callForm = inferCallForm(callNode, callNameNode);
               const receiverName = callForm === 'member' ? extractReceiverName(callNameNode) : undefined;
               const receiverTypeName = receiverName ? typeEnv.lookup(receiverName, callNode) : undefined;
+              const conditionality = computeCallConditionality(callNode);
               result.calls.push({
                 filePath: file.path,
                 calledName,
@@ -1048,6 +1448,11 @@ const processFileGroup = (
                 ...(receiverTypeName !== undefined ? { receiverTypeName } : {}),
                 eventType: evtType,
                 eventName,
+                ...(conditionality.isConditional ? {
+                  isConditional: true,
+                  ...(conditionality.guardExpression !== undefined ? { guardExpression: conditionality.guardExpression } : {}),
+                  branchDepth: conditionality.branchDepth,
+                } : {}),
               });
             }
             continue;
@@ -1060,6 +1465,7 @@ const processFileGroup = (
             const callForm = inferCallForm(callNode, callNameNode);
             const receiverName = callForm === 'member' ? extractReceiverName(callNameNode) : undefined;
             const receiverTypeName = receiverName ? typeEnv.lookup(receiverName, callNode) : undefined;
+            const conditionality = computeCallConditionality(callNode);
             result.calls.push({
               filePath: file.path,
               calledName,
@@ -1068,6 +1474,11 @@ const processFileGroup = (
               ...(callForm !== undefined ? { callForm } : {}),
               ...(receiverName !== undefined ? { receiverName } : {}),
               ...(receiverTypeName !== undefined ? { receiverTypeName } : {}),
+              ...(conditionality.isConditional ? {
+                isConditional: true,
+                ...(conditionality.guardExpression !== undefined ? { guardExpression: conditionality.guardExpression } : {}),
+                branchDepth: conditionality.branchDepth,
+              } : {}),
             });
           }
         }
@@ -1170,16 +1581,44 @@ const processFileGroup = (
         }
       }
 
+      // ── Semantic depth: compute new node properties ─────────────────────
+      const nodeStartLine = definitionNode ? definitionNode.startPosition.row : startLine;
+      const nodeEndLine = definitionNode ? definitionNode.endPosition.row : startLine;
+      const sloc = nodeEndLine - nodeStartLine + 1;
+
+      // Complexity: only for function/method/constructor nodes
+      let complexity: number | undefined;
+      if ((nodeLabel === 'Function' || nodeLabel === 'Method' || nodeLabel === 'Constructor') && definitionNode) {
+        complexity = computeComplexity(definitionNode, language);
+      }
+
+      // Visibility / accessor / readonly / static / abstract: class members only
+      let visibility: 'public' | 'protected' | 'private' | undefined;
+      let isAccessor: boolean | undefined;
+      let isReadonly: boolean | undefined;
+      let isStatic: boolean | undefined;
+      let isAbstract: boolean | undefined;
+
+      const isClassMember = nodeLabel === 'Method' || nodeLabel === 'Constructor' || nodeLabel === 'Property';
+      if (isClassMember && definitionNode && (language === SupportedLanguages.TypeScript || language === SupportedLanguages.JavaScript)) {
+        visibility = extractVisibility(definitionNode, language);
+        isAccessor = extractIsAccessor(definitionNode, language) || undefined;
+        isReadonly = extractIsReadonly(definitionNode, language) || undefined;
+        isStatic = extractIsStatic(definitionNode, language) || undefined;
+        isAbstract = extractIsAbstract(definitionNode, language) || undefined;
+      }
+
       result.nodes.push({
         id: nodeId,
         label: nodeLabel,
         properties: {
           name: nodeName,
           filePath: file.path,
-          startLine: definitionNode ? definitionNode.startPosition.row : startLine,
-          endLine: definitionNode ? definitionNode.endPosition.row : startLine,
+          startLine: nodeStartLine,
+          endLine: nodeEndLine,
           language: language,
           isExported: isNodeExported(nameNode || definitionNode, nodeName, language),
+          sloc,
           ...(frameworkHint ? {
             astFrameworkMultiplier: frameworkHint.entryPointMultiplier,
             astFrameworkReason: frameworkHint.reason,
@@ -1187,6 +1626,12 @@ const processFileGroup = (
           ...(description !== undefined ? { description } : {}),
           ...(parameterCount !== undefined ? { parameterCount } : {}),
           ...(returnType !== undefined ? { returnType } : {}),
+          ...(complexity !== undefined ? { complexity } : {}),
+          ...(visibility !== undefined ? { visibility } : {}),
+          ...(isAccessor ? { isAccessor } : {}),
+          ...(isReadonly ? { isReadonly } : {}),
+          ...(isStatic ? { isStatic } : {}),
+          ...(isAbstract ? { isAbstract } : {}),
         },
       });
 
@@ -1227,12 +1672,154 @@ const processFileGroup = (
           reason: '',
         });
       }
+
+      // ── Parameter extraction (Function / Method / Constructor) ────────────
+      if ((nodeLabel === 'Function' || nodeLabel === 'Method' || nodeLabel === 'Constructor') && definitionNode) {
+        const paramResult = extractParameters(definitionNode, nodeId, nodeName, file.path, enclosingClassId);
+        for (const param of paramResult.parameters) {
+          result.parameters.push(param);
+
+          // Emit Parameter node
+          result.nodes.push({
+            id: param.id,
+            label: 'Parameter',
+            properties: {
+              name: param.name,
+              filePath: param.filePath,
+              startLine: param.startLine,
+              endLine: param.endLine,
+              language,
+              isExported: false,
+              ordinal: param.ordinal,
+              isOptional: param.isOptional,
+              hasDefault: param.hasDefault,
+              isRest: param.isRest,
+              ...(param.type !== undefined ? { returnType: param.type } : {}),
+              ...(param.visibility !== undefined ? { visibility: param.visibility } : {}),
+            },
+          });
+
+          // PARAM_OF edge: Parameter → parent function/method/constructor
+          result.relationships.push({
+            id: generateId('PARAM_OF', `${param.id}->${nodeId}`),
+            sourceId: param.id,
+            targetId: nodeId,
+            type: 'PARAM_OF',
+            confidence: 1.0,
+            reason: 'ast-derived',
+          });
+
+          // Collect USES_TYPE from parameter type annotation (non-builtins resolved later)
+          if (param.type && !isBuiltinType(param.type)) {
+            result.typeUsages.push({
+              filePath: file.path,
+              sourceId: param.id,
+              typeName: param.type,
+              usageKind: 'param',
+            });
+          }
+        }
+
+        // Emit promoted Property nodes from TS constructor parameter promotion
+        for (const promoted of paramResult.promotedProperties) {
+          result.nodes.push({
+            id: promoted.id,
+            label: 'Property',
+            properties: {
+              name: promoted.name,
+              filePath: promoted.filePath,
+              startLine: promoted.startLine,
+              endLine: promoted.endLine,
+              language,
+              isExported: false,
+              visibility: promoted.visibility,
+              ...(promoted.isReadonly ? { isReadonly: true } : {}),
+              ...(promoted.type !== undefined ? { returnType: promoted.type } : {}),
+            },
+          });
+          // HAS_METHOD edge from class to promoted property
+          if (promoted.classId) {
+            result.relationships.push({
+              id: generateId('HAS_METHOD', `${promoted.classId}->${promoted.id}`),
+              sourceId: promoted.classId,
+              targetId: promoted.id,
+              type: 'HAS_METHOD',
+              confidence: 1.0,
+              reason: 'constructor-promotion',
+            });
+          }
+        }
+      }
+
+      // ── USES_TYPE from return type annotation ────────────────────────────
+      if ((nodeLabel === 'Function' || nodeLabel === 'Method') && returnType && !isBuiltinType(returnType)) {
+        result.typeUsages.push({
+          filePath: file.path,
+          sourceId: nodeId,
+          typeName: returnType,
+          usageKind: 'return',
+        });
+      }
     }
+
+    // ── Field access extraction: walk entire AST for member_expression nodes ──
+    extractFieldAccesses(tree.rootNode, file.path, language, result);
+
+    // ── Throw statement extraction ────────────────────────────────────────────
+    extractThrowStatements(tree.rootNode, file.path, result);
 
     // Extract Laravel routes from route files via procedural AST walk
     if (language === SupportedLanguages.PHP && (file.path.includes('/routes/') || file.path.startsWith('routes/')) && file.path.endsWith('.php')) {
       const extractedRoutes = extractLaravelRoutes(tree, file.path);
       result.routes.push(...extractedRoutes);
+    }
+
+    // ── oxc-cfg: intra-function control flow graphs (TS/JS only) ─────────────
+    if (analyzeCfg && (
+      language === SupportedLanguages.TypeScript ||
+      language === SupportedLanguages.JavaScript
+    )) {
+      try {
+        const cfgResult = analyzeCfg(file.path, file.content);
+        if (cfgResult && Array.isArray(cfgResult.functions) && cfgResult.functions.length > 0) {
+          // Build a lookup map from (name, startLine) → nodeId for this file's function/method nodes
+          // Collect nodes added during this file's parse (they're at the tail of result.nodes)
+          // We use a Map keyed by `name:startLine` for O(1) matching
+          const fnLookup = new Map<string, string>();
+          for (const n of result.nodes) {
+            if (
+              n.properties.filePath === file.path &&
+              (n.label === 'Function' || n.label === 'Method' || n.label === 'Constructor')
+            ) {
+              fnLookup.set(`${n.properties.name}:${n.properties.startLine}`, n.id);
+            }
+          }
+
+          const extractedFunctions: ExtractedFunctionCfg[] = cfgResult.functions.map((fn: any) => {
+            // startLine from oxc is 1-indexed; tree-sitter stores 0-indexed rows
+            const tsLine = fn.startLine - 1;
+            const symbolId = fnLookup.get(`${fn.name}:${tsLine}`) ?? null;
+            return {
+              name: fn.name,
+              symbolId,
+              startLine: fn.startLine,
+              endLine: fn.endLine,
+              className: fn.className ?? null,
+              blocks: fn.blocks,
+              edges: fn.edges,
+            };
+          });
+
+          result.cfgData.push({ filePath: file.path, functions: extractedFunctions });
+        }
+      } catch (err) {
+        const message = `oxc-cfg analysis failed for ${file.path}: ${err instanceof Error ? err.message : String(err)}`;
+        if (parentPort) {
+          parentPort.postMessage({ type: 'warning', message });
+        } else {
+          console.warn(message);
+        }
+      }
     }
   }
 };
@@ -1244,7 +1831,10 @@ const processFileGroup = (
 /** Accumulated result across sub-batches */
 let accumulated: ParseWorkerResult = {
   nodes: [], relationships: [], symbols: [],
-  imports: [], calls: [], heritage: [], routes: [], constructorBindings: [], skippedLanguages: {}, fileCount: 0,
+  imports: [], calls: [], heritage: [], routes: [], constructorBindings: [],
+  parameters: [], fieldAccesses: [], typeUsages: [], throws: [],
+  cfgData: [],
+  skippedLanguages: {}, fileCount: 0,
 };
 let cumulativeProcessed = 0;
 
@@ -1257,6 +1847,11 @@ const mergeResult = (target: ParseWorkerResult, src: ParseWorkerResult) => {
   target.heritage.push(...src.heritage);
   target.routes.push(...src.routes);
   target.constructorBindings.push(...src.constructorBindings);
+  target.parameters.push(...src.parameters);
+  target.fieldAccesses.push(...src.fieldAccesses);
+  target.typeUsages.push(...src.typeUsages);
+  target.throws.push(...src.throws);
+  target.cfgData.push(...src.cfgData);
   for (const [lang, count] of Object.entries(src.skippedLanguages)) {
     target.skippedLanguages[lang] = (target.skippedLanguages[lang] || 0) + count;
   }
@@ -1281,7 +1876,7 @@ parentPort!.on('message', (msg: any) => {
     if (msg && msg.type === 'flush') {
       parentPort!.postMessage({ type: 'result', data: accumulated });
       // Reset for potential reuse
-      accumulated = { nodes: [], relationships: [], symbols: [], imports: [], calls: [], heritage: [], routes: [], constructorBindings: [], skippedLanguages: {}, fileCount: 0 };
+      accumulated = { nodes: [], relationships: [], symbols: [], imports: [], calls: [], heritage: [], routes: [], constructorBindings: [], parameters: [], fieldAccesses: [], typeUsages: [], throws: [], cfgData: [], skippedLanguages: {}, fileCount: 0 };
       cumulativeProcessed = 0;
       return;
     }

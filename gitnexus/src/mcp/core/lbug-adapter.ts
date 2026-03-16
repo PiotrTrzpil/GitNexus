@@ -330,7 +330,7 @@ export const executeParameterized = async (
 
   const conn = await checkout(entry);
   try {
-    const stmt = await withTimeout(conn.prepare(cypher), QUERY_TIMEOUT_MS, 'Prepare');
+    const stmt: any = await withTimeout(conn.prepare(cypher), QUERY_TIMEOUT_MS, 'Prepare');
     if (!stmt.isSuccess()) {
       const errMsg = await stmt.getErrorMessage();
       throw new Error(`Prepare failed: ${errMsg}`);

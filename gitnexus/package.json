@@ -45,7 +45,7 @@
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "prepare": "npm run build",
-    "postinstall": "node scripts/patch-tree-sitter-swift.cjs"
+    "postinstall": "node scripts/patch-tree-sitter-swift.cjs && node scripts/rebuild-native-grammars.cjs && node scripts/build-oxc-cfg.cjs"
   },
   "dependencies": {
     "@huggingface/transformers": "^3.0.0",
@@ -81,7 +81,8 @@
   },
   "optionalDependencies": {
     "tree-sitter-kotlin": "^0.3.8",
-    "tree-sitter-swift": "^0.6.0"
+    "tree-sitter-swift": "^0.6.0",
+    "@gitnexus/oxc-cfg": "file:native/oxc-cfg-napi"
   },
   "devDependencies": {
     "@types/cli-progress": "^3.11.6",

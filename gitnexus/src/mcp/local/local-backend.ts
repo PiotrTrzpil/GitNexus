@@ -16,6 +16,7 @@ import { initLbug, executeQuery, executeParameterized, closeLbug, isLbugReady } 
 import {
   listRegisteredRepos,
   cleanupOldKuzuFiles,
+  loadMeta,
   type RegistryEntry,
 } from '../../storage/repo-manager.js';
 // AI context generation is CLI-only (gitnexus analyze)
@@ -136,6 +137,7 @@ interface RepoHandle {
   indexedAt: string;
   lastCommit: string;
   stats?: RegistryEntry['stats'];
+  loadedAt?: string;   // meta.indexedAt when DB was opened — for staleness detection
 }
 
 export class LocalBackend {
@@ -301,7 +303,24 @@ export class LocalBackend {
 
   private async ensureInitialized(repoId: string): Promise<void> {
     // Always check the actual pool — the idle timer may have evicted the connection
-    if (this.initializedRepos.has(repoId) && isLbugReady(repoId)) return;
+    if (this.initializedRepos.has(repoId) && isLbugReady(repoId)) {
+      // Staleness check: did `gitnexus analyze` rebuild the DB since we opened it?
+      const handle = this.repos.get(repoId);
+      if (handle?.loadedAt) {
+        const meta = await loadMeta(handle.storagePath);
+        if (meta?.indexedAt && meta.indexedAt !== handle.loadedAt) {
+          // DB was rebuilt — close stale connection and fall through to re-init
+          await closeLbug(repoId);
+          this.initializedRepos.delete(repoId);
+          this.contextCache.delete(repoId);
+          handle.loadedAt = undefined;
+        } else {
+          return; // Still fresh
+        }
+      } else {
+        return; // No loadedAt tracked yet (first run)
+      }
+    }
 
     const handle = this.repos.get(repoId);
     if (!handle) throw new Error(`Unknown repo: ${repoId}`);
@@ -309,6 +328,10 @@ export class LocalBackend {
     try {
       await initLbug(repoId, handle.lbugPath);
       this.initializedRepos.add(repoId);
+
+      // Record when we loaded so we can detect staleness later
+      const meta = await loadMeta(handle.storagePath);
+      handle.loadedAt = meta?.indexedAt;
     } catch (err: any) {
       // If lock error, mark as not initialized so next call retries
       this.initializedRepos.delete(repoId);
@@ -390,6 +413,8 @@ export class LocalBackend {
         return this.searchGraph(repo, params);
       case 'get_architecture':
         return this.getArchitecture(repo, params);
+      case 'quality_query':
+        return this.qualityQuery(repo, params);
       // Legacy aliases for backwards compatibility
       case 'search':
         return this.query(repo, params);
@@ -1957,26 +1982,27 @@ export class LocalBackend {
       const d1Ids = (grouped[1] || []).map((i: any) => `'${i.id.replace(/'/g, "''")}'`).join(', ');
 
       // Affected processes: which execution flows are broken and at which step
-      const [processRows, moduleRows, directModuleRows] = await Promise.all([
-        executeQuery(repo.id, `
+      // NOTE: queries are run sequentially to avoid concurrent access to the
+      // native DB addon (LadybugDB/KuzuDB C++ bindings are not thread-safe).
+      // Running them via Promise.all caused non-deterministic segfaults (#292).
+      const processRows = await executeQuery(repo.id, `
           MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
           WHERE s.id IN [${allIds}]
           RETURN p.heuristicLabel AS name, COUNT(DISTINCT s.id) AS hits, MIN(r.step) AS minStep, p.stepCount AS stepCount
           ORDER BY hits DESC
           LIMIT 20
-        `).catch(() => []),
-        executeQuery(repo.id, `
+        `).catch(() => []);
+      const moduleRows = await executeQuery(repo.id, `
           MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
           WHERE s.id IN [${allIds}]
           RETURN c.heuristicLabel AS name, COUNT(DISTINCT s.id) AS hits
           ORDER BY hits DESC
-        `).catch(() => []),
-        d1Ids ? executeQuery(repo.id, `
+        `).catch(() => []);
+      const directModuleRows = await (d1Ids ? executeQuery(repo.id, `
           MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
           WHERE s.id IN [${d1Ids}]
           RETURN DISTINCT c.heuristicLabel AS name
-        `).catch(() => []) : Promise.resolve([]),
-      ]);
+        `).catch(() => []) : Promise.resolve([]));
 
       affectedProcesses = processRows.map((r: any) => ({
         name: r.name || r[0],
@@ -2249,7 +2275,7 @@ export class LocalBackend {
    */
   async reindexRepo(repoPath: string): Promise<void> {
     const { runPipelineFromRepo } = await import('../../core/ingestion/pipeline.js');
-    const { loadGraphToKuzu } = await import('../../core/kuzu/kuzu-adapter.js');
+    const { loadGraphToKuzu, closeKuzu } = await import('../../core/kuzu/kuzu-adapter.js');
     const { getStoragePaths, saveMeta, registerRepo } = await import('../../storage/repo-manager.js');
     const { getCurrentCommit } = await import('../../storage/git.js');
 
@@ -2423,6 +2449,709 @@ export class LocalBackend {
       results,
       has_more: offset + results.length < total,
     };
+  }
+
+  // ─── quality_query ───────────────────────────────────────────────
+
+  /**
+   * Pre-built code quality and layer analysis queries.
+   * Each preset is a focused Cypher query returning structured results.
+   * Returns raw data — consumers apply their own thresholds and judgments.
+   */
+  private async qualityQuery(repo: RepoHandle, params: {
+    preset: string;
+    threshold?: number;
+    function?: string;
+    type?: string;
+  }): Promise<any> {
+    await this.ensureInitialized(repo.id);
+
+    if (!isLbugReady(repo.id)) {
+      return { error: 'LadybugDB not ready. Index may be corrupted.' };
+    }
+
+    const { preset, threshold, function: funcName, type: typeName } = params;
+
+    try {
+      const results = await this._runQualityPreset(repo, preset, { threshold, funcName, typeName });
+      return { preset, results, count: results.length };
+    } catch (err: any) {
+      return { error: err.message || `quality_query preset '${preset}' failed` };
+    }
+  }
+
+  private async _runQualityPreset(
+    repo: RepoHandle,
+    preset: string,
+    opts: { threshold?: number; funcName?: string; typeName?: string },
+  ): Promise<any[]> {
+    const { threshold, funcName, typeName } = opts;
+
+    switch (preset) {
+
+      // ── high_complexity ────────────────────────────────────────────────
+      // Functions/methods with cyclomatic complexity above threshold.
+      case 'high_complexity': {
+        if (threshold === undefined) throw new Error('threshold is required for high_complexity');
+        const rows = await executeParameterized(repo.id, `
+          MATCH (n)
+          WHERE (labels(n)[0] IN ['Function', 'Method', 'Constructor'])
+            AND n.complexity > $threshold
+          RETURN n.id AS id, n.name AS name, labels(n)[0] AS label,
+                 n.filePath AS filePath, n.startLine AS startLine,
+                 n.complexity AS complexity, n.sloc AS sloc
+          ORDER BY n.complexity DESC
+          LIMIT 200
+        `, { threshold });
+        return rows.map((r: any) => ({
+          name: r.name ?? r[1],
+          label: r.label ?? r[2],
+          filePath: r.filePath ?? r[3],
+          startLine: r.startLine ?? r[4],
+          complexity: r.complexity ?? r[5],
+          sloc: r.sloc ?? r[6],
+        }));
+      }
+
+      // ── many_optionals ────────────────────────────────────────────────
+      // Functions/methods that have more than threshold optional parameters.
+      case 'many_optionals': {
+        if (threshold === undefined) throw new Error('threshold is required for many_optionals');
+        // Fetch all functions then count optional PARAM_OF edges in JS,
+        // since KuzuDB's 200-row cap limits subquery aggregation reliability.
+        const paramRows = await executeQuery(repo.id, `
+          MATCH (p:Parameter)-[:CodeRelation {type: 'PARAM_OF'}]->(fn)
+          WHERE p.isOptional = true
+          RETURN fn.id AS fnId, fn.name AS fnName, labels(fn)[0] AS fnLabel,
+                 fn.filePath AS filePath, fn.startLine AS startLine
+        `);
+        // Group by function
+        const counts = new Map<string, { name: string; label: string; filePath: string; startLine: any; count: number }>();
+        for (const r of paramRows) {
+          const fnId = r.fnId ?? r[0] ?? '';
+          if (!fnId) continue;
+          if (!counts.has(fnId)) {
+            counts.set(fnId, {
+              name: r.fnName ?? r[1] ?? '',
+              label: r.fnLabel ?? r[2] ?? '',
+              filePath: r.filePath ?? r[3] ?? '',
+              startLine: r.startLine ?? r[4],
+              count: 0,
+            });
+          }
+          counts.get(fnId)!.count += 1;
+        }
+        return [...counts.entries()]
+          .filter(([, v]) => v.count > threshold)
+          .sort((a, b) => b[1].count - a[1].count)
+          .map(([id, v]) => ({ id, ...v, optional_param_count: v.count }))
+          .map(({ count, ...rest }) => rest);
+      }
+
+      // ── dead_code ─────────────────────────────────────────────────────
+      // Functions/methods with zero inbound CALLS edges, excluding entry points
+      // and test-file symbols.
+      case 'dead_code': {
+        const allFunctions = await executeQuery(repo.id, `
+          MATCH (n)
+          WHERE labels(n)[0] IN ['Function', 'Method', 'Constructor']
+            AND (n.isEntryPoint IS NULL OR n.isEntryPoint = false)
+          RETURN n.id AS id, n.name AS name, labels(n)[0] AS label,
+                 n.filePath AS filePath, n.startLine AS startLine
+        `);
+        const results: any[] = [];
+        for (const r of allFunctions) {
+          const id = r.id ?? r[0] ?? '';
+          const filePath = r.filePath ?? r[3] ?? '';
+          if (!id) continue;
+          // Skip test files
+          if (isTestFilePath(filePath)) continue;
+          try {
+            const callerRows = await executeParameterized(repo.id,
+              `MATCH (caller)-[:CodeRelation {type: 'CALLS'}]->(n {id: $id}) RETURN COUNT(caller) AS cnt`,
+              { id });
+            const cnt = callerRows[0]?.cnt ?? callerRows[0]?.[0] ?? 0;
+            if (cnt === 0) {
+              results.push({
+                name: r.name ?? r[1],
+                label: r.label ?? r[2],
+                filePath,
+                startLine: r.startLine ?? r[4],
+              });
+            }
+          } catch {}
+        }
+        return results;
+      }
+
+      // ── cross_class_field_access ──────────────────────────────────────
+      // All READS_FIELD / WRITES_FIELD edges where the accessing function and the
+      // accessed property belong to different classes.
+      case 'cross_class_field_access': {
+        const reads = await executeQuery(repo.id, `
+          MATCH (src)-[:CodeRelation {type: 'READS_FIELD'}]->(prop)
+          RETURN src.id AS srcId, src.name AS srcName, labels(src)[0] AS srcLabel,
+                 src.filePath AS srcFile,
+                 prop.id AS propId, prop.name AS propName, prop.visibility AS visibility,
+                 'read' AS accessKind
+          LIMIT 200
+        `);
+        const writes = await executeQuery(repo.id, `
+          MATCH (src)-[:CodeRelation {type: 'WRITES_FIELD'}]->(prop)
+          RETURN src.id AS srcId, src.name AS srcName, labels(src)[0] AS srcLabel,
+                 src.filePath AS srcFile,
+                 prop.id AS propId, prop.name AS propName, prop.visibility AS visibility,
+                 'write' AS accessKind
+          LIMIT 200
+        `);
+        const allRows = [...reads, ...writes];
+        // Filter to cross-class accesses (exclude self-access where reason = 'self-access')
+        return allRows.map((r: any) => ({
+          accessor: r.srcName ?? r[1],
+          accessorLabel: r.srcLabel ?? r[2],
+          accessorFile: r.srcFile ?? r[3],
+          field: r.propName ?? r[5],
+          fieldVisibility: r.visibility ?? r[6],
+          accessKind: r.accessKind ?? r[7],
+        }));
+      }
+
+      // ── encapsulation_violations ──────────────────────────────────────
+      // Cross-class READS_FIELD / WRITES_FIELD accesses to private or protected fields.
+      case 'encapsulation_violations': {
+        const reads = await executeQuery(repo.id, `
+          MATCH (src)-[rel:CodeRelation {type: 'READS_FIELD'}]->(prop)
+          WHERE prop.visibility IN ['private', 'protected']
+            AND (rel.reason IS NULL OR rel.reason <> 'self-access')
+          RETURN src.id AS srcId, src.name AS srcName, labels(src)[0] AS srcLabel,
+                 src.filePath AS srcFile,
+                 prop.id AS propId, prop.name AS propName, prop.visibility AS visibility,
+                 'read' AS accessKind
+          LIMIT 200
+        `);
+        const writes = await executeQuery(repo.id, `
+          MATCH (src)-[rel:CodeRelation {type: 'WRITES_FIELD'}]->(prop)
+          WHERE prop.visibility IN ['private', 'protected']
+            AND (rel.reason IS NULL OR rel.reason <> 'self-access')
+          RETURN src.id AS srcId, src.name AS srcName, labels(src)[0] AS srcLabel,
+                 src.filePath AS srcFile,
+                 prop.id AS propId, prop.name AS propName, prop.visibility AS visibility,
+                 'write' AS accessKind
+          LIMIT 200
+        `);
+        return [...reads, ...writes].map((r: any) => ({
+          accessor: r.srcName ?? r[1],
+          accessorLabel: r.srcLabel ?? r[2],
+          accessorFile: r.srcFile ?? r[3],
+          field: r.propName ?? r[5],
+          fieldVisibility: r.visibility ?? r[6],
+          accessKind: r.accessKind ?? r[7],
+        }));
+      }
+
+      // ── unused_injections ────────────────────────────────────────────
+      // Constructor parameters (with visibility = promoted fields) that are never
+      // read via READS_FIELD from any sibling method of the same class.
+      case 'unused_injections': {
+        // Fetch all promoted constructor params (those with visibility set = TS constructor promotion)
+        const paramRows = await executeQuery(repo.id, `
+          MATCH (p:Parameter)-[:CodeRelation {type: 'PARAM_OF'}]->(ctor:Constructor)
+          WHERE p.visibility IS NOT NULL
+          RETURN p.id AS paramId, p.name AS paramName, p.visibility AS visibility,
+                 ctor.id AS ctorId, ctor.filePath AS filePath
+          LIMIT 500
+        `);
+
+        const results: any[] = [];
+        for (const r of paramRows) {
+          const paramName = r.paramName ?? r[1] ?? '';
+          const ctorId = r.ctorId ?? r[3] ?? '';
+          const filePath = r.filePath ?? r[4] ?? '';
+          if (!paramName || !ctorId) continue;
+
+          // Find the owning class of this constructor
+          let classId = '';
+          try {
+            const classRows = await executeParameterized(repo.id,
+              `MATCH (cls)-[:CodeRelation {type: 'HAS_METHOD'}]->(ctor {id: $ctorId}) RETURN cls.id AS id LIMIT 1`,
+              { ctorId });
+            classId = classRows[0]?.id ?? classRows[0]?.[0] ?? '';
+          } catch {}
+          if (!classId) continue;
+
+          // Find all methods of this class (excluding the constructor)
+          let methodIds: string[] = [];
+          try {
+            const methodRows = await executeParameterized(repo.id,
+              `MATCH (cls {id: $classId})-[:CodeRelation {type: 'HAS_METHOD'}]->(m)
+               WHERE labels(m)[0] = 'Method'
+               RETURN m.id AS id`,
+              { classId });
+            methodIds = methodRows.map((mr: any) => mr.id ?? mr[0] ?? '').filter(Boolean);
+          } catch {}
+          if (methodIds.length === 0) {
+            // No sibling methods — the param is trivially unused by methods
+            results.push({ paramName, filePath, classId });
+            continue;
+          }
+
+          // Check if any method has a READS_FIELD edge to the promoted property
+          // The promoted property name matches the param name
+          let used = false;
+          for (const methodId of methodIds) {
+            try {
+              const readRows = await executeParameterized(repo.id,
+                `MATCH (m {id: $methodId})-[:CodeRelation {type: 'READS_FIELD'}]->(prop)
+                 WHERE prop.name = $propName
+                 RETURN COUNT(prop) AS cnt`,
+                { methodId, propName: paramName });
+              const cnt = readRows[0]?.cnt ?? readRows[0]?.[0] ?? 0;
+              if (cnt > 0) { used = true; break; }
+            } catch {}
+          }
+          if (!used) {
+            results.push({
+              paramName,
+              visibility: r.visibility ?? r[2],
+              filePath,
+              classId,
+            });
+          }
+        }
+        return results;
+      }
+
+      // ── overused_injections ──────────────────────────────────────────
+      // Constructor params referenced by more than 80% of the class's methods.
+      case 'overused_injections': {
+        const paramRows = await executeQuery(repo.id, `
+          MATCH (p:Parameter)-[:CodeRelation {type: 'PARAM_OF'}]->(ctor:Constructor)
+          WHERE p.visibility IS NOT NULL
+          RETURN p.id AS paramId, p.name AS paramName, p.visibility AS visibility,
+                 ctor.id AS ctorId, ctor.filePath AS filePath
+          LIMIT 500
+        `);
+
+        const results: any[] = [];
+        for (const r of paramRows) {
+          const paramName = r.paramName ?? r[1] ?? '';
+          const ctorId = r.ctorId ?? r[3] ?? '';
+          const filePath = r.filePath ?? r[4] ?? '';
+          if (!paramName || !ctorId) continue;
+
+          let classId = '';
+          try {
+            const classRows = await executeParameterized(repo.id,
+              `MATCH (cls)-[:CodeRelation {type: 'HAS_METHOD'}]->(ctor {id: $ctorId}) RETURN cls.id AS id LIMIT 1`,
+              { ctorId });
+            classId = classRows[0]?.id ?? classRows[0]?.[0] ?? '';
+          } catch {}
+          if (!classId) continue;
+
+          let methodIds: string[] = [];
+          try {
+            const methodRows = await executeParameterized(repo.id,
+              `MATCH (cls {id: $classId})-[:CodeRelation {type: 'HAS_METHOD'}]->(m)
+               WHERE labels(m)[0] = 'Method'
+               RETURN m.id AS id`,
+              { classId });
+            methodIds = methodRows.map((mr: any) => mr.id ?? mr[0] ?? '').filter(Boolean);
+          } catch {}
+          if (methodIds.length === 0) continue;
+
+          let usageCount = 0;
+          for (const methodId of methodIds) {
+            try {
+              const readRows = await executeParameterized(repo.id,
+                `MATCH (m {id: $methodId})-[:CodeRelation {type: 'READS_FIELD'}]->(prop)
+                 WHERE prop.name = $propName
+                 RETURN COUNT(prop) AS cnt`,
+                { methodId, propName: paramName });
+              const cnt = readRows[0]?.cnt ?? readRows[0]?.[0] ?? 0;
+              if (cnt > 0) usageCount += 1;
+            } catch {}
+          }
+
+          const usageRatio = usageCount / methodIds.length;
+          if (usageRatio > 0.8) {
+            results.push({
+              paramName,
+              visibility: r.visibility ?? r[2],
+              filePath,
+              classId,
+              usedByMethodCount: usageCount,
+              totalMethodCount: methodIds.length,
+              usageRatio: Math.round(usageRatio * 100) / 100,
+            });
+          }
+        }
+        return results;
+      }
+
+      // ── params_by_type ────────────────────────────────────────────────
+      // All Parameter nodes that have a USES_TYPE edge to the given type.
+      case 'params_by_type': {
+        if (!typeName) throw new Error('type is required for params_by_type');
+        const rows = await executeParameterized(repo.id, `
+          MATCH (p:Parameter)-[:CodeRelation {type: 'USES_TYPE'}]->(t)
+          WHERE t.name = $typeName
+          RETURN p.id AS paramId, p.name AS paramName, p.ordinal AS ordinal,
+                 p.isOptional AS isOptional, p.isRest AS isRest,
+                 t.name AS typeName, p.filePath AS filePath
+          ORDER BY p.filePath
+          LIMIT 200
+        `, { typeName });
+        return rows.map((r: any) => ({
+          paramName: r.paramName ?? r[1],
+          ordinal: r.ordinal ?? r[2],
+          isOptional: r.isOptional ?? r[3],
+          isRest: r.isRest ?? r[4],
+          typeName: r.typeName ?? r[5],
+          filePath: r.filePath ?? r[6],
+        }));
+      }
+
+      // ── param_fan_in ──────────────────────────────────────────────────
+      // Types ranked by how many Parameter nodes reference them via USES_TYPE.
+      case 'param_fan_in': {
+        const rows = await executeQuery(repo.id, `
+          MATCH (p:Parameter)-[:CodeRelation {type: 'USES_TYPE'}]->(t)
+          RETURN t.name AS typeName, t.id AS typeId, labels(t)[0] AS typeLabel,
+                 COUNT(p) AS paramCount
+          ORDER BY paramCount DESC
+          LIMIT 100
+        `);
+        return rows.map((r: any) => ({
+          typeName: r.typeName ?? r[0],
+          typeLabel: r.typeLabel ?? r[2],
+          paramCount: r.paramCount ?? r[3],
+        }));
+      }
+
+      // ── type_coupling ─────────────────────────────────────────────────
+      // Classes and interfaces ranked by inbound USES_TYPE count (from all sources,
+      // not just Parameters).
+      case 'type_coupling': {
+        const rows = await executeQuery(repo.id, `
+          MATCH (src)-[:CodeRelation {type: 'USES_TYPE'}]->(t)
+          RETURN t.name AS typeName, t.id AS typeId, labels(t)[0] AS typeLabel,
+                 t.filePath AS filePath, COUNT(src) AS usageCount
+          ORDER BY usageCount DESC
+          LIMIT 100
+        `);
+        return rows.map((r: any) => ({
+          typeName: r.typeName ?? r[0],
+          typeLabel: r.typeLabel ?? r[2],
+          filePath: r.filePath ?? r[3],
+          usageCount: r.usageCount ?? r[4],
+        }));
+      }
+
+      // ── layer_violations ─────────────────────────────────────────────
+      // Calls from "leaf" nodes (low fan-in, many callees = worker/utility functions)
+      // to "entry" nodes (high fan-in = shared hubs or services that should only be
+      // called by orchestrators, not by leaves).
+      // Heuristic: entry node = in_degree >= 10; leaf node = in_degree <= 1, out_degree >= 3.
+      case 'layer_violations': {
+        // Step 1: identify entry nodes (high fan-in) and leaf nodes (low fan-in, high fan-out)
+        // For performance, we do this in two passes.
+        const funcRows = await executeQuery(repo.id, `
+          MATCH (n)
+          WHERE labels(n)[0] IN ['Function', 'Method']
+          RETURN n.id AS id, n.name AS name, n.filePath AS filePath
+          LIMIT 1000
+        `);
+
+        // Compute degrees in batch
+        const nodeData: Array<{ id: string; name: string; filePath: string; inDeg: number; outDeg: number }> = [];
+        for (const r of funcRows) {
+          const id = r.id ?? r[0] ?? '';
+          if (!id) continue;
+          let inDeg = 0, outDeg = 0;
+          try {
+            const iRows = await executeParameterized(repo.id,
+              `MATCH (c)-[:CodeRelation {type: 'CALLS'}]->(n {id: $id}) RETURN COUNT(c) AS cnt`, { id });
+            inDeg = iRows[0]?.cnt ?? iRows[0]?.[0] ?? 0;
+          } catch {}
+          try {
+            const oRows = await executeParameterized(repo.id,
+              `MATCH (n {id: $id})-[:CodeRelation {type: 'CALLS'}]->(c) RETURN COUNT(c) AS cnt`, { id });
+            outDeg = oRows[0]?.cnt ?? oRows[0]?.[0] ?? 0;
+          } catch {}
+          nodeData.push({ id, name: r.name ?? r[1] ?? '', filePath: r.filePath ?? r[2] ?? '', inDeg, outDeg });
+        }
+
+        const entryIds = new Set(nodeData.filter(n => n.inDeg >= 10).map(n => n.id));
+        const leafIds = new Set(nodeData.filter(n => n.inDeg <= 1 && n.outDeg >= 3).map(n => n.id));
+
+        if (leafIds.size === 0 || entryIds.size === 0) return [];
+
+        // Step 2: find CALLS edges from leaf → entry
+        const violations: any[] = [];
+        for (const leafId of leafIds) {
+          try {
+            const callRows = await executeParameterized(repo.id,
+              `MATCH (leaf {id: $leafId})-[:CodeRelation {type: 'CALLS'}]->(target)
+               RETURN target.id AS targetId, target.name AS targetName, target.filePath AS targetFile`,
+              { leafId });
+            for (const cr of callRows) {
+              const targetId = cr.targetId ?? cr[0] ?? '';
+              if (entryIds.has(targetId)) {
+                const leaf = nodeData.find(n => n.id === leafId)!;
+                violations.push({
+                  caller: leaf.name,
+                  callerFile: leaf.filePath,
+                  callerInDegree: leaf.inDeg,
+                  callee: cr.targetName ?? cr[1],
+                  calleeFile: cr.targetFile ?? cr[2],
+                  calleeInDegree: nodeData.find(n => n.id === targetId)?.inDeg ?? 0,
+                });
+              }
+            }
+          } catch {}
+        }
+        return violations;
+      }
+
+      // ── god_functions ─────────────────────────────────────────────────
+      // Functions with high complexity AND high fan-out AND many params.
+      // Thresholds: complexity > 10, outbound CALLS > 8, parameterCount > 4.
+      case 'god_functions': {
+        const complexityThreshold = threshold ?? 10;
+        const rows = await executeParameterized(repo.id, `
+          MATCH (n)
+          WHERE labels(n)[0] IN ['Function', 'Method']
+            AND n.complexity > $complexity
+            AND n.parameterCount > 4
+          RETURN n.id AS id, n.name AS name, labels(n)[0] AS label,
+                 n.filePath AS filePath, n.startLine AS startLine,
+                 n.complexity AS complexity, n.parameterCount AS parameterCount
+          ORDER BY n.complexity DESC
+          LIMIT 200
+        `, { complexity: complexityThreshold });
+
+        const results: any[] = [];
+        for (const r of rows) {
+          const id = r.id ?? r[0] ?? '';
+          if (!id) continue;
+          let outDeg = 0;
+          try {
+            const degRows = await executeParameterized(repo.id,
+              `MATCH (n {id: $id})-[:CodeRelation {type: 'CALLS'}]->(c) RETURN COUNT(c) AS cnt`, { id });
+            outDeg = degRows[0]?.cnt ?? degRows[0]?.[0] ?? 0;
+          } catch {}
+          if (outDeg > 8) {
+            results.push({
+              name: r.name ?? r[1],
+              label: r.label ?? r[2],
+              filePath: r.filePath ?? r[3],
+              startLine: r.startLine ?? r[4],
+              complexity: r.complexity ?? r[5],
+              parameterCount: r.parameterCount ?? r[6],
+              outboundCalls: outDeg,
+            });
+          }
+        }
+        return results.sort((a, b) => b.complexity - a.complexity);
+      }
+
+      // ── throw_diversity ───────────────────────────────────────────────
+      // Functions that throw more than threshold distinct exception types.
+      case 'throw_diversity': {
+        if (threshold === undefined) throw new Error('threshold is required for throw_diversity');
+        const rows = await executeQuery(repo.id, `
+          MATCH (fn)-[:CodeRelation {type: 'THROWS'}]->(exc)
+          RETURN fn.id AS fnId, fn.name AS fnName, fn.filePath AS filePath,
+                 exc.name AS exceptionName
+          LIMIT 1000
+        `);
+        // Group by function
+        const fnExceptions = new Map<string, { name: string; filePath: string; exceptions: Set<string> }>();
+        for (const r of rows) {
+          const fnId = r.fnId ?? r[0] ?? '';
+          if (!fnId) continue;
+          if (!fnExceptions.has(fnId)) {
+            fnExceptions.set(fnId, {
+              name: r.fnName ?? r[1] ?? '',
+              filePath: r.filePath ?? r[2] ?? '',
+              exceptions: new Set(),
+            });
+          }
+          const excName = r.exceptionName ?? r[3];
+          if (excName) fnExceptions.get(fnId)!.exceptions.add(excName);
+        }
+        return [...fnExceptions.entries()]
+          .filter(([, v]) => v.exceptions.size > threshold)
+          .sort((a, b) => b[1].exceptions.size - a[1].exceptions.size)
+          .map(([, v]) => ({
+            name: v.name,
+            filePath: v.filePath,
+            exceptionCount: v.exceptions.size,
+            exceptions: [...v.exceptions],
+          }));
+      }
+
+      // ── accessor_vs_direct ────────────────────────────────────────────
+      // READS_FIELD edges to a property where an accessor (getter) also exists
+      // for the same property — i.e., the read bypasses the getter.
+      case 'accessor_vs_direct': {
+        const rows = await executeQuery(repo.id, `
+          MATCH (src)-[rel:CodeRelation {type: 'READS_FIELD'}]->(prop)
+          RETURN src.id AS srcId, src.name AS srcName, labels(src)[0] AS srcLabel,
+                 src.filePath AS srcFile,
+                 prop.id AS propId, prop.name AS propName, prop.visibility AS visibility
+          LIMIT 500
+        `);
+
+        const violations: any[] = [];
+        for (const r of rows) {
+          const propId = r.propId ?? r[4] ?? '';
+          const propName = r.propName ?? r[5] ?? '';
+          if (!propId || !propName) continue;
+
+          // Check if a getter accessor exists for the same name in the same class
+          try {
+            const accessorRows = await executeParameterized(repo.id,
+              `MATCH (cls)-[:CodeRelation {type: 'HAS_METHOD'}]->(m)
+               WHERE m.name = $propName AND m.isAccessor = true
+               RETURN m.id AS id LIMIT 1`,
+              { propName });
+            if (accessorRows.length > 0) {
+              violations.push({
+                accessor: r.srcName ?? r[1],
+                accessorLabel: r.srcLabel ?? r[2],
+                accessorFile: r.srcFile ?? r[3],
+                field: propName,
+                fieldVisibility: r.visibility ?? r[6],
+                bypassesGetter: true,
+              });
+            }
+          } catch {}
+        }
+        return violations;
+      }
+
+      // ── conditional_calls ─────────────────────────────────────────────
+      // All CALLS edges from a given function, annotated with conditionality metadata.
+      case 'conditional_calls': {
+        if (!funcName) throw new Error('function is required for conditional_calls');
+        const rows = await executeParameterized(repo.id, `
+          MATCH (src)-[rel:CodeRelation {type: 'CALLS'}]->(target)
+          WHERE src.name = $funcName
+          RETURN target.name AS callee, target.filePath AS calleeFile,
+                 rel.isConditional AS isConditional,
+                 rel.guardExpression AS guardExpression,
+                 rel.branchDepth AS branchDepth
+          ORDER BY rel.branchDepth
+        `, { funcName });
+        return rows.map((r: any) => ({
+          callee: r.callee ?? r[0],
+          calleeFile: r.calleeFile ?? r[1],
+          isConditional: r.isConditional ?? r[2] ?? false,
+          guardExpression: r.guardExpression ?? r[3] ?? null,
+          branchDepth: r.branchDepth ?? r[4] ?? 0,
+        }));
+      }
+
+      // ── hot_path ──────────────────────────────────────────────────────
+      // BFS from a given function following only unconditional CALLS edges
+      // (isConditional = false or absent). Returns the always-executed call chain.
+      case 'hot_path': {
+        if (!funcName) throw new Error('function is required for hot_path');
+        // Find the source function node
+        const srcRows = await executeParameterized(repo.id,
+          `MATCH (n) WHERE n.name = $funcName RETURN n.id AS id, n.filePath AS filePath LIMIT 1`,
+          { funcName });
+        if (srcRows.length === 0) return [];
+
+        const startId = srcRows[0].id ?? srcRows[0][0];
+        const visited = new Set<string>([startId]);
+        const chain: Array<{ depth: number; name: string; filePath: string; id: string }> = [];
+        let frontier = [startId];
+        let depth = 0;
+        const MAX_DEPTH = 20;
+
+        while (frontier.length > 0 && depth < MAX_DEPTH) {
+          const nextFrontier: string[] = [];
+          for (const nodeId of frontier) {
+            try {
+              const edgeRows = await executeParameterized(repo.id,
+                `MATCH (n {id: $nodeId})-[rel:CodeRelation {type: 'CALLS'}]->(target)
+                 WHERE rel.isConditional IS NULL OR rel.isConditional = false
+                 RETURN target.id AS targetId, target.name AS targetName, target.filePath AS targetFile`,
+                { nodeId });
+              for (const er of edgeRows) {
+                const targetId = er.targetId ?? er[0] ?? '';
+                if (!targetId || visited.has(targetId)) continue;
+                visited.add(targetId);
+                chain.push({
+                  depth: depth + 1,
+                  name: er.targetName ?? er[1] ?? '',
+                  filePath: er.targetFile ?? er[2] ?? '',
+                  id: targetId,
+                });
+                nextFrontier.push(targetId);
+              }
+            } catch {}
+          }
+          frontier = nextFrontier;
+          depth++;
+        }
+        return chain;
+      }
+
+      // ── guarded_paths ─────────────────────────────────────────────────
+      // BFS from a given function following only conditional CALLS edges.
+      // Groups results by guardExpression.
+      case 'guarded_paths': {
+        if (!funcName) throw new Error('function is required for guarded_paths');
+        const srcRows = await executeParameterized(repo.id,
+          `MATCH (n) WHERE n.name = $funcName RETURN n.id AS id LIMIT 1`,
+          { funcName });
+        if (srcRows.length === 0) return [];
+
+        const startId = srcRows[0].id ?? srcRows[0][0];
+        const visited = new Set<string>([startId]);
+        const guardGroups = new Map<string, { guard: string; branchDepth: number; calls: Array<{ name: string; filePath: string }> }>();
+        let frontier = [startId];
+        let depth = 0;
+        const MAX_DEPTH = 20;
+
+        while (frontier.length > 0 && depth < MAX_DEPTH) {
+          const nextFrontier: string[] = [];
+          for (const nodeId of frontier) {
+            try {
+              const edgeRows = await executeParameterized(repo.id,
+                `MATCH (n {id: $nodeId})-[rel:CodeRelation {type: 'CALLS'}]->(target)
+                 WHERE rel.isConditional = true
+                 RETURN target.id AS targetId, target.name AS targetName, target.filePath AS targetFile,
+                        rel.guardExpression AS guardExpression, rel.branchDepth AS branchDepth`,
+                { nodeId });
+              for (const er of edgeRows) {
+                const targetId = er.targetId ?? er[0] ?? '';
+                if (!targetId || visited.has(targetId)) continue;
+                visited.add(targetId);
+                nextFrontier.push(targetId);
+                const guard = er.guardExpression ?? er[3] ?? 'unknown';
+                if (!guardGroups.has(guard)) {
+                  guardGroups.set(guard, { guard, branchDepth: er.branchDepth ?? er[4] ?? 1, calls: [] });
+                }
+                guardGroups.get(guard)!.calls.push({
+                  name: er.targetName ?? er[1] ?? '',
+                  filePath: er.targetFile ?? er[2] ?? '',
+                });
+              }
+            } catch {}
+          }
+          frontier = nextFrontier;
+          depth++;
+        }
+        return [...guardGroups.values()].sort((a, b) => a.branchDepth - b.branchDepth);
+      }
+
+      default:
+        throw new Error(`Unknown quality_query preset: ${preset}. Valid presets: high_complexity, many_optionals, dead_code, cross_class_field_access, encapsulation_violations, unused_injections, overused_injections, params_by_type, param_fan_in, type_coupling, layer_violations, god_functions, throw_diversity, accessor_vs_direct, conditional_calls, hot_path, guarded_paths`);
+    }
   }
 
   // ─── get_architecture ────────────────────────────────────────────

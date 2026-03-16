@@ -21,10 +21,6 @@ try { Kotlin = _require('tree-sitter-kotlin'); } catch {}
 let Swift: any = null;
 try { Swift = _require('tree-sitter-swift'); } catch {}
 
-// tree-sitter-kotlin is an optionalDependency — may not be installed
-let Kotlin: any = null;
-try { Kotlin = _require('tree-sitter-kotlin'); } catch {}
-
 let parser: Parser | null = null;
 
 const languageMap: Record<string, any> = {

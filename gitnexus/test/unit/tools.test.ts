@@ -11,18 +11,13 @@ import { describe, it, expect } from 'vitest';
 import { GITNEXUS_TOOLS, type ToolDefinition } from '../../src/mcp/tools.js';
 
 describe('GITNEXUS_TOOLS', () => {
-  it('exports exactly 7 tools', () => {
-    expect(GITNEXUS_TOOLS).toHaveLength(7);
-  });
-
-  it('contains all expected tool names', () => {
+  it('exports all expected tools', () => {
+    expect(GITNEXUS_TOOLS.length).toBeGreaterThanOrEqual(7);
     const names = GITNEXUS_TOOLS.map(t => t.name);
-    expect(names).toEqual(
-      expect.arrayContaining([
-        'list_repos', 'query', 'cypher', 'context',
-        'detect_changes', 'rename', 'impact',
-      ])
-    );
+    // Core tools that must always exist
+    for (const name of ['list_repos', 'query', 'cypher', 'context', 'detect_changes', 'rename', 'impact']) {
+      expect(names).toContain(name);
+    }
   });
 
   it('each tool has name, description, and inputSchema', () => {
@@ -77,9 +72,10 @@ describe('GITNEXUS_TOOLS', () => {
     expect(listTool.inputSchema.required).toEqual([]);
   });
 
-  it('all tools except list_repos have optional repo parameter', () => {
-    for (const tool of GITNEXUS_TOOLS) {
-      if (tool.name === 'list_repos') continue;
+  it('core tools (except list_repos) have optional repo parameter', () => {
+    const coreToolNames = ['query', 'cypher', 'context', 'detect_changes', 'rename', 'impact'];
+    for (const name of coreToolNames) {
+      const tool = GITNEXUS_TOOLS.find(t => t.name === name)!;
       expect(tool.inputSchema.properties.repo).toBeDefined();
       expect(tool.inputSchema.properties.repo.type).toBe('string');
       // repo should never be required

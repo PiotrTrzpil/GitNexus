@@ -32,7 +32,10 @@ export type NodeLabel =
   | 'Delegate'
   | 'Annotation'
   | 'Constructor'
-  | 'Template';
+  | 'Template'
+  | 'Parameter'
+  // Intra-function control flow graph nodes
+  | 'BasicBlock';
 
 
 import { SupportedLanguages } from '../../config/supported-languages.js';
@@ -66,6 +69,39 @@ export type NodeProperties = {
   // Method signature (for MRO disambiguation)
   parameterCount?: number,
   returnType?: string,
+  // ── Semantic depth properties ──
+  /** Cyclomatic complexity (branching node count). Functions/Methods only. */
+  complexity?: number,
+  /** Source lines of code (endLine - startLine + 1). */
+  sloc?: number,
+  /** Visibility modifier. Class members only. */
+  visibility?: 'public' | 'protected' | 'private',
+  /** True for get/set accessors (as opposed to regular methods/properties). */
+  isAccessor?: boolean,
+  /** True for readonly/const fields. */
+  isReadonly?: boolean,
+  /** True for static members. */
+  isStatic?: boolean,
+  /** True for abstract methods/classes. */
+  isAbstract?: boolean,
+  // ── Parameter node properties (label: 'Parameter') ──
+  /** Ordinal position in the parameter list (0-indexed). Parameter nodes only. */
+  ordinal?: number,
+  /** True if the parameter has `?` or a default value. Parameter nodes only. */
+  isOptional?: boolean,
+  /** True if the parameter has `= defaultValue`. Parameter nodes only. */
+  hasDefault?: boolean,
+  /** True if the parameter is a rest/spread param (`...args`). Parameter nodes only. */
+  isRest?: boolean,
+  // ── BasicBlock node properties (label: 'BasicBlock') ──
+  /** Block ID within its function's CFG (0 = entry block). BasicBlock nodes only. */
+  blockIndex?: number,
+  /** Number of instructions in this block. BasicBlock nodes only. */
+  instructionCount?: number,
+  /** True if this block is statically unreachable. BasicBlock nodes only. */
+  isUnreachable?: boolean,
+  /** JSON-encoded instruction array (compact storage). BasicBlock nodes only. */
+  cfgInstructions?: string,
 }
 
 export type RelationshipType =
@@ -87,6 +123,14 @@ export type RelationshipType =
   | 'EMITS'
   | 'SUBSCRIBES_TO'
   | 'FILE_CHANGES_WITH'
+  | 'PARAM_OF'
+  | 'READS_FIELD'
+  | 'WRITES_FIELD'
+  | 'USES_TYPE'
+  | 'THROWS'
+  // Intra-function control flow graph edges
+  | 'CFG_CONTAINS'   // Function/Method → BasicBlock
+  | 'CFG_EDGE'       // BasicBlock → BasicBlock
 
 export interface GraphNode {
   id:  string,
@@ -105,6 +149,16 @@ export interface GraphRelationship {
   reason: string,
   /** Step number for STEP_IN_PROCESS relationships (1-indexed) */
   step?: number,
+  /** True when the call site is inside a branching construct. CALLS edges only. */
+  isConditional?: boolean,
+  /** Short guard expression text (e.g., "if (user.isAdmin)", "catch"). Truncated to 120 chars. CALLS edges only. */
+  guardExpression?: string,
+  /** Nesting depth of branching constructs around the call site. 0 = unconditional. CALLS edges only. */
+  branchDepth?: number,
+  /** CFG edge type: 'Jump' | 'Normal' | 'Backedge' | 'Finalize' | 'ErrorExplicit' | 'ErrorImplicit' | 'Unreachable' | 'Join'. CFG_EDGE relationships only. */
+  cfgEdgeType?: string,
+  /** Guard/condition expression text for Jump edges (≤120 chars). CFG_EDGE relationships only. */
+  conditionText?: string,
 }
 
 export interface KnowledgeGraph {
