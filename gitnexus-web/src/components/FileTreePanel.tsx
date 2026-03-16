@@ -14,6 +14,7 @@ import {
   Variable,
   Hash,
   Target,
+  Play,
 } from 'lucide-react';
 import { useAppState } from '../hooks/useAppState';
 import { FILTERABLE_LABELS, NODE_COLORS, ALL_EDGE_TYPES, EDGE_INFO, type EdgeType } from '../lib/constants';
@@ -192,15 +193,34 @@ const getNodeTypeIcon = (label: NodeLabel) => {
 
 interface FileTreePanelProps {
   onFocusNode: (nodeId: string) => void;
+  onRerunLayout?: () => void;
 }
 
-export const FileTreePanel = ({ onFocusNode }: FileTreePanelProps) => {
+export const FileTreePanel = ({ onFocusNode, onRerunLayout }: FileTreePanelProps) => {
   const { graph, visibleLabels, toggleLabelVisibility, visibleEdgeTypes, toggleEdgeVisibility, selectedNode, setSelectedNode, openCodePanel, depthFilter, setDepthFilter } = useAppState();
 
   const [isCollapsed, setIsCollapsed] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(new Set());
   const [activeTab, setActiveTab] = useState<'files' | 'filters'>('files');
+
+  // Track whether filters changed since last layout run
+  const [filtersChanged, setFiltersChanged] = useState(false);
+
+  // Persist filter selections to localStorage
+  useEffect(() => {
+    try {
+      localStorage.setItem('gitnexus-visible-labels', JSON.stringify(visibleLabels));
+    } catch { /* ignore */ }
+    setFiltersChanged(true);
+  }, [visibleLabels]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('gitnexus-visible-edges', JSON.stringify(visibleEdgeTypes));
+    } catch { /* ignore */ }
+    setFiltersChanged(true);
+  }, [visibleEdgeTypes]);
 
   // Build file tree from graph
   const fileTree = useMemo(() => {
@@ -451,6 +471,29 @@ export const FileTreePanel = ({ onFocusNode }: FileTreePanelProps) => {
               })}
             </div>
           </div>
+
+          {/* Re-run Layout button */}
+          {onRerunLayout && (
+            <div className="mt-6 pt-4 border-t border-border-subtle">
+              <button
+                onClick={() => {
+                  onRerunLayout();
+                  setFiltersChanged(false);
+                }}
+                disabled={!filtersChanged}
+                className={`
+                  w-full flex items-center justify-center gap-2 px-3 py-2 rounded-md text-xs font-medium transition-all
+                  ${filtersChanged
+                    ? 'bg-accent text-white hover:bg-accent/90 cursor-pointer'
+                    : 'bg-elevated text-text-muted border border-border-subtle cursor-not-allowed opacity-50'
+                  }
+                `}
+              >
+                <Play className="w-3.5 h-3.5" />
+                Re-run Layout
+              </button>
+            </div>
+          )}
 
           {/* Depth Filter */}
           <div className="mt-6 pt-4 border-t border-border-subtle">

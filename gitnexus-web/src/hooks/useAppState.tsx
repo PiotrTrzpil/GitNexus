@@ -200,9 +200,21 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
     setRightPanelTab('chat');
   }, []);
 
-  // Filters
-  const [visibleLabels, setVisibleLabels] = useState<NodeLabel[]>(DEFAULT_VISIBLE_LABELS);
-  const [visibleEdgeTypes, setVisibleEdgeTypes] = useState<EdgeType[]>(DEFAULT_VISIBLE_EDGES);
+  // Filters — restore from localStorage if available
+  const [visibleLabels, setVisibleLabels] = useState<NodeLabel[]>(() => {
+    try {
+      const saved = localStorage.getItem('gitnexus-visible-labels');
+      if (saved) return JSON.parse(saved) as NodeLabel[];
+    } catch { /* ignore */ }
+    return DEFAULT_VISIBLE_LABELS;
+  });
+  const [visibleEdgeTypes, setVisibleEdgeTypes] = useState<EdgeType[]>(() => {
+    try {
+      const saved = localStorage.getItem('gitnexus-visible-edges');
+      if (saved) return JSON.parse(saved) as EdgeType[];
+    } catch { /* ignore */ }
+    return DEFAULT_VISIBLE_EDGES;
+  });
 
   // Depth filter
   const [depthFilter, setDepthFilter] = useState<number | null>(null);
@@ -1017,6 +1029,7 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
       for (const [p, c] of Object.entries(result.fileContents)) fileMap.set(p, c);
       setFileContents(fileMap);
 
+      setProgress(null);
       setViewMode('exploring');
 
       if (getActiveProviderConfig()) initializeAgent(pName);

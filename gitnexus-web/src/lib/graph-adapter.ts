@@ -1,4 +1,4 @@
-import Graph from 'graphology';
+import Graph, { MultiGraph } from 'graphology';
 import { KnowledgeGraph, NodeLabel } from '../core/graph/types';
 import { NODE_COLORS, NODE_SIZES, getCommunityColor } from './constants';
 
@@ -47,29 +47,29 @@ const getScaledNodeSize = (baseSize: number, nodeCount: number): number => {
  * Get mass for node type - higher mass = more repulsion in ForceAtlas2
  * Folders get MUCH higher mass so they spread out and pull their files with them
  */
-const getNodeMass = (nodeType: NodeLabel, nodeCount: number): number => {
-  // Scale mass based on graph size
-  const baseMassMultiplier = nodeCount > 5000 ? 2 : nodeCount > 1000 ? 1.5 : 1;
-  
+const getNodeMass = (nodeType: NodeLabel, _nodeCount: number): number => {
+  // Mass affects FA2 repulsion — keep values moderate so clusters can form.
+  // High mass on structural nodes prevents FA2 from pulling their children
+  // into tight clusters, so we use a flatter scale.
   switch (nodeType) {
     case 'Project':
-      return 50 * baseMassMultiplier;  // Heaviest - anchors everything
+      return 10;
     case 'Package':
-      return 30 * baseMassMultiplier;  // Very heavy
+      return 6;
     case 'Module':
-      return 20 * baseMassMultiplier;  // Heavy
+      return 5;
     case 'Folder':
-      return 15 * baseMassMultiplier;  // Heavy - blasts folders apart!
+      return 4;
     case 'File':
-      return 3 * baseMassMultiplier;   // Medium - follows folders
+      return 2;
     case 'Class':
     case 'Interface':
-      return 5 * baseMassMultiplier;   // Medium-heavy
+      return 3;
     case 'Function':
     case 'Method':
-      return 2 * baseMassMultiplier;   // Light
+      return 1;
     default:
-      return 1;  // Default mass
+      return 1;
   }
 };
 
@@ -83,157 +83,37 @@ const getNodeMass = (nodeType: NodeLabel, nodeCount: number): number => {
 export const knowledgeGraphToGraphology = (
   knowledgeGraph: KnowledgeGraph,
   communityMemberships?: Map<string, number>
-): Graph<SigmaNodeAttributes, SigmaEdgeAttributes> => {
-  const graph = new Graph<SigmaNodeAttributes, SigmaEdgeAttributes>();
+): MultiGraph<SigmaNodeAttributes, SigmaEdgeAttributes> => {
+  const graph = new MultiGraph<SigmaNodeAttributes, SigmaEdgeAttributes>();
   const nodeCount = knowledgeGraph.nodes.length;
-  
-  // Build parent-child map from hierarchy relationships
-  // CONTAINS: Folder -> File
-  // DEFINES: File -> Function/Class/Interface/Method
-  // IMPORTS: File -> Import
-  // parent -> children
-  const parentToChildren = new Map<string, string[]>();
-  // child -> parent
-  const childToParent = new Map<string, string>();
-  
-  const hierarchyRelations = new Set(['CONTAINS', 'DEFINES', 'IMPORTS']);
-  
-  knowledgeGraph.relationships.forEach(rel => {
-    // These relationships represent parent-child hierarchy for positioning
-    if (hierarchyRelations.has(rel.type)) {
-      // source CONTAINS/DEFINES/IMPORTS target, so source is parent
-      if (!parentToChildren.has(rel.sourceId)) {
-        parentToChildren.set(rel.sourceId, []);
-      }
-      parentToChildren.get(rel.sourceId)!.push(rel.targetId);
-      childToParent.set(rel.targetId, rel.sourceId);
-    }
-  });
-  
-  // Create node lookup
-  const nodeMap = new Map(knowledgeGraph.nodes.map(n => [n.id, n]));
-  
-  // Separate structural nodes (folders, packages) from content nodes
-  const structuralTypes = new Set(['Project', 'Package', 'Module', 'Folder']);
-  const structuralNodes = knowledgeGraph.nodes.filter(n => structuralTypes.has(n.label));
-  
-  // Much wider spread for structural nodes - this is the key!
-  const structuralSpread = Math.sqrt(nodeCount) * 40;
-  // Small jitter for children around their parent
-  const childJitter = Math.sqrt(nodeCount) * 3;
 
-  // === CLUSTER-BASED POSITIONING ===
-  // Calculate cluster centers - each cluster gets a region of the graph
-  const clusterCenters = new Map<number, { x: number; y: number }>();
-  if (communityMemberships && communityMemberships.size > 0) {
-    // Find unique community IDs
-    const communities = new Set(communityMemberships.values());
-    const communityCount = communities.size;
-    const clusterSpread = structuralSpread * 0.8; // Clusters spread across 80% of graph
-    
-    // Position cluster centers using golden angle for even distribution
-    const goldenAngle = Math.PI * (3 - Math.sqrt(5));
-    let idx = 0;
-    communities.forEach(communityId => {
-      const angle = idx * goldenAngle;
-      const radius = clusterSpread * Math.sqrt((idx + 1) / communityCount);
-      clusterCenters.set(communityId, {
-        x: radius * Math.cos(angle),
-        y: radius * Math.sin(angle),
-      });
-      idx++;
-    });
-  }
-  // Jitter within cluster (tighter than childJitter)
-  const clusterJitter = Math.sqrt(nodeCount) * 1.5;
+  // Skip metadata and structural container nodes — they're not code symbols
+  // or have no semantic edges (Folder/Project/Package only had CONTAINS edges
+  // which are excluded from the layout graph).
+  const metadataTypes = new Set(['Community', 'Process', 'Project', 'Package', 'Module', 'Folder']);
 
-  // Store positions for parent lookup
-  const nodePositions = new Map<string, { x: number; y: number }>();
+  // Compact random initial positions — FA2 will organize from here.
+  // Small spread lets FA2 expand clusters outward via repulsion.
+  const spread = Math.sqrt(nodeCount);
 
-  // Position structural nodes (folders, etc.) in a wide radial pattern FIRST
-  structuralNodes.forEach((node, index) => {
-    // Use golden angle for even distribution
-    const goldenAngle = Math.PI * (3 - Math.sqrt(5));
-    const angle = index * goldenAngle;
-    const radius = structuralSpread * Math.sqrt((index + 1) / Math.max(structuralNodes.length, 1));
-    
-    // Add some randomness to prevent perfect patterns
-    const jitter = structuralSpread * 0.15;
-    const x = radius * Math.cos(angle) + (Math.random() - 0.5) * jitter;
-    const y = radius * Math.sin(angle) + (Math.random() - 0.5) * jitter;
-    
-    nodePositions.set(node.id, { x, y });
-    
-    const baseSize = NODE_SIZES[node.label] || 8;
-    const scaledSize = getScaledNodeSize(baseSize, nodeCount);
-    
-    // Structural nodes keep their type-based color
-    graph.addNode(node.id, {
-      x,
-      y,
-      size: scaledSize,
-      color: NODE_COLORS[node.label] || '#9ca3af',
-      label: node.properties.name,
-      nodeType: node.label,
-      filePath: node.properties.filePath,
-      startLine: node.properties.startLine,
-      endLine: node.properties.endLine,
-      hidden: false,
-      mass: getNodeMass(node.label, nodeCount),
-    });
-  });
+  const symbolTypes = new Set(['Function', 'Class', 'Method', 'Interface', 'Enum', 'Type', 'Const']);
 
-  // Process remaining nodes in HIERARCHY ORDER (parents before children)
-  // Use BFS starting from structural nodes to ensure parents are positioned first
-  const addNodeWithPosition = (nodeId: string) => {
-    if (graph.hasNode(nodeId)) return;
-    
-    const node = nodeMap.get(nodeId);
-    if (!node) return;
-    
-    let x: number, y: number;
-    
-    // Check if this is a symbol node with a community assignment
-    const communityIndex = communityMemberships?.get(nodeId);
-    const symbolTypes = new Set(['Function', 'Class', 'Method', 'Interface']);
-    const clusterCenter = communityIndex !== undefined ? clusterCenters.get(communityIndex) : null;
-    
-    if (clusterCenter && symbolTypes.has(node.label)) {
-      // CLUSTER-BASED POSITIONING: Position near cluster center with tight jitter
-      x = clusterCenter.x + (Math.random() - 0.5) * clusterJitter;
-      y = clusterCenter.y + (Math.random() - 0.5) * clusterJitter;
-    } else {
-      // HIERARCHY-BASED POSITIONING: Position near parent
-      const parentId = childToParent.get(nodeId);
-      const parentPos = parentId ? nodePositions.get(parentId) : null;
-      
-      if (parentPos) {
-        x = parentPos.x + (Math.random() - 0.5) * childJitter;
-        y = parentPos.y + (Math.random() - 0.5) * childJitter;
-      } else {
-        // No parent found - position randomly but still spread out
-        x = (Math.random() - 0.5) * structuralSpread * 0.5;
-        y = (Math.random() - 0.5) * structuralSpread * 0.5;
-      }
-    }
-    
-    nodePositions.set(nodeId, { x, y });
-    
-    const baseSize = NODE_SIZES[node.label] || 8;
-    const scaledSize = getScaledNodeSize(baseSize, nodeCount);
-    
-    // Check if this node has a community assignment (reuse communityIndex from above)
+  for (const node of knowledgeGraph.nodes) {
+    if (metadataTypes.has(node.label)) continue;
+
+    const communityIndex = communityMemberships?.get(node.id);
     const hasCommunity = communityIndex !== undefined;
-    
-    // Symbol nodes get colored by community if available
     const usesCommunityColor = hasCommunity && symbolTypes.has(node.label);
-    const nodeColor = usesCommunityColor 
+    const nodeColor = usesCommunityColor
       ? getCommunityColor(communityIndex!)
       : NODE_COLORS[node.label] || '#9ca3af';
-    
-    graph.addNode(nodeId, {
-      x,
-      y,
+
+    const baseSize = NODE_SIZES[node.label] || 8;
+    const scaledSize = getScaledNodeSize(baseSize, nodeCount);
+
+    graph.addNode(node.id, {
+      x: (Math.random() - 0.5) * spread,
+      y: (Math.random() - 0.5) * spread,
       size: scaledSize,
       color: nodeColor,
       label: node.properties.name,
@@ -246,72 +126,62 @@ export const knowledgeGraphToGraphology = (
       community: communityIndex,
       communityColor: hasCommunity ? getCommunityColor(communityIndex!) : undefined,
     });
-  };
-  
-  // BFS from structural nodes - this ensures parent is ALWAYS positioned before child
-  const queue: string[] = [...structuralNodes.map(n => n.id)];
-  const visited = new Set<string>(queue);
-  
-  while (queue.length > 0) {
-    const currentId = queue.shift()!;
-    
-    // Get children of current node and add them
-    const children = parentToChildren.get(currentId) || [];
-    for (const childId of children) {
-      if (!visited.has(childId)) {
-        visited.add(childId);
-        addNodeWithPosition(childId);
-        queue.push(childId); // Add to queue so its children are processed too
-      }
-    }
   }
-  
-  // Add any orphan nodes that weren't reached (no parent relationship)
-  knowledgeGraph.nodes.forEach((node) => {
-    if (!graph.hasNode(node.id)) {
-      addNodeWithPosition(node.id);
-    }
-  });
 
   // Add edges with distinct colors per relationship type
-  const edgeBaseSize = nodeCount > 20000 ? 0.4 : nodeCount > 5000 ? 0.6 : 1.0;
-  
-  // Edge styles - each relationship type has a DISTINCT color for clarity
-  // Using varied hues so relationships are easily distinguishable
+  const edgeBaseSize = nodeCount > 20000 ? 1.0 : nodeCount > 5000 ? 1.5 : 2.0;
+
+  // Edge styles — bright colors on dark background, uniform sizing so all types are visible
   const EDGE_STYLES: Record<string, { color: string; sizeMultiplier: number }> = {
-    // STRUCTURAL - Greens (folder/file hierarchy)
-    CONTAINS: { color: '#2d5a3d', sizeMultiplier: 0.4 },    // Forest green - folder contains
-    
-    // DEFINITIONS - Cyan/Teal (code definitions)
-    DEFINES: { color: '#0e7490', sizeMultiplier: 0.5 },     // Cyan - file defines function/class
-    
-    // DEPENDENCIES - Blue (imports between files)  
-    IMPORTS: { color: '#1d4ed8', sizeMultiplier: 0.6 },     // Blue - file imports file
-    
-    // FUNCTION FLOW - Purple (call graph)
-    CALLS: { color: '#7c3aed', sizeMultiplier: 0.8 },       // Violet - function calls
-    
-    // TYPE RELATIONSHIPS - Warm colors (OOP)
-    EXTENDS: { color: '#c2410c', sizeMultiplier: 1.0 },     // Orange - extension
-    IMPLEMENTS: { color: '#be185d', sizeMultiplier: 0.9 },  // Pink - interface implementation
+    CONTAINS: { color: '#4ade80', sizeMultiplier: 0.6 },    // Green
+    DEFINES: { color: '#22d3ee', sizeMultiplier: 0.7 },     // Cyan
+    IMPORTS: { color: '#60a5fa', sizeMultiplier: 0.8 },     // Blue
+    CALLS: { color: '#a78bfa', sizeMultiplier: 0.8 },       // Purple
+    HAS_METHOD: { color: '#2dd4bf', sizeMultiplier: 0.7 },  // Teal
+    EXTENDS: { color: '#fb923c', sizeMultiplier: 1.0 },     // Orange
+    IMPLEMENTS: { color: '#f472b6', sizeMultiplier: 0.9 },  // Pink
+    SUBSCRIBES_TO: { color: '#fbbf24', sizeMultiplier: 0.8 }, // Yellow
+    EMITS: { color: '#f87171', sizeMultiplier: 0.8 },       // Red
   };
   
+  // Include edges that represent code relationships for FA2 layout.
+  // DEFINES (File→Symbol) and HAS_METHOD (Class→Method) keep symbols near
+  // their parent, while CALLS/IMPORTS create the inter-cluster structure.
+  // Skip: CONTAINS (folder tree), MEMBER_OF (community metadata),
+  // STEP_IN_PROCESS (execution flow metadata), FILE_CHANGES_WITH (git coupling).
+  const includeForLayout = new Set([
+    'CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS',
+    'DEFINES', 'HAS_METHOD',
+    'SUBSCRIBES_TO', 'EMITS',
+  ]);
+
   knowledgeGraph.relationships.forEach((rel) => {
-    if (graph.hasNode(rel.sourceId) && graph.hasNode(rel.targetId)) {
-      if (!graph.hasEdge(rel.sourceId, rel.targetId)) {
-        const style = EDGE_STYLES[rel.type] || { color: '#4a4a5a', sizeMultiplier: 0.5 };
-        const curvature = 0.12 + (Math.random() * 0.08);
-        
-        graph.addEdge(rel.sourceId, rel.targetId, {
-          size: edgeBaseSize * style.sizeMultiplier,
-          color: style.color,
-          relationType: rel.type,
-          type: 'curved',
-          curvature: curvature,
-        });
-      }
+    if (!includeForLayout.has(rel.type)) return;
+    if (!graph.hasNode(rel.sourceId) || !graph.hasNode(rel.targetId)) return;
+    const style = EDGE_STYLES[rel.type] || { color: '#4a4a5a', sizeMultiplier: 0.5 };
+    const curvature = 0.12 + (Math.random() * 0.08);
+
+    graph.addEdge(rel.sourceId, rel.targetId, {
+      size: edgeBaseSize * style.sizeMultiplier,
+      color: style.color,
+      relationType: rel.type,
+      type: 'curved',
+      curvature: curvature,
+    });
+  });
+
+  // Remove isolated nodes (zero edges) — they add visual noise without
+  // contributing to the graph structure. These are typically config files,
+  // test fixtures, or other files with no imports/calls.
+  const toRemove: string[] = [];
+  graph.forEachNode((nodeId) => {
+    if (graph.degree(nodeId) === 0) {
+      toRemove.push(nodeId);
     }
   });
+  for (const nodeId of toRemove) {
+    graph.dropNode(nodeId);
+  }
 
   return graph;
 };

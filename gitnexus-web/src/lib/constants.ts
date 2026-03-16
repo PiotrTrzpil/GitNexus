@@ -65,10 +65,6 @@ export const getCommunityColor = (communityIndex: number): string => {
 
 // Labels to show by default (hide imports and variables by default as they clutter)
 export const DEFAULT_VISIBLE_LABELS: NodeLabel[] = [
-  'Project',
-  'Package',
-  'Module',
-  'Folder',
   'File',
   'Class',
   'Function',
@@ -102,22 +98,21 @@ export const ALL_EDGE_TYPES: EdgeType[] = [
   'IMPLEMENTS',
 ];
 
-// Default visible edges (CALLS hidden by default to reduce clutter)
+// Default visible edges — hide CONTAINS (folder tree) to reduce noise.
 export const DEFAULT_VISIBLE_EDGES: EdgeType[] = [
-  'CONTAINS',
   'DEFINES',
   'IMPORTS',
+  'CALLS',
   'EXTENDS',
   'IMPLEMENTS',
-  'CALLS',
 ];
 
 // Edge display info for UI
 export const EDGE_INFO: Record<EdgeType, { color: string; label: string }> = {
-  CONTAINS: { color: '#2d5a3d', label: 'Contains' },
-  DEFINES: { color: '#0e7490', label: 'Defines' },
-  IMPORTS: { color: '#1d4ed8', label: 'Imports' },
-  CALLS: { color: '#7c3aed', label: 'Calls' },
-  EXTENDS: { color: '#c2410c', label: 'Extends' },
-  IMPLEMENTS: { color: '#be185d', label: 'Implements' },
+  CONTAINS: { color: '#4ade80', label: 'Contains' },
+  DEFINES: { color: '#22d3ee', label: 'Defines' },
+  IMPORTS: { color: '#60a5fa', label: 'Imports' },
+  CALLS: { color: '#a78bfa', label: 'Calls' },
+  EXTENDS: { color: '#fb923c', label: 'Extends' },
+  IMPLEMENTS: { color: '#f472b6', label: 'Implements' },
 };

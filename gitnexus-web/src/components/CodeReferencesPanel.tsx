@@ -78,6 +78,7 @@ export const CodeReferencesPanel = ({ onFocusNode }: CodeReferencesPanelProps) =
   const [isCollapsed, setIsCollapsed] = useState(false);
   const [glowRefId, setGlowRefId] = useState<string | null>(null);
   const panelRef = useRef<HTMLElement | null>(null);
+  const selectedCodeScrollRef = useRef<HTMLDivElement | null>(null);
   const resizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
   const refCardEls = useRef<Map<string, HTMLDivElement | null>>(new Map());
   const glowTimerRef = useRef<number | null>(null);
@@ -90,6 +91,29 @@ export const CodeReferencesPanel = ({ onFocusNode }: CodeReferencesPanelProps) =
       }
     };
   }, []);
+
+  // Scroll to highlighted line when selected node changes
+  useEffect(() => {
+    const startLine = selectedNode?.properties?.startLine;
+    if (typeof startLine !== 'number') return;
+
+    // Small delay to let SyntaxHighlighter render highlighted lines
+    const timer = setTimeout(() => {
+      const container = selectedCodeScrollRef.current;
+      if (!container) return;
+
+      // Find the first highlighted line by its non-transparent border-left
+      const lineElements = container.querySelectorAll('span[style]');
+      for (const el of lineElements) {
+        const style = (el as HTMLElement).style;
+        if (style.borderLeft && !style.borderLeft.includes('transparent')) {
+          (el as HTMLElement).scrollIntoView({ behavior: 'smooth', block: 'center' });
+          return;
+        }
+      }
+    }, 100);
+    return () => clearTimeout(timer);
+  }, [selectedNode]);
 
   const [panelWidth, setPanelWidth] = useState<number>(() => {
     try {
@@ -300,7 +324,7 @@ export const CodeReferencesPanel = ({ onFocusNode }: CodeReferencesPanelProps) =
                 <X className="w-4 h-4" />
               </button>
             </div>
-            <div className="flex-1 min-h-0 overflow-auto scrollbar-thin">
+            <div ref={selectedCodeScrollRef} className="flex-1 min-h-0 overflow-auto scrollbar-thin">
               {selectedFileContent ? (
                 <SyntaxHighlighter
                   language={getSyntaxLanguage(selectedFilePath)}

@@ -8,6 +8,7 @@ import Graph from 'graphology';
 
 export interface GraphCanvasHandle {
   focusNode: (nodeId: string) => void;
+  startLayout: () => void;
 }
 
 export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
@@ -98,7 +99,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
     visibleEdgeTypes,
   });
 
-  // Expose focusNode to parent via ref
+  // Expose focusNode and startLayout to parent via ref
   useImperativeHandle(ref, () => ({
     focusNode: (nodeId: string) => {
       // Also update app state so the selection syncs properly
@@ -110,8 +111,9 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
         }
       }
       focusNode(nodeId);
-    }
-  }), [focusNode, graph, setSelectedNode, openCodePanel]);
+    },
+    startLayout,
+  }), [focusNode, graph, setSelectedNode, openCodePanel, startLayout]);
 
   // Update Sigma graph when KnowledgeGraph changes
   useEffect(() => {

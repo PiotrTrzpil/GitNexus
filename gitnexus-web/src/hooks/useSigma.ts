@@ -1,6 +1,6 @@
 import { useRef, useEffect, useCallback, useState } from 'react';
 import Sigma from 'sigma';
-import Graph from 'graphology';
+import Graph, { MultiGraph } from 'graphology';
 import FA2Layout from 'graphology-layout-forceatlas2/worker';
 import forceAtlas2 from 'graphology-layout-forceatlas2';
 import noverlap from 'graphology-layout-noverlap';
@@ -83,44 +83,40 @@ const NOVERLAP_SETTINGS = {
   expansion: 1.05,
 };
 
-// ForceAtlas2 settings - FAST convergence since nodes start near their parents
+// ForceAtlas2 settings — optimized to minimize edge lengths and form clusters.
+// With only semantic edges (CALLS, IMPORTS, EXTENDS, IMPLEMENTS), FA2 will
+// naturally group tightly-connected code together and push unrelated code apart.
 const getFA2Settings = (nodeCount: number) => {
-  const isSmall = nodeCount < 500;
-  const isMedium = nodeCount >= 500 && nodeCount < 2000;
-  const isLarge = nodeCount >= 2000 && nodeCount < 10000;
-  
   return {
-    // Lower gravity allows folders to stay spread out
-    gravity: isSmall ? 0.8 : isMedium ? 0.5 : isLarge ? 0.3 : 0.15,
-    
-    // Higher scaling ratio = more spread out overall
-    scalingRatio: isSmall ? 15 : isMedium ? 30 : isLarge ? 60 : 100,
-    
-    // LOW slowDown = FASTER movement (converges quicker)
-    slowDown: isSmall ? 1 : isMedium ? 2 : isLarge ? 3 : 5,
-    
-    // Barnes-Hut for performance - use it even on smaller graphs
+    // Gravity pulls everything gently toward center — prevents drift
+    gravity: 1,
+
+    // Scaling ratio: repulsion strength. Higher = more space between clusters.
+    scalingRatio: nodeCount > 5000 ? 50 : nodeCount > 2000 ? 20 : 5,
+
+    slowDown: 10,
+
+    // Barnes-Hut approximation for O(n log n) performance
     barnesHutOptimize: nodeCount > 200,
-    barnesHutTheta: isLarge ? 0.8 : 0.6,  // Higher = faster but less accurate
-    
-    // These help with clustering while keeping spread
+    barnesHutTheta: 0.5,
+
     strongGravityMode: false,
-    outboundAttractionDistribution: true,
     linLogMode: false,
-    adjustSizes: true,
+    outboundAttractionDistribution: true,
+    adjustSizes: false,
     edgeWeightInfluence: 1,
   };
 };
 
-// Layout duration - let it run longer for better results
-// Web Worker + WebGL means minimal system impact
+// Layout duration — FA2 runs in a web worker so it doesn't block the UI.
+// Longer = better convergence, especially for large graphs starting from random positions.
 const getLayoutDuration = (nodeCount: number): number => {
-  if (nodeCount > 10000) return 45000;  // 45s for huge graphs
-  if (nodeCount > 5000) return 35000;   // 35s
-  if (nodeCount > 2000) return 30000;   // 30s
-  if (nodeCount > 1000) return 30000;   // 30s
+  if (nodeCount > 10000) return 90000;  // 90s for huge graphs
+  if (nodeCount > 5000) return 60000;   // 60s
+  if (nodeCount > 2000) return 45000;   // 45s
+  if (nodeCount > 1000) return 35000;   // 35s
   if (nodeCount > 500) return 25000;    // 25s
-  return 20000;                         // 20s for small graphs
+  return 15000;                         // 15s for small graphs
 };
 
 export const useSigma = (options: UseSigmaOptions = {}): UseSigmaReturn => {
@@ -194,7 +190,7 @@ export const useSigma = (options: UseSigmaOptions = {}): UseSigmaReturn => {
   useEffect(() => {
     if (!containerRef.current) return;
 
-    const graph = new Graph<SigmaNodeAttributes, SigmaEdgeAttributes>();
+    const graph = new MultiGraph<SigmaNodeAttributes, SigmaEdgeAttributes>();
     graphRef.current = graph;
 
     const sigma = new Sigma(graph, containerRef.current, {
@@ -265,7 +261,7 @@ export const useSigma = (options: UseSigmaOptions = {}): UseSigmaReturn => {
       
       minCameraRatio: 0.002,
       maxCameraRatio: 50,
-      hideEdgesOnMove: true,
+      hideEdgesOnMove: false,
       zIndex: true,
       
       nodeReducer: (node, data) => {

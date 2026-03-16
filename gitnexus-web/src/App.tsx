@@ -12,7 +12,7 @@ import { CodeReferencesPanel } from './components/CodeReferencesPanel';
 import { FileEntry } from './services/zip';
 import { getActiveProviderConfig } from './core/llm/settings-service';
 import { createKnowledgeGraph } from './core/graph/graph';
-import { connectToServer, fetchRepos, normalizeServerUrl, type ConnectToServerResult } from './services/server-connection';
+import { connectToServer, fetchRepos, normalizeServerUrl, type ConnectToServerResult, type RepoSummary } from './services/server-connection';
 
 const AppContent = () => {
   const {
@@ -156,6 +156,7 @@ const AppContent = () => {
     setFileContents(fileMap);
 
     // Transition directly to exploring view
+    setProgress(null);
     setViewMode('exploring');
 
     // Initialize agent if LLM is configured
@@ -171,61 +172,84 @@ const AppContent = () => {
         console.warn('Embeddings auto-start failed:', err);
       }
     });
-  }, [setViewMode, setGraph, setFileContents, setProjectName, initializeAgent, startEmbeddings]);
+  }, [setViewMode, setGraph, setFileContents, setProgress, setProjectName, initializeAgent, startEmbeddings]);
 
-  // Auto-connect when ?server query param is present (bookmarkable shortcut)
+  // Auto-connect: ?server param OR auto-detect localhost:4747
   const autoConnectRan = useRef(false);
   useEffect(() => {
     if (autoConnectRan.current) return;
-    const params = new URLSearchParams(window.location.search);
-    if (!params.has('server')) return;
     autoConnectRan.current = true;
 
+    const params = new URLSearchParams(window.location.search);
+    const serverUrl = params.get('server');
+
     // Clean the URL so a refresh won't re-trigger
-    const cleanUrl = window.location.pathname + window.location.hash;
-    window.history.replaceState(null, '', cleanUrl);
+    if (serverUrl) {
+      const cleanUrl = window.location.pathname + window.location.hash;
+      window.history.replaceState(null, '', cleanUrl);
+    }
 
-    setProgress({ phase: 'extracting', percent: 0, message: 'Connecting to server...', detail: 'Validating server' });
-    setViewMode('loading');
+    const doAutoConnect = async (url: string) => {
+      const baseUrl = normalizeServerUrl(url);
 
-    const serverUrl = params.get('server') || window.location.origin;
+      setProgress({ phase: 'extracting', percent: 0, message: 'Connecting to server...', detail: 'Validating server' });
+      setViewMode('loading');
 
-    const baseUrl = normalizeServerUrl(serverUrl);
-
-    connectToServer(serverUrl, (phase, downloaded, total) => {
-      if (phase === 'validating') {
-        setProgress({ phase: 'extracting', percent: 5, message: 'Connecting to server...', detail: 'Validating server' });
-      } else if (phase === 'downloading') {
-        const pct = total ? Math.round((downloaded / total) * 90) + 5 : 50;
-        const mb = (downloaded / (1024 * 1024)).toFixed(1);
-        setProgress({ phase: 'extracting', percent: pct, message: 'Downloading graph...', detail: `${mb} MB downloaded` });
-      } else if (phase === 'extracting') {
-        setProgress({ phase: 'extracting', percent: 97, message: 'Processing...', detail: 'Extracting file contents' });
-      }
-    }).then(async (result) => {
-      handleServerConnect(result);
-
-      // Store server URL and fetch available repos for the repo switcher
-      setServerBaseUrl(baseUrl);
       try {
-        const repos = await fetchRepos(baseUrl);
-        setAvailableRepos(repos);
-      } catch (e) {
-        console.warn('Failed to fetch repo list:', e);
+        const result = await connectToServer(url, (phase, downloaded, total) => {
+          if (phase === 'validating') {
+            setProgress({ phase: 'extracting', percent: 5, message: 'Connecting to server...', detail: 'Validating server' });
+          } else if (phase === 'downloading') {
+            const pct = total ? Math.round((downloaded / total) * 90) + 5 : 50;
+            const mb = (downloaded / (1024 * 1024)).toFixed(1);
+            setProgress({ phase: 'extracting', percent: pct, message: 'Downloading graph...', detail: `${mb} MB downloaded` });
+          } else if (phase === 'extracting') {
+            setProgress({ phase: 'extracting', percent: 97, message: 'Processing...', detail: 'Extracting file contents' });
+          }
+        });
+
+        handleServerConnect(result);
+        setServerBaseUrl(baseUrl);
+        try {
+          const repos = await fetchRepos(baseUrl);
+          setAvailableRepos(repos);
+        } catch (e) {
+          console.warn('Failed to fetch repo list:', e);
+        }
+      } catch (err) {
+        console.error('Auto-connect failed:', err);
+        setProgress({
+          phase: 'error',
+          percent: 0,
+          message: 'Failed to connect to server',
+          detail: err instanceof Error ? err.message : 'Unknown error',
+        });
+        setTimeout(() => {
+          setViewMode('onboarding');
+          setProgress(null);
+        }, 3000);
       }
-    }).catch((err) => {
-      console.error('Auto-connect failed:', err);
-      setProgress({
-        phase: 'error',
-        percent: 0,
-        message: 'Failed to connect to server',
-        detail: err instanceof Error ? err.message : 'Unknown error',
-      });
-      setTimeout(() => {
-        setViewMode('onboarding');
-        setProgress(null);
-      }, 3000);
-    });
+    };
+
+    if (serverUrl) {
+      doAutoConnect(serverUrl);
+    } else {
+      // Auto-detect: probe localhost:4747 and connect if a server is running
+      const DEFAULT_SERVER = 'http://localhost:4747';
+      fetch(`${DEFAULT_SERVER}/api/repos`, { signal: AbortSignal.timeout(2000) })
+        .then((res) => {
+          if (res.ok) return res.json();
+          throw new Error('not ok');
+        })
+        .then((repos: RepoSummary[]) => {
+          if (repos.length > 0) {
+            doAutoConnect(DEFAULT_SERVER);
+          }
+        })
+        .catch(() => {
+          // No server running — stay on onboarding
+        });
+    }
   }, [handleServerConnect, setProgress, setViewMode, setServerBaseUrl, setAvailableRepos]);
 
   const handleFocusNode = useCallback((nodeId: string) => {
@@ -273,7 +297,7 @@ const AppContent = () => {
 
       <main className="flex-1 flex min-h-0">
         {/* Left Panel - File Tree */}
-        <FileTreePanel onFocusNode={handleFocusNode} />
+        <FileTreePanel onFocusNode={handleFocusNode} onRerunLayout={() => graphCanvasRef.current?.startLayout()} />
 
         {/* Graph area - takes remaining space */}
         <div className="flex-1 relative min-w-0">
