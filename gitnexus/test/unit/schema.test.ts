@@ -19,6 +19,7 @@ import {
   RELATION_SCHEMA,
   EMBEDDING_SCHEMA,
   CREATE_VECTOR_INDEX_QUERY,
+  BASIC_BLOCK_SCHEMA,
 } from '../../src/core/lbug/schema.js';
 
 describe('LadybugDB Schema', () => {
@@ -30,6 +31,10 @@ describe('LadybugDB Schema', () => {
       }
     });
 
+    it('includes CFG node types', () => {
+      expect(NODE_TABLES).toContain('BasicBlock');
+    });
+
     it('includes multi-language node types', () => {
       const multiLang = ['Struct', 'Enum', 'Macro', 'Typedef', 'Union', 'Namespace', 'Trait', 'Impl',
         'TypeAlias', 'Const', 'Static', 'Property', 'Record', 'Delegate', 'Annotation', 'Constructor', 'Template', 'Module'];
@@ -39,8 +44,8 @@ describe('LadybugDB Schema', () => {
     });
 
     it('has expected total count', () => {
-      // 9 core + 18 multi-language + 1 Route = 28
-      expect(NODE_TABLES).toHaveLength(28);
+      // 9 core + 18 multi-language + 1 Route + 1 BasicBlock = 29
+      expect(NODE_TABLES).toHaveLength(29);
     });
   });
 
@@ -88,6 +93,14 @@ describe('LadybugDB Schema', () => {
       expect(PROCESS_SCHEMA).toContain('processType STRING');
       expect(PROCESS_SCHEMA).toContain('stepCount INT32');
     });
+
+    it('BasicBlock schema has CFG-specific fields', () => {
+      expect(BASIC_BLOCK_SCHEMA).toContain('CREATE NODE TABLE BasicBlock');
+      expect(BASIC_BLOCK_SCHEMA).toContain('blockIndex INT64');
+      expect(BASIC_BLOCK_SCHEMA).toContain('instructionCount INT64');
+      expect(BASIC_BLOCK_SCHEMA).toContain('isUnreachable BOOL');
+      expect(BASIC_BLOCK_SCHEMA).toContain('cfgInstructions STRING');
+    });
   });
 
   describe('relation schema', () => {
@@ -118,6 +131,23 @@ describe('LadybugDB Schema', () => {
     it('connects symbols to Process (STEP_IN_PROCESS)', () => {
       expect(RELATION_SCHEMA).toContain('FROM Function TO Process');
       expect(RELATION_SCHEMA).toContain('FROM Method TO Process');
+    });
+
+    it('connects functions/methods to BasicBlock (CFG_CONTAINS) and BasicBlock to BasicBlock (CFG_EDGE)', () => {
+      expect(RELATION_SCHEMA).toContain('FROM Function TO BasicBlock');
+      expect(RELATION_SCHEMA).toContain('FROM Method TO BasicBlock');
+      expect(RELATION_SCHEMA).toContain('FROM `Constructor` TO BasicBlock');
+      expect(RELATION_SCHEMA).toContain('FROM BasicBlock TO BasicBlock');
+    });
+
+    it('has cfgEdgeType and conditionText properties', () => {
+      expect(RELATION_SCHEMA).toContain('cfgEdgeType STRING');
+      expect(RELATION_SCHEMA).toContain('conditionText STRING');
+    });
+
+    it('includes CFG_CONTAINS and CFG_EDGE in REL_TYPES', () => {
+      expect(REL_TYPES).toContain('CFG_CONTAINS');
+      expect(REL_TYPES).toContain('CFG_EDGE');
     });
 
     it('has all FROM/TO pairs needed for HAS_METHOD edges', () => {
@@ -164,7 +194,7 @@ describe('LadybugDB Schema', () => {
 
   describe('schema query ordering', () => {
     it('NODE_SCHEMA_QUERIES has correct count', () => {
-      expect(NODE_SCHEMA_QUERIES).toHaveLength(28);
+      expect(NODE_SCHEMA_QUERIES).toHaveLength(29);
     });
 
     it('REL_SCHEMA_QUERIES has one relation table', () => {
@@ -172,8 +202,8 @@ describe('LadybugDB Schema', () => {
     });
 
     it('SCHEMA_QUERIES includes all node + rel + embedding schemas', () => {
-      // 28 node + 1 rel + 1 embedding = 30
-      expect(SCHEMA_QUERIES).toHaveLength(30);
+      // 29 node + 1 rel + 1 embedding = 31
+      expect(SCHEMA_QUERIES).toHaveLength(31);
     });
 
     it('node schemas come before relation schemas in SCHEMA_QUERIES', () => {

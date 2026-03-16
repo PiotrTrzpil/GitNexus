@@ -294,9 +294,9 @@ const fallbackRelationshipInserts = async (
   for (let i = 1; i < validRelLines.length; i++) {
     const line = validRelLines[i];
     try {
-      const match = line.match(/"([^"]*)","([^"]*)","([^"]*)",([0-9.]+),"([^"]*)",([0-9-]+)/);
+      const match = line.match(/"([^"]*)","([^"]*)","([^"]*)",([0-9.]+),"([^"]*)",([0-9-]+),"([^"]*)","([^"]*)"/);
       if (!match) continue;
-      const [, fromId, toId, relType, confidenceStr, reason, stepStr] = match;
+      const [, fromId, toId, relType, confidenceStr, reason, stepStr, cfgEdgeType, conditionText] = match;
       const fromLabel = getNodeLabel(fromId);
       const toLabel = getNodeLabel(toId);
       if (!validTables.has(fromLabel) || !validTables.has(toLabel)) continue;
@@ -308,7 +308,7 @@ const fallbackRelationshipInserts = async (
       await conn.query(`
         MATCH (a:${escapeLabel(fromLabel)} {id: '${esc(fromId)}' }),
               (b:${escapeLabel(toLabel)} {id: '${esc(toId)}' })
-        CREATE (a)-[:${REL_TABLE_NAME} {type: '${esc(relType)}', confidence: ${confidence}, reason: '${esc(reason)}', step: ${step}}]->(b)
+        CREATE (a)-[:${REL_TABLE_NAME} {type: '${esc(relType)}', confidence: ${confidence}, reason: '${esc(reason)}', step: ${step}, cfgEdgeType: '${esc(cfgEdgeType)}', conditionText: '${esc(conditionText)}'}]->(b)
       `);
     } catch {
       // skip
@@ -334,7 +334,13 @@ const getCopyQuery = (table: NodeTableName, filePath: string): string => {
     return `COPY ${t}(id, label, heuristicLabel, processType, stepCount, communities, entryPointId, terminalId) FROM "${filePath}" ${COPY_CSV_OPTS}`;
   }
   if (table === 'Method') {
-    return `COPY ${t}(id, name, filePath, startLine, endLine, isExported, content, description, parameterCount, returnType) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+    return `COPY ${t}(id, name, filePath, startLine, endLine, isExported, content, description, parameterCount, returnType, className) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+  }
+  if (table === 'Constructor' || table === 'Property') {
+    return `COPY ${t}(id, name, filePath, startLine, endLine, content, description, className) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+  }
+  if (table === 'BasicBlock') {
+    return `COPY ${t}(id, name, filePath, startLine, endLine, blockIndex, instructionCount, isUnreachable, cfgInstructions) FROM "${filePath}" ${COPY_CSV_OPTS}`;
   }
   // TypeScript/JS code element tables have isExported; multi-language tables do not
   if (TABLES_WITH_EXPORTED.has(table)) {

@@ -317,7 +317,20 @@ const findEnclosingFunctionId = (node: any, filePath: string): string | null => 
     if (FUNCTION_NODE_TYPES.has(current.type)) {
       const { funcName, label } = extractFunctionName(current);
       if (funcName) {
-        return generateId(label, `${filePath}:${funcName}`);
+        // Qualify with class name to match the node ID format (e.g. Method:file:Sequence.tick)
+        let qualifiedName = funcName;
+        if (label === 'Method' || label === 'Constructor') {
+          const nameNode = current.childForFieldName?.('name')
+            ?? current.children?.find((c: any) => c.type === 'property_identifier' || c.type === 'identifier');
+          const classId = findEnclosingClassId(nameNode || current, filePath);
+          if (classId) {
+            const className = classId.split(':').pop()!;
+            qualifiedName = `${className}.${funcName}`;
+          }
+        }
+        // Promote TS constructors to Constructor label (matches getLabelFromCaptures)
+        const resolvedLabel = (label === 'Method' && funcName === 'constructor') ? 'Constructor' : label;
+        return generateId(resolvedLabel, `${filePath}:${qualifiedName}`);
       }
     }
     current = current.parent;
@@ -337,7 +350,13 @@ const getLabelFromCaptures = (captureMap: Record<string, any>): string | null =>
   if (captureMap['definition.function']) return 'Function';
   if (captureMap['definition.class']) return 'Class';
   if (captureMap['definition.interface']) return 'Interface';
-  if (captureMap['definition.method']) return 'Method';
+  // In TypeScript/JavaScript, constructors are method_definition nodes with name "constructor".
+  // Promote them to Constructor label for consistency with languages that have explicit constructor AST nodes.
+  if (captureMap['definition.method']) {
+    const nameText = captureMap['name']?.text;
+    if (nameText === 'constructor') return 'Constructor';
+    return 'Method';
+  }
   if (captureMap['definition.struct']) return 'Struct';
   if (captureMap['definition.enum']) return 'Enum';
   if (captureMap['definition.namespace']) return 'Namespace';
@@ -1534,7 +1553,19 @@ const processFileGroup = (
       const nodeName = nameNode ? nameNode.text : 'init';
       const definitionNode = getDefinitionNodeFromCaptures(captureMap);
       const startLine = definitionNode ? definitionNode.startPosition.row : (nameNode ? nameNode.startPosition.row : 0);
-      const nodeId = generateId(nodeLabel, `${file.path}:${nodeName}`);
+
+      // Compute enclosing class early — needed for unique method IDs.
+      // Without this, methods with the same name in different classes (e.g. Sequence.tick,
+      // Selector.tick) would collide to a single node ID.
+      const needsOwner = nodeLabel === 'Method' || nodeLabel === 'Constructor' || nodeLabel === 'Property' || nodeLabel === 'Function';
+      const enclosingClassId = needsOwner ? findEnclosingClassId(nameNode || definitionNode, file.path) : null;
+
+      // Include enclosing class name in the ID to disambiguate same-name methods
+      // e.g. Method:src/foo.ts:Sequence.tick vs Method:src/foo.ts:Selector.tick
+      // enclosingClassId looks like "Class:src/foo.ts:ClassName" — extract the class name
+      const className = enclosingClassId ? enclosingClassId.split(':').pop()! : undefined;
+      const qualifiedName = className ? `${className}.${nodeName}` : nodeName;
+      const nodeId = generateId(nodeLabel, `${file.path}:${qualifiedName}`);
 
       let description: string | undefined;
       // Extract string literal value for Const nodes (string constants + error messages)
@@ -1632,13 +1663,9 @@ const processFileGroup = (
           ...(isReadonly ? { isReadonly } : {}),
           ...(isStatic ? { isStatic } : {}),
           ...(isAbstract ? { isAbstract } : {}),
+          ...(className ? { className } : {}),
         },
       });
-
-      // Compute enclosing class for Method/Constructor/Property/Function — used for both ownerId and HAS_METHOD
-      // Function is included because Kotlin/Rust/Python capture class methods as Function nodes
-      const needsOwner = nodeLabel === 'Method' || nodeLabel === 'Constructor' || nodeLabel === 'Property' || nodeLabel === 'Function';
-      const enclosingClassId = needsOwner ? findEnclosingClassId(nameNode || definitionNode, file.path) : null;
 
       result.symbols.push({
         filePath: file.path,
@@ -1775,7 +1802,7 @@ const processFileGroup = (
     }
 
     // ── oxc-cfg: intra-function control flow graphs (TS/JS only) ─────────────
-    if (analyzeCfg && (
+    if (analyzeCfg && !process.env.GITNEXUS_NO_CFG && (
       language === SupportedLanguages.TypeScript ||
       language === SupportedLanguages.JavaScript
     )) {

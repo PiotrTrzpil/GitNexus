@@ -19,6 +19,8 @@ export const NODE_TABLES = [
   'TypeAlias', 'Const', 'Static', 'Property', 'Record', 'Delegate', 'Annotation', 'Constructor', 'Template', 'Module',
   // CBM feature port
   'Route',
+  // CFG (control flow graph)
+  'BasicBlock',
 ] as const;
 export type NodeTableName = typeof NODE_TABLES[number];
 
@@ -28,7 +30,7 @@ export type NodeTableName = typeof NODE_TABLES[number];
 export const REL_TABLE_NAME = 'CodeRelation';
 
 // Valid relation types
-export const REL_TYPES = ['CONTAINS', 'DEFINES', 'IMPORTS', 'CALLS', 'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'OVERRIDES', 'MEMBER_OF', 'STEP_IN_PROCESS', 'FILE_CHANGES_WITH', 'HTTP_CALLS', 'ASYNC_CALLS', 'EMITS', 'SUBSCRIBES_TO'] as const;
+export const REL_TYPES = ['CONTAINS', 'DEFINES', 'IMPORTS', 'CALLS', 'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'OVERRIDES', 'MEMBER_OF', 'STEP_IN_PROCESS', 'FILE_CHANGES_WITH', 'HTTP_CALLS', 'ASYNC_CALLS', 'EMITS', 'SUBSCRIBES_TO', 'CFG_CONTAINS', 'CFG_EDGE'] as const;
 export type RelType = typeof REL_TYPES[number];
 
 // ============================================================================
@@ -108,6 +110,7 @@ CREATE NODE TABLE Method (
   description STRING,
   parameterCount INT32,
   returnType STRING,
+  className STRING,
   PRIMARY KEY (id)
 )`;
 
@@ -176,6 +179,20 @@ CREATE NODE TABLE \`${name}\` (
   PRIMARY KEY (id)
 )`;
 
+// Class member variant — adds className for class-scoped symbols
+const CLASS_MEMBER_BASE = (name: string) => `
+CREATE NODE TABLE \`${name}\` (
+  id STRING,
+  name STRING,
+  filePath STRING,
+  startLine INT64,
+  endLine INT64,
+  content STRING,
+  description STRING,
+  className STRING,
+  PRIMARY KEY (id)
+)`;
+
 // ============================================================================
 // ROUTE NODE TABLE (for HTTP route discovery)
 // ============================================================================
@@ -192,6 +209,24 @@ CREATE NODE TABLE Route (
   PRIMARY KEY (id)
 )`;
 
+// ============================================================================
+// BASIC BLOCK NODE TABLE (for CFG / control flow graph)
+// ============================================================================
+
+export const BASIC_BLOCK_SCHEMA = `
+CREATE NODE TABLE BasicBlock (
+  id STRING,
+  name STRING,
+  filePath STRING,
+  startLine INT64,
+  endLine INT64,
+  blockIndex INT64,
+  instructionCount INT64,
+  isUnreachable BOOL,
+  cfgInstructions STRING,
+  PRIMARY KEY (id)
+)`;
+
 export const STRUCT_SCHEMA = CODE_ELEMENT_BASE('Struct');
 export const ENUM_SCHEMA = CODE_ELEMENT_BASE('Enum');
 export const MACRO_SCHEMA = CODE_ELEMENT_BASE('Macro');
@@ -203,11 +238,11 @@ export const IMPL_SCHEMA = CODE_ELEMENT_BASE('Impl');
 export const TYPE_ALIAS_SCHEMA = CODE_ELEMENT_BASE('TypeAlias');
 export const CONST_SCHEMA = CODE_ELEMENT_BASE('Const');
 export const STATIC_SCHEMA = CODE_ELEMENT_BASE('Static');
-export const PROPERTY_SCHEMA = CODE_ELEMENT_BASE('Property');
+export const PROPERTY_SCHEMA = CLASS_MEMBER_BASE('Property');
 export const RECORD_SCHEMA = CODE_ELEMENT_BASE('Record');
 export const DELEGATE_SCHEMA = CODE_ELEMENT_BASE('Delegate');
 export const ANNOTATION_SCHEMA = CODE_ELEMENT_BASE('Annotation');
-export const CONSTRUCTOR_SCHEMA = CODE_ELEMENT_BASE('Constructor');
+export const CONSTRUCTOR_SCHEMA = CLASS_MEMBER_BASE('Constructor');
 export const TEMPLATE_SCHEMA = CODE_ELEMENT_BASE('Template');
 export const MODULE_SCHEMA = CODE_ELEMENT_BASE('Module');
 
@@ -408,10 +443,16 @@ CREATE REL TABLE ${REL_TABLE_NAME} (
   FROM \`Annotation\` TO Process,
   FROM \`Template\` TO Process,
   FROM CodeElement TO Process,
+  FROM Function TO BasicBlock,
+  FROM Method TO BasicBlock,
+  FROM \`Constructor\` TO BasicBlock,
+  FROM BasicBlock TO BasicBlock,
   type STRING,
   confidence DOUBLE,
   reason STRING,
-  step INT32
+  step INT32,
+  cfgEdgeType STRING,
+  conditionText STRING
 )`;
 
 // ============================================================================
@@ -470,6 +511,8 @@ export const NODE_SCHEMA_QUERIES = [
   MODULE_SCHEMA,
   // CBM feature port
   ROUTE_SCHEMA,
+  // CFG (control flow graph)
+  BASIC_BLOCK_SCHEMA,
 ];
 
 export const REL_SCHEMA_QUERIES = [

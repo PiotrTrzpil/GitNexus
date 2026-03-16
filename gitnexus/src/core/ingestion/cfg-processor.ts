@@ -33,7 +33,7 @@ function findParentNode(
   let containsMatch: GraphNode | undefined;
 
   graph.forEachNode((node) => {
-    if (node.label !== 'Function' && node.label !== 'Method') return;
+    if (node.label !== 'Function' && node.label !== 'Method' && node.label !== 'Constructor') return;
     if (node.properties.filePath !== filePath) return;
 
     const nodeStart = node.properties.startLine;
@@ -112,8 +112,24 @@ export const processCfgFromExtracted = async (
       // after all blocks are created.
       const blockNodeIds = new Map<number, string>();
 
+      // Identify error handler sink blocks: blocks with zero instructions
+      // that only receive ErrorImplicit edges. These are synthetic OXC nodes
+      // that become orphans after ErrorImplicit filtering.
+      const errorSinkBlockIds = new Set<number>();
+      for (const block of cfgFn.blocks) {
+        if (block.instructions.length > 0) continue;
+        // Check if this block only has incoming ErrorImplicit edges
+        const hasNonErrorIncoming = cfgFn.edges.some(
+          e => e.target === block.id && e.type !== 'ErrorImplicit',
+        );
+        if (!hasNonErrorIncoming) {
+          errorSinkBlockIds.add(block.id);
+        }
+      }
+
       // ── Create BasicBlock nodes ──────────────────────────────────────────
       for (const block of cfgFn.blocks) {
+        if (errorSinkBlockIds.has(block.id)) continue;
         const basicBlockNodeId = generateId('BasicBlock', `${parentNodeId}:${block.id}`);
         blockNodeIds.set(block.id, basicBlockNodeId);
 
@@ -161,7 +177,13 @@ export const processCfgFromExtracted = async (
       }
 
       // ── Create CFG_EDGE relationships ────────────────────────────────────
+      // Skip ErrorImplicit edges: OXC generates one from every block to a
+      // synthetic error handler sink (an empty block with no source location).
+      // These represent "any statement could throw" — they're correct but add
+      // ~45% edge noise that inflates complexity metrics without aiding analysis.
       for (const edge of cfgFn.edges) {
+        if (edge.type === 'ErrorImplicit') continue;
+
         const sourceBlockNodeId = blockNodeIds.get(edge.source);
         const targetBlockNodeId = blockNodeIds.get(edge.target);
 
