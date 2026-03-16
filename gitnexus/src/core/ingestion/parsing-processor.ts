@@ -1,6 +1,6 @@
 import { KnowledgeGraph, GraphNode, GraphRelationship } from '../graph/types.js';
 import Parser from 'tree-sitter';
-import { loadParser, loadLanguage } from '../tree-sitter/parser-loader.js';
+import { loadParser, loadLanguage, isLanguageAvailable } from '../tree-sitter/parser-loader.js';
 import { LANGUAGE_QUERIES } from './tree-sitter-queries.js';
 import { generateId } from '../../lib/utils.js';
 import { SymbolTable } from './symbol-table.js';
@@ -8,6 +8,7 @@ import { ASTCache } from './ast-cache.js';
 import { getLanguageFromFilename, yieldToEventLoop, DEFINITION_CAPTURE_KEYS, getDefinitionNodeFromCaptures, findEnclosingClassId, extractMethodSignature } from './utils.js';
 import { isNodeExported } from './export-detection.js';
 import { detectFrameworkFromAST } from './framework-detection.js';
+import { typeConfigs } from './type-extractors/index.js';
 import { WorkerPool } from './workers/worker-pool.js';
 import type { ParseWorkerResult, ParseWorkerInput, ExtractedImport, ExtractedCall, ExtractedHeritage, ExtractedRoute, FileConstructorBindings } from './workers/parse-worker.js';
 import { getTreeSitterBufferSize, TREE_SITTER_MAX_BUFFER } from './constants.js';
@@ -79,6 +80,7 @@ const processParsingWithWorkers = async (
     for (const sym of result.symbols) {
       symbolTable.add(sym.filePath, sym.name, sym.nodeId, sym.type, {
         parameterCount: sym.parameterCount,
+        returnType: sym.returnType,
         ownerId: sym.ownerId,
       });
     }
@@ -88,6 +90,20 @@ const processParsingWithWorkers = async (
     allHeritage.push(...result.heritage);
     allRoutes.push(...result.routes);
     allConstructorBindings.push(...result.constructorBindings);
+  }
+
+  // Merge and log skipped languages from workers
+  const skippedLanguages = new Map<string, number>();
+  for (const result of chunkResults) {
+    for (const [lang, count] of Object.entries(result.skippedLanguages)) {
+      skippedLanguages.set(lang, (skippedLanguages.get(lang) || 0) + count);
+    }
+  }
+  if (skippedLanguages.size > 0) {
+    const summary = Array.from(skippedLanguages.entries())
+      .map(([lang, count]) => `${lang}: ${count}`)
+      .join(', ');
+    console.warn(`  Skipped unsupported languages: ${summary}`);
   }
 
   // Final progress
@@ -108,6 +124,7 @@ const processParsingSequential = async (
 ) => {
   const parser = await loadParser();
   const total = files.length;
+  const skippedLanguages = new Map<string, number>();
 
   for (let i = 0; i < files.length; i++) {
     const file = files[i];
@@ -120,13 +137,19 @@ const processParsingSequential = async (
 
     if (!language) continue;
 
+    // Skip unsupported languages (e.g. Swift when tree-sitter-swift not installed)
+    if (!isLanguageAvailable(language)) {
+      skippedLanguages.set(language, (skippedLanguages.get(language) || 0) + 1);
+      continue;
+    }
+
     // Skip files larger than the max tree-sitter buffer (32 MB)
     if (file.content.length > TREE_SITTER_MAX_BUFFER) continue;
 
     try {
       await loadLanguage(language, file.path);
     } catch {
-      continue;  // parser unavailable — already warned in pipeline
+      continue;  // parser unavailable — safety net
     }
 
     let tree;
@@ -215,6 +238,14 @@ const processParsingSequential = async (
         ? extractMethodSignature(definitionNode)
         : undefined;
 
+      // Language-specific return type fallback (e.g. Ruby YARD @return [Type])
+      if (methodSig && !methodSig.returnType && definitionNode) {
+        const tc = typeConfigs[language as keyof typeof typeConfigs];
+        if (tc?.extractReturnType) {
+          methodSig.returnType = tc.extractReturnType(definitionNode);
+        }
+      }
+
       const node: GraphNode = {
         id: nodeId,
         label: nodeLabel as any,
@@ -245,6 +276,7 @@ const processParsingSequential = async (
 
       symbolTable.add(file.path, nodeName, nodeId, nodeLabel, {
         parameterCount: methodSig?.parameterCount,
+        returnType: methodSig?.returnType,
         ownerId: enclosingClassId ?? undefined,
       });
 
@@ -275,6 +307,13 @@ const processParsingSequential = async (
         });
       }
     });
+  }
+
+  if (skippedLanguages.size > 0) {
+    const summary = Array.from(skippedLanguages.entries())
+      .map(([lang, count]) => `${lang}: ${count}`)
+      .join(', ');
+    console.warn(`  Skipped unsupported languages: ${summary}`);
   }
 };
 

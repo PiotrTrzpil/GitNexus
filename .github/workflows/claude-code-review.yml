@@ -15,6 +15,12 @@ on:
   issue_comment:
     types: [created]
 
+# Serialize per-PR so concurrent @claude comments don't race on the
+# temporary fork branch push/delete.
+concurrency:
+  group: claude-review-${{ github.event.issue.number || github.event.pull_request.number }}
+  cancel-in-progress: false
+
 jobs:
   claude-review:
     # Run only when:
@@ -41,7 +47,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
-      contents: write       # needed to push fork branch to origin
+      contents: write       # needed to create fork branch ref via API
       pull-requests: write
       issues: read
       id-token: write
@@ -76,11 +82,25 @@ jobs:
           fetch-depth: 1
 
       # claude-code-action fetches branches by name from origin, which fails
-      # for fork PRs. Work around by pushing the fork branch to origin so
-      # the action can find it.  Cleaned up in the post step below.
-      - name: Push fork branch to origin
+      # for fork PRs. Create a temporary branch ref via the API so the action
+      # can find it. Using the API (not git push) avoids the GITHUB_TOKEN
+      # restriction that blocks pushing commits containing workflow file changes.
+      - name: Create fork branch ref on origin
+        id: push-fork
         if: steps.pr.outputs.is_fork == 'true'
-        run: git push origin HEAD:refs/heads/${{ steps.pr.outputs.branch }}
+        env:
+          FORK_BRANCH: ${{ steps.pr.outputs.branch }}
+          FORK_SHA: ${{ steps.pr.outputs.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/${{ github.repository }}/git/refs" \
+            --method POST \
+            -f ref="refs/heads/$FORK_BRANCH" \
+            -f sha="$FORK_SHA" \
+          || gh api "repos/${{ github.repository }}/git/refs/heads/$FORK_BRANCH" \
+            --method PATCH \
+            -f sha="$FORK_SHA" \
+            -F force=true
 
       - name: Run Claude Code Review
         id: claude-review
@@ -91,7 +111,11 @@ jobs:
           plugins: 'code-review@claude-code-plugins'
           prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ steps.pr.outputs.number }}'
 
-      # Clean up the temporary branch we pushed for fork PRs
-      - name: Delete fork branch from origin
-        if: always() && steps.pr.outputs.is_fork == 'true'
-        run: git push origin --delete refs/heads/${{ steps.pr.outputs.branch }} || true
+      # Clean up the temporary branch ref we created for fork PRs.
+      # Only delete if the create step actually succeeded.
+      - name: Delete fork branch ref from origin
+        if: always() && steps.push-fork.outcome == 'success'
+        env:
+          FORK_BRANCH: ${{ steps.pr.outputs.branch }}
+          GH_TOKEN: ${{ github.token }}
+        run: gh api "repos/${{ github.repository }}/git/refs/heads/$FORK_BRANCH" --method DELETE || true

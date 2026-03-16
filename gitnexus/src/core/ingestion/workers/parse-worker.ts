@@ -24,6 +24,10 @@ try { Kotlin = _require('tree-sitter-kotlin'); } catch {}
 
 let Swift: any = null;
 try { Swift = _require('tree-sitter-swift'); } catch {}
+
+// tree-sitter-kotlin is an optionalDependency — may not be installed
+let Kotlin: any = null;
+try { Kotlin = _require('tree-sitter-kotlin'); } catch {}
 import { 
   getLanguageFromFilename,
   FUNCTION_NODE_TYPES,
@@ -40,6 +44,7 @@ import { buildTypeEnv } from '../type-env.js';
 import type { ConstructorBinding } from '../type-env.js';
 import { isNodeExported } from '../export-detection.js';
 import { detectFrameworkFromAST } from '../framework-detection.js';
+import { typeConfigs } from '../type-extractors/index.js';
 import { generateId } from '../../../lib/utils.js';
 import { extractNamedBindings } from '../named-binding-extraction.js';
 import { appendKotlinWildcard } from '../resolvers/index.js';
@@ -82,6 +87,7 @@ interface ParsedSymbol {
   nodeId: string;
   type: string;
   parameterCount?: number;
+  returnType?: string;
   ownerId?: string;
 }
 
@@ -145,6 +151,7 @@ export interface ParseWorkerResult {
   heritage: ExtractedHeritage[];
   routes: ExtractedRoute[];
   constructorBindings: FileConstructorBindings[];
+  skippedLanguages: Record<string, number>;
   fileCount: number;
 }
 
@@ -170,10 +177,23 @@ const languageMap: Record<string, any> = {
   [SupportedLanguages.CSharp]: CSharp,
   [SupportedLanguages.Go]: Go,
   [SupportedLanguages.Rust]: Rust,
-  [SupportedLanguages.Kotlin]: Kotlin,
+  ...(Kotlin ? { [SupportedLanguages.Kotlin]: Kotlin } : {}),
   [SupportedLanguages.PHP]: PHP.php_only,
   [SupportedLanguages.Ruby]: Ruby,
   ...(Swift ? { [SupportedLanguages.Swift]: Swift } : {}),
+};
+
+/**
+ * Check if a language grammar is available in this worker.
+ * Duplicated from parser-loader.ts because workers can't import from the main thread.
+ * Extra filePath parameter needed to distinguish .tsx from .ts (different grammars
+ * under the same SupportedLanguages.TypeScript key).
+ */
+const isLanguageAvailable = (language: SupportedLanguages, filePath: string): boolean => {
+  const key = language === SupportedLanguages.TypeScript && filePath.endsWith('.tsx')
+    ? `${language}:tsx`
+    : language;
+  return key in languageMap && languageMap[key] != null;
 };
 
 const setLanguage = (language: SupportedLanguages, filePath: string): void => {
@@ -258,6 +278,7 @@ const processBatch = (files: ParseWorkerInput[], onProgress?: (filesProcessed: n
     heritage: [],
     routes: [],
     constructorBindings: [],
+    skippedLanguages: {},
     fileCount: 0,
   };
 
@@ -308,21 +329,29 @@ const processBatch = (files: ParseWorkerInput[], onProgress?: (filesProcessed: n
 
     // Process regular files for this language
     if (regularFiles.length > 0) {
-      try {
-        setLanguage(language, regularFiles[0].path);
-        processFileGroup(regularFiles, language, queryString, result, onFileProcessed);
-      } catch {
-        // parser unavailable — skip this language group
+      if (isLanguageAvailable(language, regularFiles[0].path)) {
+        try {
+          setLanguage(language, regularFiles[0].path);
+          processFileGroup(regularFiles, language, queryString, result, onFileProcessed);
+        } catch {
+          // parser unavailable — skip this language group
+        }
+      } else {
+        result.skippedLanguages[language] = (result.skippedLanguages[language] || 0) + regularFiles.length;
       }
     }
 
     // Process tsx files separately (different grammar)
     if (tsxFiles.length > 0) {
-      try {
-        setLanguage(language, tsxFiles[0].path);
-        processFileGroup(tsxFiles, language, queryString, result, onFileProcessed);
-      } catch {
-        // parser unavailable — skip this language group
+      if (isLanguageAvailable(language, tsxFiles[0].path)) {
+        try {
+          setLanguage(language, tsxFiles[0].path);
+          processFileGroup(tsxFiles, language, queryString, result, onFileProcessed);
+        } catch {
+          // parser unavailable — skip this language group
+        }
+      } else {
+        result.skippedLanguages[language] = (result.skippedLanguages[language] || 0) + tsxFiles.length;
       }
     }
   }
@@ -1131,6 +1160,14 @@ const processFileGroup = (
         const sig = extractMethodSignature(definitionNode);
         parameterCount = sig.parameterCount;
         returnType = sig.returnType;
+
+        // Language-specific return type fallback (e.g. Ruby YARD @return [Type])
+        if (!returnType && definitionNode) {
+          const tc = typeConfigs[language as keyof typeof typeConfigs];
+          if (tc?.extractReturnType) {
+            returnType = tc.extractReturnType(definitionNode);
+          }
+        }
       }
 
       result.nodes.push({
@@ -1164,6 +1201,7 @@ const processFileGroup = (
         nodeId,
         type: nodeLabel,
         ...(parameterCount !== undefined ? { parameterCount } : {}),
+        ...(returnType !== undefined ? { returnType } : {}),
         ...(enclosingClassId ? { ownerId: enclosingClassId } : {}),
       });
 
@@ -1206,7 +1244,7 @@ const processFileGroup = (
 /** Accumulated result across sub-batches */
 let accumulated: ParseWorkerResult = {
   nodes: [], relationships: [], symbols: [],
-  imports: [], calls: [], heritage: [], routes: [], constructorBindings: [], fileCount: 0,
+  imports: [], calls: [], heritage: [], routes: [], constructorBindings: [], skippedLanguages: {}, fileCount: 0,
 };
 let cumulativeProcessed = 0;
 
@@ -1219,6 +1257,9 @@ const mergeResult = (target: ParseWorkerResult, src: ParseWorkerResult) => {
   target.heritage.push(...src.heritage);
   target.routes.push(...src.routes);
   target.constructorBindings.push(...src.constructorBindings);
+  for (const [lang, count] of Object.entries(src.skippedLanguages)) {
+    target.skippedLanguages[lang] = (target.skippedLanguages[lang] || 0) + count;
+  }
   target.fileCount += src.fileCount;
 };
 
@@ -1240,7 +1281,7 @@ parentPort!.on('message', (msg: any) => {
     if (msg && msg.type === 'flush') {
       parentPort!.postMessage({ type: 'result', data: accumulated });
       // Reset for potential reuse
-      accumulated = { nodes: [], relationships: [], symbols: [], imports: [], calls: [], heritage: [], routes: [], constructorBindings: [], fileCount: 0 };
+      accumulated = { nodes: [], relationships: [], symbols: [], imports: [], calls: [], heritage: [], routes: [], constructorBindings: [], skippedLanguages: {}, fileCount: 0 };
       cumulativeProcessed = 0;
       return;
     }
