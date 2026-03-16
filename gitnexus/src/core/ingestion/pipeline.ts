@@ -326,7 +326,7 @@ export const runPipelineFromRepo = async (
                 });
               },
             ),
-            processCfgFromExtracted(
+            ...(!process.env.GITNEXUS_NO_CFG ? [processCfgFromExtracted(
               graph,
               chunkWorkerData.cfgData ?? [],
               ctx,
@@ -339,7 +339,7 @@ export const runPipelineFromRepo = async (
                   stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
                 });
               },
-            ),
+            )] : []),
           ]);
         } else {
           await processImports(graph, chunkFiles, astCache, ctx, undefined, repoPath, allPaths);

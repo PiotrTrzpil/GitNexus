@@ -48,6 +48,7 @@ export interface AnalyzeOptions {
   embeddings?: boolean;
   skills?: boolean;
   verbose?: boolean;
+  cfg?: boolean;
 }
 
 /** Threshold: auto-skip embeddings for repos with more nodes than this */
@@ -77,6 +78,10 @@ export const analyzeCommand = async (
 
   if (options?.verbose) {
     process.env.GITNEXUS_VERBOSE = '1';
+  }
+
+  if (options?.cfg === false) {
+    process.env.GITNEXUS_NO_CFG = '1';
   }
 
   console.log('\n  GitNexus Analyzer\n');
@@ -199,6 +204,17 @@ export const analyzeCommand = async (
       await closeLbug();
     } catch {
       try { await closeLbug(); } catch {}
+    }
+  }
+
+  // When --force is set, delete stored file hashes so the incremental
+  // classifier treats every file as changed (full re-parse).
+  if (options?.force) {
+    const { fileHashPath } = getStoragePaths(repoPath);
+    try {
+      await fs.rm(fileHashPath, { force: true });
+    } catch (err: any) {
+      console.warn(`[analyze] Failed to remove file hashes for --force re-index: ${err?.message}`);
     }
   }
 

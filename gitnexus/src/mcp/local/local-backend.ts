@@ -2480,6 +2480,45 @@ export class LocalBackend {
     }
   }
 
+  /** Cached per-repo check: are BasicBlock nodes present? */
+  private _cfgDataCache = new Map<string, boolean>();
+
+  private async _hasCfgData(repoId: string): Promise<boolean> {
+    const cached = this._cfgDataCache.get(repoId);
+    if (cached !== undefined) return cached;
+    try {
+      const rows = await executeQuery(repoId, `MATCH (n:BasicBlock) RETURN n.id LIMIT 1`);
+      const has = rows.length > 0;
+      this._cfgDataCache.set(repoId, has);
+      return has;
+    } catch {
+      this._cfgDataCache.set(repoId, false);
+      return false;
+    }
+  }
+
+  /** Augment function results with CFG block counts (cfgBlocks, unreachableBlocks). */
+  private async _augmentWithCfgStats(
+    repoId: string,
+    results: Array<{ id?: string; [k: string]: any }>,
+  ): Promise<void> {
+    for (const r of results) {
+      if (!r.id) continue;
+      try {
+        const blockRows = await executeParameterized(repoId,
+          `MATCH (n {id: $id})-[:CodeRelation {type: 'CFG_CONTAINS'}]->(b:BasicBlock)
+           RETURN COUNT(b) AS total, COUNT(CASE WHEN b.isUnreachable = true THEN 1 END) AS unreachable`,
+          { id: r.id });
+        const total = blockRows[0]?.total ?? blockRows[0]?.[0] ?? 0;
+        const unreachable = blockRows[0]?.unreachable ?? blockRows[0]?.[1] ?? 0;
+        if (total > 0) {
+          r.cfgBlocks = total;
+          if (unreachable > 0) r.unreachableBlocks = unreachable;
+        }
+      } catch {}
+    }
+  }
+
   private async _runQualityPreset(
     repo: RepoHandle,
     preset: string,
@@ -2491,6 +2530,7 @@ export class LocalBackend {
 
       // ── high_complexity ────────────────────────────────────────────────
       // Functions/methods with cyclomatic complexity above threshold.
+      // When CFG data is available, includes cfgBlocks and unreachableBlocks.
       case 'high_complexity': {
         if (threshold === undefined) throw new Error('threshold is required for high_complexity');
         const rows = await executeParameterized(repo.id, `
@@ -2503,7 +2543,8 @@ export class LocalBackend {
           ORDER BY n.complexity DESC
           LIMIT 200
         `, { threshold });
-        return rows.map((r: any) => ({
+        const results = rows.map((r: any) => ({
+          id: r.id ?? r[0],
           name: r.name ?? r[1],
           label: r.label ?? r[2],
           filePath: r.filePath ?? r[3],
@@ -2511,6 +2552,10 @@ export class LocalBackend {
           complexity: r.complexity ?? r[5],
           sloc: r.sloc ?? r[6],
         }));
+        if (await this._hasCfgData(repo.id)) {
+          await this._augmentWithCfgStats(repo.id, results);
+        }
+        return results.map(({ id, ...rest }) => rest);
       }
 
       // ── many_optionals ────────────────────────────────────────────────
@@ -2916,6 +2961,7 @@ export class LocalBackend {
       // ── god_functions ─────────────────────────────────────────────────
       // Functions with high complexity AND high fan-out AND many params.
       // Thresholds: complexity > 10, outbound CALLS > 8, parameterCount > 4.
+      // When CFG data is available, includes cfgBlocks and unreachableBlocks.
       case 'god_functions': {
         const complexityThreshold = threshold ?? 10;
         const rows = await executeParameterized(repo.id, `
@@ -2930,6 +2976,7 @@ export class LocalBackend {
           LIMIT 200
         `, { complexity: complexityThreshold });
 
+        const hasCfg = await this._hasCfgData(repo.id);
         const results: any[] = [];
         for (const r of rows) {
           const id = r.id ?? r[0] ?? '';
@@ -2941,7 +2988,8 @@ export class LocalBackend {
             outDeg = degRows[0]?.cnt ?? degRows[0]?.[0] ?? 0;
           } catch {}
           if (outDeg > 8) {
-            results.push({
+            const entry: any = {
+              id,
               name: r.name ?? r[1],
               label: r.label ?? r[2],
               filePath: r.filePath ?? r[3],
@@ -2949,10 +2997,16 @@ export class LocalBackend {
               complexity: r.complexity ?? r[5],
               parameterCount: r.parameterCount ?? r[6],
               outboundCalls: outDeg,
-            });
+            };
+            results.push(entry);
           }
         }
-        return results.sort((a, b) => b.complexity - a.complexity);
+        if (hasCfg) {
+          await this._augmentWithCfgStats(repo.id, results);
+        }
+        return results
+          .sort((a, b) => b.complexity - a.complexity)
+          .map(({ id, ...rest }) => rest);
       }
 
       // ── throw_diversity ───────────────────────────────────────────────
@@ -3056,6 +3110,7 @@ export class LocalBackend {
       // ── hot_path ──────────────────────────────────────────────────────
       // BFS from a given function following only unconditional CALLS edges
       // (isConditional = false or absent). Returns the always-executed call chain.
+      // When CFG data is available, includes cfgBlocks and unreachableBlocks per function.
       case 'hot_path': {
         if (!funcName) throw new Error('function is required for hot_path');
         // Find the source function node
@@ -3097,7 +3152,10 @@ export class LocalBackend {
           frontier = nextFrontier;
           depth++;
         }
-        return chain;
+        if (await this._hasCfgData(repo.id)) {
+          await this._augmentWithCfgStats(repo.id, chain);
+        }
+        return chain.map(({ id, ...rest }) => rest);
       }
 
       // ── guarded_paths ─────────────────────────────────────────────────
@@ -3149,8 +3207,139 @@ export class LocalBackend {
         return [...guardGroups.values()].sort((a, b) => a.branchDepth - b.branchDepth);
       }
 
+      // ── unreachable_code ──────────────────────────────────────────────
+      // Functions containing statically unreachable BasicBlocks (requires CFG data).
+      case 'unreachable_code': {
+        if (!await this._hasCfgData(repo.id)) {
+          return [{ error: 'No CFG data available. Re-run analyze without --no-cfg to generate CFG data.' }];
+        }
+        const rows = await executeQuery(repo.id, `
+          MATCH (fn)-[:CodeRelation {type: 'CFG_CONTAINS'}]->(b:BasicBlock)
+          WHERE b.isUnreachable = true
+          RETURN fn.id AS fnId, fn.name AS fnName, labels(fn)[0] AS fnLabel,
+                 fn.filePath AS filePath, fn.startLine AS startLine,
+                 b.name AS blockName, b.startLine AS blockStartLine, b.endLine AS blockEndLine,
+                 b.instructionCount AS instructionCount
+          ORDER BY fn.filePath, fn.startLine
+          LIMIT 200
+        `);
+        // Group by function
+        const grouped = new Map<string, {
+          name: string; label: string; filePath: string; startLine: any;
+          unreachableBlocks: Array<{ blockName: string; startLine: any; endLine: any; instructionCount: any }>;
+        }>();
+        for (const r of rows) {
+          const fnId = r.fnId ?? r[0] ?? '';
+          if (!fnId) continue;
+          if (!grouped.has(fnId)) {
+            grouped.set(fnId, {
+              name: r.fnName ?? r[1] ?? '',
+              label: r.fnLabel ?? r[2] ?? '',
+              filePath: r.filePath ?? r[3] ?? '',
+              startLine: r.startLine ?? r[4],
+              unreachableBlocks: [],
+            });
+          }
+          grouped.get(fnId)!.unreachableBlocks.push({
+            blockName: r.blockName ?? r[5] ?? '',
+            startLine: r.blockStartLine ?? r[6],
+            endLine: r.blockEndLine ?? r[7],
+            instructionCount: r.instructionCount ?? r[8] ?? 0,
+          });
+        }
+        return [...grouped.values()];
+      }
+
+      // ── cfg_complexity ─────────────────────────────────────────────────
+      // True cyclomatic complexity from CFG: (edges − blocks + 2) per function.
+      // Requires CFG data. threshold defaults to 5.
+      case 'cfg_complexity': {
+        if (!await this._hasCfgData(repo.id)) {
+          return [{ error: 'No CFG data available. Re-run analyze without --no-cfg to generate CFG data.' }];
+        }
+        const cfgThreshold = threshold ?? 5;
+        // Count blocks and edges per function
+        const blockRows = await executeQuery(repo.id, `
+          MATCH (fn)-[:CodeRelation {type: 'CFG_CONTAINS'}]->(b:BasicBlock)
+          RETURN fn.id AS fnId, fn.name AS fnName, labels(fn)[0] AS fnLabel,
+                 fn.filePath AS filePath, fn.startLine AS startLine,
+                 fn.complexity AS astComplexity, fn.sloc AS sloc
+        `);
+        const fnMap = new Map<string, {
+          name: string; label: string; filePath: string; startLine: any;
+          astComplexity: any; sloc: any; blockCount: number; blockIds: string[];
+        }>();
+        // Also need block IDs to count edges between them
+        const blockIdRows = await executeQuery(repo.id, `
+          MATCH (fn)-[:CodeRelation {type: 'CFG_CONTAINS'}]->(b:BasicBlock)
+          RETURN fn.id AS fnId, b.id AS blockId
+        `);
+        // Group blocks by function
+        const fnBlockIds = new Map<string, Set<string>>();
+        for (const r of blockIdRows) {
+          const fnId = r.fnId ?? r[0] ?? '';
+          const blockId = r.blockId ?? r[1] ?? '';
+          if (!fnId || !blockId) continue;
+          if (!fnBlockIds.has(fnId)) fnBlockIds.set(fnId, new Set());
+          fnBlockIds.get(fnId)!.add(blockId);
+        }
+        for (const r of blockRows) {
+          const fnId = r.fnId ?? r[0] ?? '';
+          if (!fnId || fnMap.has(fnId)) continue;
+          fnMap.set(fnId, {
+            name: r.fnName ?? r[1] ?? '',
+            label: r.fnLabel ?? r[2] ?? '',
+            filePath: r.filePath ?? r[3] ?? '',
+            startLine: r.startLine ?? r[4],
+            astComplexity: r.astComplexity ?? r[5],
+            sloc: r.sloc ?? r[6],
+            blockCount: fnBlockIds.get(fnId)?.size ?? 0,
+            blockIds: [],
+          });
+        }
+        // Count CFG_EDGE per function
+        const edgeRows = await executeQuery(repo.id, `
+          MATCH (b1:BasicBlock)-[:CodeRelation {type: 'CFG_EDGE'}]->(b2:BasicBlock)
+          RETURN b1.id AS srcId, b2.id AS tgtId
+        `);
+        const fnEdgeCounts = new Map<string, number>();
+        // Reverse lookup: blockId → fnId
+        const blockToFn = new Map<string, string>();
+        for (const [fnId, blockIds] of fnBlockIds) {
+          for (const bid of blockIds) {
+            blockToFn.set(bid, fnId);
+          }
+        }
+        for (const r of edgeRows) {
+          const srcId = r.srcId ?? r[0] ?? '';
+          const fnId = blockToFn.get(srcId);
+          if (fnId) {
+            fnEdgeCounts.set(fnId, (fnEdgeCounts.get(fnId) ?? 0) + 1);
+          }
+        }
+        const results: any[] = [];
+        for (const [fnId, fn] of fnMap) {
+          const edgeCount = fnEdgeCounts.get(fnId) ?? 0;
+          const cfgCyclomaticComplexity = edgeCount - fn.blockCount + 2;
+          if (cfgCyclomaticComplexity > cfgThreshold) {
+            results.push({
+              name: fn.name,
+              label: fn.label,
+              filePath: fn.filePath,
+              startLine: fn.startLine,
+              cfgComplexity: cfgCyclomaticComplexity,
+              astComplexity: fn.astComplexity,
+              cfgBlocks: fn.blockCount,
+              cfgEdges: edgeCount,
+              sloc: fn.sloc,
+            });
+          }
+        }
+        return results.sort((a, b) => b.cfgComplexity - a.cfgComplexity).slice(0, 200);
+      }
+
       default:
-        throw new Error(`Unknown quality_query preset: ${preset}. Valid presets: high_complexity, many_optionals, dead_code, cross_class_field_access, encapsulation_violations, unused_injections, overused_injections, params_by_type, param_fan_in, type_coupling, layer_violations, god_functions, throw_diversity, accessor_vs_direct, conditional_calls, hot_path, guarded_paths`);
+        throw new Error(`Unknown quality_query preset: ${preset}. Valid presets: high_complexity, many_optionals, dead_code, cross_class_field_access, encapsulation_violations, unused_injections, overused_injections, params_by_type, param_fan_in, type_coupling, layer_violations, god_functions, throw_diversity, accessor_vs_direct, conditional_calls, hot_path, guarded_paths, unreachable_code, cfg_complexity`);
     }
   }
 
