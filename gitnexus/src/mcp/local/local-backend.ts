@@ -1629,6 +1629,73 @@ export class LocalBackend {
     };
   }
 
+  // ─── File Watcher Support ─────────────────────────────────────
+
+  /**
+   * Return repo metadata needed for the file watcher (path + file count).
+   * Used by startMCPServer() to configure adaptive polling intervals.
+   */
+  async getWatchableRepos(): Promise<Array<{ path: string; fileCount: number }>> {
+    const entries = await listRegisteredRepos({ validate: true });
+    return entries.map(e => ({
+      path: e.path,
+      fileCount: e.stats?.files ?? 0,
+    }));
+  }
+
+  /**
+   * Re-run the analysis pipeline for a repo and reload the LadybugDB connection.
+   * Called by the file watcher when changes are detected.
+   */
+  async reindexRepo(repoPath: string): Promise<void> {
+    const { runPipelineFromRepo } = await import('../../core/ingestion/pipeline.js');
+    const {
+      initLbug: initCoreLbug,
+      loadGraphToLbug,
+      closeLbug: closeCoreLbug,
+    } = await import('../../core/lbug/lbug-adapter.js');
+    const { getStoragePaths, saveMeta, registerRepo } = await import('../../storage/repo-manager.js');
+    const { getCurrentCommit } = await import('../../storage/git.js');
+
+    const resolved = path.resolve(repoPath);
+    const { storagePath, lbugPath } = getStoragePaths(resolved);
+
+    // Close the MCP pool's read-only connection so we can write without lock conflicts
+    const handle = [...this.repos.values()].find(h => h.repoPath === resolved);
+    if (handle) {
+      try { await closeLbug(handle.id); } catch (err) {
+        console.warn(`[reindexRepo] closeLbug pool warning for ${resolved}: ${(err as Error).message}`);
+      }
+      this.initializedRepos.delete(handle.id);
+    }
+
+    // Re-run pipeline (no UI progress needed)
+    const result = await runPipelineFromRepo(resolved, () => {});
+
+    // Persist to LadybugDB using the core singleton adapter (write-capable).
+    // Delete old db files first to avoid duplicate data (same as analyze CLI).
+    await closeCoreLbug();
+    for (const f of [lbugPath, `${lbugPath}.wal`, `${lbugPath}.lock`]) {
+      try { await fs.rm(f, { recursive: true, force: true }); } catch {}
+    }
+    await initCoreLbug(lbugPath);
+    await loadGraphToLbug(result.graph, resolved, storagePath);
+    await closeCoreLbug();
+
+    // Update meta
+    const meta = {
+      repoPath: resolved,
+      lastCommit: getCurrentCommit(resolved),
+      indexedAt: new Date().toISOString(),
+      stats: {
+        files: result.totalFileCount,
+        nodes: result.graph.nodeCount,
+      },
+    };
+    await saveMeta(storagePath, meta);
+    await registerRepo(resolved, meta);
+  }
+
   async disconnect(): Promise<void> {
     await closeLbug(); // close all connections
     // Note: we intentionally do NOT call disposeEmbedder() here.
