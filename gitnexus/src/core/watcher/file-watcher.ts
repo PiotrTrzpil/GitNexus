@@ -14,7 +14,7 @@
 import fs from 'fs/promises';
 import path from 'path';
 import { glob } from 'glob';
-import { shouldIgnorePath } from '../../config/ignore-service.js';
+import { createIgnoreFilter } from '../../config/ignore-service.js';
 
 export interface WatcherOptions {
   onReindex: (repoPath: string) => Promise<void>;
@@ -50,21 +50,24 @@ function computeInterval(fileCount: number, maxIntervalMs: number): number {
 
 /**
  * Walk the repo and capture {mtime, size} for each file.
- * Uses the same ignore rules as the ingestion pipeline.
+ * Uses the same ignore filter as the ingestion pipeline, with directory-level
+ * pruning so node_modules/dist/etc are never traversed.
  */
 async function captureSnapshot(repoPath: string): Promise<Map<string, FileSnapshot>> {
+  const ignoreFilter = await createIgnoreFilter(repoPath);
+
   const files = await glob('**/*', {
     cwd: repoPath,
     nodir: true,
     dot: false,
+    ignore: ignoreFilter,
   });
 
-  const filtered = files.filter(f => !shouldIgnorePath(f));
   const snap = new Map<string, FileSnapshot>();
 
   const CONCURRENCY = 64;
-  for (let i = 0; i < filtered.length; i += CONCURRENCY) {
-    const batch = filtered.slice(i, i + CONCURRENCY);
+  for (let i = 0; i < files.length; i += CONCURRENCY) {
+    const batch = files.slice(i, i + CONCURRENCY);
     await Promise.all(
       batch.map(async relPath => {
         try {
@@ -97,6 +100,59 @@ function snapshotsEqual(
     if (prevEntry.mtime !== currEntry.mtime || prevEntry.size !== currEntry.size) return false;
   }
   return true;
+}
+
+// ─── Cross-process lockfile ──────────────────────────────────────────────
+// Prevents multiple MCP instances from reindexing the same repo concurrently.
+// Uses a simple PID-based lockfile with a stale timeout.
+
+const LOCK_STALE_MS = 5 * 60 * 1000; // 5 minutes — if lock is older, treat as stale
+
+function lockPath(repoPath: string): string {
+  return path.join(repoPath, '.gitnexus', 'reindex.lock');
+}
+
+async function tryAcquireLock(repoPath: string): Promise<boolean> {
+  const lp = lockPath(repoPath);
+  try {
+    // O_WRONLY | O_CREAT | O_EXCL — atomic create-if-not-exists
+    const fd = await fs.open(lp, 'wx');
+    await fd.writeFile(JSON.stringify({ pid: process.pid, ts: Date.now() }));
+    await fd.close();
+    return true;
+  } catch (err: any) {
+    if (err?.code !== 'EEXIST') return false;
+    // Lock exists — check if stale
+    try {
+      const content = await fs.readFile(lp, 'utf-8');
+      const { pid, ts } = JSON.parse(content);
+      const age = Date.now() - ts;
+      if (age > LOCK_STALE_MS) {
+        // Stale lock — try to replace it
+        await fs.writeFile(lp, JSON.stringify({ pid: process.pid, ts: Date.now() }));
+        return true;
+      }
+      // Check if the owning process is still alive
+      try {
+        process.kill(pid, 0); // signal 0 = existence check, no signal sent
+        return false; // Process alive, lock is valid
+      } catch {
+        // Process gone — take over the lock
+        await fs.writeFile(lp, JSON.stringify({ pid: process.pid, ts: Date.now() }));
+        return true;
+      }
+    } catch {
+      return false; // Can't read/parse lock — leave it alone
+    }
+  }
+}
+
+async function releaseLock(repoPath: string): Promise<void> {
+  try {
+    await fs.unlink(lockPath(repoPath));
+  } catch {
+    // Best effort — lock may have been cleaned up already
+  }
 }
 
 /**
@@ -153,6 +209,15 @@ async function pollRepo(
     return;
   }
 
+  // Cross-process lock — another MCP instance may already be reindexing
+  if (!(await tryAcquireLock(repo.path))) {
+    // Another process holds the lock — skip this cycle, update snapshot
+    // so we don't re-trigger on the same diff next cycle
+    state.snapshot = snap;
+    state.nextPollAt = Date.now() + interval;
+    return;
+  }
+
   state.reindexing = true;
   try {
     await options.onReindex(repo.path);
@@ -164,6 +229,7 @@ async function pollRepo(
     // Keep old snapshot so we retry next cycle
     state.nextPollAt = Date.now() + interval;
   } finally {
+    await releaseLock(repo.path);
     state.reindexing = false;
   }
 }

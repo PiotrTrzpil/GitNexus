@@ -23,7 +23,8 @@ import {
 // import { generateAIContextFiles } from '../../cli/ai-context.js';
 import { diffFile } from '../../core/diff/semantic-differ.js';
 import { planCommits, type CouplingEdge, type FileChangeSummary } from '../../core/diff/commit-planner.js';
-import { readSourceWithContext, readFileLines, formatWithLineNumbers } from '../source-reader.js';
+import { readSourceWithContext } from '../source-reader.js';
+import { findSymbol } from './symbol-lookup.js';
 
 /**
  * Quick test-file detection for filtering impact results.
@@ -104,7 +105,7 @@ function groupByFile<T extends Record<string, any>>(
 /**
  * Extract the logical label from a GitNexus node ID.
  * IDs are formatted as "Label:path:name:line" — the prefix before the first ":" is the label.
- * KuzuDB's labels(n)[0] returns the table name (always "CodeElement" etc.), not the logical label.
+ * LadybugDB's labels(n)[0] returns the table name (always "CodeElement" etc.), not the logical label.
  */
 function extractLabelFromQn(qn: string): string {
   if (!qn) return '';
@@ -373,12 +374,6 @@ export class LocalBackend {
   // ─── Tool Dispatch ───────────────────────────────────────────────
 
   async callTool(method: string, params: any): Promise<any> {
-    if (method === 'set_output_format') {
-      const { setOutputFormat } = await import('../output-format.js');
-      const fmt = setOutputFormat(params?.format);
-      return `Output format set to ${fmt}`;
-    }
-
     if (method === 'list_repos') {
       return this.listRepos();
     }
@@ -403,16 +398,6 @@ export class LocalBackend {
         return this.rename(repo, params);
       case 'semantic_diff':
         return this.semanticDiff(repo, params);
-      case 'plan_commits':
-        return this.planCommits(repo, params);
-      case 'get_code_snippet':
-        return this.getCodeSnippet(repo, params);
-      case 'search_code':
-        return this.searchCode(repo, params);
-      case 'search_graph':
-        return this.searchGraph(repo, params);
-      case 'get_architecture':
-        return this.getArchitecture(repo, params);
       case 'quality_query':
         return this.qualityQuery(repo, params);
       // Legacy aliases for backwards compatibility
@@ -433,9 +418,12 @@ export class LocalBackend {
     file_paths?: string[];
     ref?: string;
     breaking_only?: boolean;
+    scope?: 'unstaged' | 'staged' | 'all';
+    group_commits?: boolean;
   }): Promise<any> {
     const ref = params.ref ?? 'HEAD';
     const breakingOnly = params.breaking_only ?? false;
+    const groupCommits = params.group_commits ?? false;
 
     // Determine files to diff: explicit list or all changed files via git
     let filePaths: string[] = params.file_paths ?? [];
@@ -443,7 +431,16 @@ export class LocalBackend {
       // Fall back to git diff to find changed files
       try {
         const { execSync } = await import('child_process');
-        const raw = execSync('git diff --name-only HEAD', { cwd: repo.repoPath }).toString();
+        const scope = params.scope ?? 'unstaged';
+        let gitCmd: string;
+        if (scope === 'staged') {
+          gitCmd = 'git diff --cached --name-only';
+        } else if (scope === 'all') {
+          gitCmd = 'git diff HEAD --name-only';
+        } else {
+          gitCmd = 'git diff --name-only HEAD';
+        }
+        const raw = execSync(gitCmd, { cwd: repo.repoPath }).toString();
         filePaths = raw.split('\n').map(l => l.trim()).filter(Boolean)
           .map(rel => path.join(repo.repoPath, rel));
       } catch (err) {
@@ -453,14 +450,22 @@ export class LocalBackend {
     }
 
     if (filePaths.length === 0) {
-      return { changes: [], summary: { total: 0, breaking: 0, byKind: {} } };
+      const empty: any = { changes: [], summary: { total: 0, breaking: 0, byKind: {} } };
+      if (groupCommits) {
+        empty.commit_groups = { groups: [], ungrouped: [] };
+      }
+      return empty;
     }
 
     const allChanges = [];
+    const fileSummaries: FileChangeSummary[] = [];
     for (const fp of filePaths) {
       try {
         const fileChanges = await diffFile(repo.repoPath, fp, 'M', ref);
         allChanges.push(...fileChanges);
+        if (groupCommits && fileChanges.length > 0) {
+          fileSummaries.push({ path: fp, changes: fileChanges });
+        }
       } catch {
         // Non-fatal: skip unparseable or new files
       }
@@ -473,7 +478,7 @@ export class LocalBackend {
       byKind[c.kind] = (byKind[c.kind] ?? 0) + 1;
     }
 
-    return {
+    const result: any = {
       changes: filtered,
       summary: {
         total: filtered.length,
@@ -481,350 +486,26 @@ export class LocalBackend {
         byKind,
       },
     };
-  }
 
-  // ─── Commit Planning ─────────────────────────────────────────────
-
-  private async planCommits(repo: RepoHandle, params: {
-    ref?: string;
-    scope?: 'unstaged' | 'staged' | 'all';
-  }): Promise<any> {
-    const ref = params.ref ?? 'HEAD';
-
-    // Get changed files for the chosen scope
-    let filePaths: string[] = [];
-    try {
-      const { execSync } = await import('child_process');
-      const scope = params.scope ?? 'unstaged';
-      let gitCmd: string;
-      if (scope === 'staged') {
-        gitCmd = 'git diff --cached --name-only';
-      } else if (scope === 'all') {
-        gitCmd = 'git diff HEAD --name-only';
-      } else {
-        gitCmd = 'git diff --name-only';
-      }
-      const raw = execSync(gitCmd, { cwd: repo.repoPath }).toString();
-      filePaths = raw.split('\n').map(l => l.trim()).filter(Boolean)
-        .map(rel => path.join(repo.repoPath, rel));
-    } catch (err) {
-      console.warn(`[planCommits] git diff failed for ${repo.repoPath}: ${(err as Error).message}`);
-      filePaths = [];
-    }
-
-    if (filePaths.length === 0) {
-      return { groups: [], ungrouped: [] };
-    }
-
-    // Collect symbol changes via semantic diff, grouped by file
-    const fileSummaries: FileChangeSummary[] = [];
-    for (const fp of filePaths) {
+    if (groupCommits) {
+      // Fetch call graph edges for coupling signal
+      let couplings: CouplingEdge[] = [];
       try {
-        const fileChanges = await diffFile(repo.repoPath, fp, 'M', ref);
-        if (fileChanges.length > 0) {
-          fileSummaries.push({ path: fp, changes: fileChanges });
-        }
+        await this.ensureInitialized(repo.id);
+        const rows = await this.cypher(repo, {
+          query: `MATCH (a)-[r:CodeRelation {type: 'CALLS'}]->(b) WHERE r.confidence >= 0.7 RETURN a.id AS sourceQN, b.id AS targetQN LIMIT 2000`,
+        });
+        couplings = (rows as any[]).map((r: any) => ({ fromQN: r.sourceQN, toQN: r.targetQN, type: 'CALLS' }));
       } catch {
-        // Non-fatal: skip unparseable files
+        // Non-fatal: group without graph edges
       }
+
+      result.commit_groups = fileSummaries.length > 0
+        ? planCommits(fileSummaries, couplings)
+        : { groups: [], ungrouped: [] };
     }
 
-    if (fileSummaries.length === 0) {
-      return { groups: [], ungrouped: [] };
-    }
-
-    // Fetch call graph edges for coupling signal
-    let couplings: CouplingEdge[] = [];
-    try {
-      await this.ensureInitialized(repo.id);
-      const rows = await this.cypher(repo, {
-        query: `MATCH (a)-[r:CodeRelation {type: 'CALLS'}]->(b) WHERE r.confidence >= 0.7 RETURN a.id AS sourceQN, b.id AS targetQN LIMIT 2000`,
-      });
-      couplings = (rows as any[]).map((r: any) => ({ fromQN: r.sourceQN, toQN: r.targetQN, type: 'CALLS' }));
-    } catch {
-      // Non-fatal: plan without graph edges
-    }
-
-    return planCommits(fileSummaries, couplings);
-  }
-
-  // ─── Code Snippet ─────────────────────────────────────────────────
-
-  private async getCodeSnippet(repo: RepoHandle, params: {
-    qualified_name: string;
-    context_lines?: number;
-    include_neighbors?: boolean;
-    repo?: string;
-  }): Promise<any> {
-    if (!params.qualified_name?.trim()) {
-      return { error: 'qualified_name parameter is required and cannot be empty.' };
-    }
-
-    await this.ensureInitialized(repo.id);
-
-    const qn = params.qualified_name.trim();
-    const contextLines = params.context_lines ?? 3;
-    const includeNeighbors = params.include_neighbors ?? false;
-
-    // Shared node fetch query
-    const nodeSelectClause = `
-      RETURN n.id AS qn, n.name AS name, labels(n)[0] AS label,
-             n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine,
-             n.description AS description
-      LIMIT 10
-    `;
-
-    // Tier 1: Exact QN match
-    let rows: any[] = [];
-    let matchMethod: string = 'exact_qn';
-    try {
-      rows = await executeParameterized(repo.id,
-        `MATCH (n) WHERE n.id = $qn ${nodeSelectClause}`,
-        { qn });
-    } catch (e) { logQueryError('get_code_snippet:exact_qn', e); }
-
-    // Tier 2: QN suffix match
-    if (rows.length === 0) {
-      matchMethod = 'qn_suffix';
-      const suffix = qn.startsWith('.') ? qn : `.${qn}`;
-      try {
-        rows = await executeParameterized(repo.id,
-          `MATCH (n) WHERE n.id ENDS WITH $suffix ${nodeSelectClause}`,
-          { suffix });
-      } catch (e) { logQueryError('get_code_snippet:qn_suffix', e); }
-    }
-
-    // Tier 3: Name match
-    if (rows.length === 0) {
-      matchMethod = 'name';
-      try {
-        rows = await executeParameterized(repo.id,
-          `MATCH (n) WHERE n.name = $name ${nodeSelectClause}`,
-          { name: qn });
-      } catch (e) { logQueryError('get_code_snippet:name', e); }
-    }
-
-    // Tier 4: Fuzzy suggestions — return top-10 name matches (exclude infrastructure nodes)
-    if (rows.length === 0) {
-      matchMethod = 'suggestions';
-      let suggestions: any[] = [];
-      try {
-        suggestions = await executeParameterized(repo.id,
-          `MATCH (n) WHERE n.name CONTAINS $fragment
-           AND NOT labels(n)[0] IN ['File', 'Folder', 'Community', 'Process']
-           RETURN n.id AS qn, n.name AS name, labels(n)[0] AS label, n.filePath AS file
-           LIMIT 10`,
-          { fragment: qn.split('.').pop() ?? qn });
-      } catch (e) { logQueryError('get_code_snippet:suggestions', e); }
-      return {
-        match_method: 'suggestions',
-        alternatives: suggestions.map(r => ({
-          name: r.name ?? r[1],
-          qn: r.qn ?? r[0],
-          label: extractLabelFromQn(r.qn ?? r[0]),
-          file: r.file ?? r[3],
-        })),
-      };
-    }
-
-    // If multiple matches, pick the first but surface alternatives
-    const node = rows[0];
-    const nodeName: string = node.name ?? node[1];
-    const nodeQn: string = node.qn ?? node[0];
-    const nodeLabel: string = extractLabelFromQn(node.qn ?? node[0]);
-    const nodeFilePath: string = node.filePath ?? node[3];
-    const startLine: number = node.startLine ?? node[4];
-    const endLine: number = node.endLine ?? node[5];
-    const description: string | undefined = node.description ?? node[6];
-
-    const alternatives = rows.length > 1
-      ? rows.slice(1).map(r => ({
-          name: r.name ?? r[1],
-          qn: r.qn ?? r[0],
-          label: extractLabelFromQn(r.qn ?? r[0]),
-          file: r.filePath ?? r[3],
-        }))
-      : undefined;
-
-    // Read source from disk
-    let source: string = '';
-    try {
-      const result = await readSourceWithContext(repo.repoPath, nodeFilePath, startLine, endLine, contextLines);
-      if (result) {
-        source = result.source;
-      }
-    } catch (e) { logQueryError('get_code_snippet:read_source', e); }
-
-    // Count callers (inbound CALLS edges)
-    let callers = 0;
-    let callerNames: string[] | undefined;
-    try {
-      const callerRows = await executeParameterized(repo.id,
-        `MATCH (caller)-[r:CodeRelation {type: 'CALLS'}]->(n {id: $qn})
-         RETURN caller.name AS name, COUNT(*) AS cnt`,
-        { qn: nodeQn });
-      callers = callerRows.length;
-      if (includeNeighbors) {
-        callerNames = callerRows.map(r => r.name ?? r[0]).filter(Boolean);
-      }
-    } catch (e) { logQueryError('get_code_snippet:callers', e); }
-
-    // Count callees (outbound CALLS edges)
-    let callees = 0;
-    let calleeNames: string[] | undefined;
-    try {
-      const calleeRows = await executeParameterized(repo.id,
-        `MATCH (n {id: $qn})-[r:CodeRelation {type: 'CALLS'}]->(callee)
-         RETURN callee.name AS name, COUNT(*) AS cnt`,
-        { qn: nodeQn });
-      callees = calleeRows.length;
-      if (includeNeighbors) {
-        calleeNames = calleeRows.map(r => r.name ?? r[0]).filter(Boolean);
-      }
-    } catch (e) { logQueryError('get_code_snippet:callees', e); }
-
-    return {
-      name: nodeName,
-      qn: nodeQn,
-      label: nodeLabel,
-      file: nodeFilePath,
-      lines: `${startLine}-${endLine}`,
-      source,
-      ...(description ? { description } : {}),
-      callers,
-      callees,
-      ...(includeNeighbors && callerNames ? { caller_names: callerNames } : {}),
-      ...(includeNeighbors && calleeNames ? { callee_names: calleeNames } : {}),
-      match_method: matchMethod,
-      ...(alternatives ? { alternatives } : {}),
-    };
-  }
-
-  /**
-   * search_code — text/regex search across indexed files.
-   *
-   * 1. Fetches indexed file paths from KuzuDB (File nodes)
-   * 2. Optionally filters by file_pattern glob (supports * and ?)
-   * 3. Reads each file from disk line-by-line
-   * 4. Matches via RegExp or string.includes()
-   * 5. Paginates results and attaches context lines
-   */
-  private async searchCode(repo: RepoHandle, params: {
-    pattern: string;
-    file_pattern?: string;
-    max_results?: number;
-    offset?: number;
-    context_lines?: number;
-    regex?: boolean;
-    case_sensitive?: boolean;
-    repo?: string;
-  }): Promise<any> {
-    if (!params.pattern?.trim()) {
-      return { error: 'pattern parameter is required and cannot be empty.' };
-    }
-
-    await this.ensureInitialized(repo.id);
-
-    const pattern = params.pattern.trim();
-    const limit = Math.min(params.max_results ?? 20, 100);
-    const offset = params.offset ?? 0;
-    const contextLines = params.context_lines ?? 2;
-    const useRegex = params.regex ?? false;
-    const caseSensitive = params.case_sensitive ?? true;
-
-    // Build matcher function
-    let matcher: (line: string) => boolean;
-    if (useRegex) {
-      const flags = caseSensitive ? '' : 'i';
-      let re: RegExp;
-      try {
-        re = new RegExp(pattern, flags);
-      } catch (e) {
-        return { error: `Invalid regex: ${(e as Error).message}` };
-      }
-      matcher = (line: string) => re.test(line);
-    } else if (caseSensitive) {
-      matcher = (line: string) => line.includes(pattern);
-    } else {
-      const lower = pattern.toLowerCase();
-      matcher = (line: string) => line.toLowerCase().includes(lower);
-    }
-
-    // Get indexed file paths from KuzuDB
-    let filePaths: string[] = [];
-    try {
-      const rows = await executeQuery(repo.id, `MATCH (f:File) RETURN f.filePath AS fp`);
-      filePaths = rows.map((r: any) => r.fp ?? r[0]).filter(Boolean);
-    } catch (e) {
-      logQueryError('search_code:file-list', e);
-      return { error: 'Failed to retrieve indexed file list.' };
-    }
-
-    // Exclude non-source files by default (docs, configs, generated files)
-    const NON_SOURCE_EXTENSIONS = new Set(['.md', '.txt', '.json', '.yaml', '.yml', '.toml', '.lock', '.csv', '.svg', '.html', '.css']);
-    filePaths = filePaths.filter(p => {
-      const dot = p.lastIndexOf('.');
-      if (dot < 0) return true;
-      return !NON_SOURCE_EXTENSIONS.has(p.slice(dot).toLowerCase());
-    });
-
-    // Filter by file_pattern if provided
-    if (params.file_pattern) {
-      const fp = params.file_pattern;
-      // Convert simple glob to regex: * → .*, ? → .
-      const globRe = new RegExp('^' + fp.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$');
-      filePaths = filePaths.filter(p => {
-        const basename = p.split('/').pop() ?? p;
-        return globRe.test(p) || globRe.test(basename);
-      });
-    }
-
-    // Scan files — collect all matches, then paginate
-    const allMatches: Array<{ file: string; line: number; content: string; lines: string[] }> = [];
-
-    for (const filePath of filePaths) {
-      const lines = await readFileLines(repo.repoPath, filePath);
-      if (!lines) continue;
-
-      for (let i = 0; i < lines.length; i++) {
-        if (matcher(lines[i])) {
-          allMatches.push({
-            file: filePath,
-            line: i + 1,
-            content: lines[i].trimEnd().slice(0, 200),
-            lines, // keep ref for context extraction
-          });
-        }
-      }
-    }
-
-    const totalMatches = allMatches.length;
-    const page = allMatches.slice(offset, offset + limit);
-
-    // Build response matches with optional context lines
-    const matches = page.map(m => {
-      const entry: any = {
-        file: m.file,
-        line: m.line,
-        content: m.content,
-      };
-      if (contextLines > 0) {
-        const firstCtx = Math.max(0, m.line - 1 - contextLines);
-        const lastCtx = Math.min(m.lines.length, m.line + contextLines);
-        const slice = m.lines.slice(firstCtx, lastCtx);
-        entry.context = formatWithLineNumbers(slice, firstCtx + 1).split('\n');
-      }
-      return entry;
-    });
-
-    return {
-      pattern,
-      total_matches: totalMatches,
-      limit,
-      offset,
-      has_more: offset + limit < totalMatches,
-      matches,
-    };
+    return result;
   }
 
   // ─── Tool Implementations ────────────────────────────────────────
@@ -1340,70 +1021,104 @@ export class LocalBackend {
     uid?: string;
     file_path?: string;
     include_content?: boolean;
+    context_lines?: number;
   }): Promise<any> {
     await this.ensureInitialized(repo.id);
-    
+
     const { name, uid, file_path, include_content } = params;
-    
+    const contextLines = params.context_lines ?? 3;
+
     if (!name && !uid) {
       return { error: 'Either "name" or "uid" parameter is required.' };
     }
-    
-    // Step 1: Find the symbol
-    let symbols: any[];
-    
+
+    // Step 1: Find the symbol via 4-tier lookup or direct UID/file_path scoped query
+    let symId: string;
+    let symName: string;
+    let symKind: string;
+    let symFilePath: string;
+    let symStartLine: number;
+    let symEndLine: number;
+
     if (uid) {
-      symbols = await executeParameterized(repo.id, `
+      // Direct UID lookup — bypass 4-tier resolver
+      const rows = await executeParameterized(repo.id, `
         MATCH (n {id: $uid})
-        RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine${include_content ? ', n.content AS content' : ''}
+        RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine
         LIMIT 1
       `, { uid });
-    } else {
-      const isQualified = name!.includes('/') || name!.includes(':');
-
-      let whereClause: string;
-      let queryParams: Record<string, any>;
-      if (file_path) {
-        whereClause = `WHERE n.name = $symName AND n.filePath CONTAINS $filePath`;
-        queryParams = { symName: name!, filePath: file_path };
-      } else if (isQualified) {
-        whereClause = `WHERE n.id = $symName OR n.name = $symName`;
-        queryParams = { symName: name! };
-      } else {
-        whereClause = `WHERE n.name = $symName`;
-        queryParams = { symName: name! };
+      if (rows.length === 0) {
+        return { error: `Symbol '${uid}' not found` };
       }
-
-      symbols = await executeParameterized(repo.id, `
-        MATCH (n) ${whereClause}
-        RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine${include_content ? ', n.content AS content' : ''}
+      const row = rows[0];
+      symId = row.id || row[0];
+      symName = row.name || row[1];
+      symKind = row.type || row[2];
+      symFilePath = row.filePath || row[3];
+      symStartLine = row.startLine || row[4];
+      symEndLine = row.endLine || row[5];
+    } else if (file_path) {
+      // file_path-scoped lookup — not covered by findSymbol's QN tiers
+      const rows = await executeParameterized(repo.id, `
+        MATCH (n)
+        WHERE n.name = $symName AND n.filePath CONTAINS $filePath
+        RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine
         LIMIT 10
-      `, queryParams);
+      `, { symName: name!, filePath: file_path });
+      if (rows.length === 0) {
+        return { error: `Symbol '${name}' not found` };
+      }
+      if (rows.length > 1) {
+        return {
+          status: 'ambiguous',
+          message: `Found ${rows.length} symbols matching '${name}'. Use uid or a more specific file_path to disambiguate.`,
+          candidates: rows.map((s: any) => ({
+            uid: s.id || s[0],
+            name: s.name || s[1],
+            kind: s.type || s[2],
+            filePath: s.filePath || s[3],
+            line: s.startLine || s[4],
+          })),
+        };
+      }
+      const row = rows[0];
+      symId = row.id || row[0];
+      symName = row.name || row[1];
+      symKind = row.type || row[2];
+      symFilePath = row.filePath || row[3];
+      symStartLine = row.startLine || row[4];
+      symEndLine = row.endLine || row[5];
+    } else {
+      // Name-based lookup — use shared 4-tier resolver
+      const found = await findSymbol(repo.id, name!);
+      if (found.kind === 'suggestions') {
+        return {
+          status: 'not_found',
+          message: `Symbol '${name}' not found. Did you mean one of these?`,
+          alternatives: found.alternatives,
+          match_method: 'suggestions',
+        };
+      }
+      // Disambiguate if multiple matches were found at any tier
+      if (found.alternatives && found.alternatives.length > 0) {
+        return {
+          status: 'ambiguous',
+          message: `Found multiple symbols matching '${name}'. Use uid or file_path to disambiguate.`,
+          candidates: [
+            { uid: found.node.qn, name: found.node.name, kind: found.node.label, filePath: found.node.filePath, line: found.node.startLine },
+            ...found.alternatives.map(a => ({ uid: a.qn, name: a.name, kind: a.label, filePath: a.file, line: 0 })),
+          ],
+        };
+      }
+      symId = found.node.qn;
+      symName = found.node.name;
+      symKind = found.node.label;
+      symFilePath = found.node.filePath;
+      symStartLine = found.node.startLine;
+      symEndLine = found.node.endLine;
     }
-    
-    if (symbols.length === 0) {
-      return { error: `Symbol '${name || uid}' not found` };
-    }
-    
-    // Step 2: Disambiguation
-    if (symbols.length > 1 && !uid) {
-      return {
-        status: 'ambiguous',
-        message: `Found ${symbols.length} symbols matching '${name}'. Use uid or file_path to disambiguate.`,
-        candidates: symbols.map((s: any) => ({
-          uid: s.id || s[0],
-          name: s.name || s[1],
-          kind: s.type || s[2],
-          filePath: s.filePath || s[3],
-          line: s.startLine || s[4],
-        })),
-      };
-    }
-    
+
     // Step 3: Class/Interface hint — redirect to methods
-    const sym = symbols[0];
-    const symId = sym.id || sym[0];
-    const symKind = extractLabelFromQn(symId);
 
     if (symKind === 'Class' || symKind === 'Interface') {
       try {
@@ -1422,8 +1137,8 @@ export class LocalBackend {
           }));
           return {
             status: 'class_node',
-            message: `${sym.name || sym[1]} is a ${symKind} — context/impact work best on functions/methods. Use one of its methods:`,
-            file: sym.filePath || sym[3],
+            message: `${symName} is a ${symKind} — context/impact work best on functions/methods. Use one of its methods:`,
+            file: symFilePath,
             methods,
           };
         }
@@ -1457,7 +1172,18 @@ export class LocalBackend {
         RETURN p.id AS pid, p.heuristicLabel AS label, r.step AS step, p.stepCount AS stepCount
       `, { symId });
     } catch (e) { logQueryError('context:process-participation', e); }
-    
+
+    // Read source from disk when include_content is requested
+    let symbolContent: string | undefined;
+    if (include_content && symFilePath && symStartLine && symEndLine) {
+      try {
+        const srcResult = await readSourceWithContext(repo.repoPath, symFilePath, symStartLine, symEndLine, contextLines);
+        if (srcResult) {
+          symbolContent = srcResult.source;
+        }
+      } catch (e) { logQueryError('context:read_source', e); }
+    }
+
     // Helper to categorize refs and group by file within each category
     const categorize = (rows: any[]) => {
       const cats: Record<string, any[]> = {};
@@ -1479,17 +1205,17 @@ export class LocalBackend {
       }
       return cats;
     };
-    
+
     return {
       status: 'found',
       symbol: {
-        uid: sym.id || sym[0],
-        name: sym.name || sym[1],
-        kind: sym.type || sym[2],
-        filePath: sym.filePath || sym[3],
-        startLine: sym.startLine || sym[4],
-        endLine: sym.endLine || sym[5],
-        ...(include_content && (sym.content || sym[6]) ? { content: sym.content || sym[6] } : {}),
+        uid: symId,
+        name: symName,
+        kind: symKind,
+        filePath: symFilePath,
+        startLine: symStartLine,
+        endLine: symEndLine,
+        ...(include_content && symbolContent ? { content: symbolContent } : {}),
       },
       incoming: categorize(incomingRows),
       outgoing: categorize(outgoingRows),
@@ -1983,7 +1709,7 @@ export class LocalBackend {
 
       // Affected processes: which execution flows are broken and at which step
       // NOTE: queries are run sequentially to avoid concurrent access to the
-      // native DB addon (LadybugDB/KuzuDB C++ bindings are not thread-safe).
+      // native DB addon (LadybugDB C++ bindings are not thread-safe).
       // Running them via Promise.all caused non-deterministic segfaults (#292).
       const processRows = await executeQuery(repo.id, `
           MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
@@ -2270,23 +1996,27 @@ export class LocalBackend {
   }
 
   /**
-   * Re-run the analysis pipeline for a repo and reload the KuzuDB connection.
+   * Re-run the analysis pipeline for a repo and reload the LadybugDB connection.
    * Called by the file watcher when changes are detected.
    */
   async reindexRepo(repoPath: string): Promise<void> {
     const { runPipelineFromRepo } = await import('../../core/ingestion/pipeline.js');
-    const { loadGraphToKuzu, closeKuzu } = await import('../../core/kuzu/kuzu-adapter.js');
+    const {
+      initLbug: initCoreLbug,
+      loadGraphToLbug,
+      closeLbug: closeCoreLbug,
+    } = await import('../../core/lbug/lbug-adapter.js');
     const { getStoragePaths, saveMeta, registerRepo } = await import('../../storage/repo-manager.js');
     const { getCurrentCommit } = await import('../../storage/git.js');
 
     const resolved = path.resolve(repoPath);
-    const { storagePath } = getStoragePaths(resolved);
+    const { storagePath, lbugPath } = getStoragePaths(resolved);
 
-    // Close existing KuzuDB connection for this repo so we can reload
+    // Close the MCP pool's read-only connection so we can write without lock conflicts
     const handle = [...this.repos.values()].find(h => h.repoPath === resolved);
     if (handle) {
-      try { await closeKuzu(handle.id); } catch (err) {
-        console.warn(`[reindexRepo] closeKuzu warning for ${resolved}: ${(err as Error).message}`);
+      try { await closeLbug(handle.id); } catch (err) {
+        console.warn(`[reindexRepo] closeLbug pool warning for ${resolved}: ${(err as Error).message}`);
       }
       this.initializedRepos.delete(handle.id);
     }
@@ -2294,8 +2024,15 @@ export class LocalBackend {
     // Re-run pipeline (no UI progress needed)
     const result = await runPipelineFromRepo(resolved, () => {});
 
-    // Persist to KuzuDB
-    await loadGraphToKuzu(result.graph, resolved, storagePath);
+    // Persist to LadybugDB using the core singleton adapter (write-capable).
+    // Delete old db files first to avoid duplicate data (same as analyze CLI).
+    await closeCoreLbug();
+    for (const f of [lbugPath, `${lbugPath}.wal`, `${lbugPath}.lock`]) {
+      try { await fs.rm(f, { recursive: true, force: true }); } catch {}
+    }
+    await initCoreLbug(lbugPath);
+    await loadGraphToLbug(result.graph, resolved, storagePath);
+    await closeCoreLbug();
 
     // Update meta
     const meta = {
@@ -2311,146 +2048,6 @@ export class LocalBackend {
     await registerRepo(resolved, meta);
   }
 
-  // ─── search_graph ────────────────────────────────────────────────
-
-  /**
-   * Structured graph node search with degree/label/pattern filters.
-   * Translates structured params into a single Cypher query with WHERE clauses.
-   */
-  private async searchGraph(repo: RepoHandle, params: {
-    name_pattern?: string;
-    label?: string;
-    file_pattern?: string;
-    min_degree?: number;
-    max_degree?: number;
-    direction?: 'inbound' | 'outbound' | 'both';
-    sort_by?: 'degree' | 'name';
-    limit?: number;
-    offset?: number;
-    exclude_labels?: string[];
-    exclude_entry_points?: boolean;
-  }): Promise<any> {
-    await this.ensureInitialized(repo.id);
-
-    const limit = Math.min(params.limit ?? 20, 100);
-    const offset = params.offset ?? 0;
-    const direction = params.direction ?? 'both';
-    const sortBy = params.sort_by ?? 'degree';
-    const excludeLabels = params.exclude_labels ?? ['Community', 'Process', 'Folder'];
-
-    // Validate label if provided
-    if (params.label && !VALID_NODE_LABELS.has(params.label)) {
-      return { error: `Invalid label: ${params.label}. Valid labels: ${[...VALID_NODE_LABELS].join(', ')}` };
-    }
-
-    // Build MATCH clause — use specific label if provided, else generic node
-    const matchClause = params.label ? `MATCH (n:\`${params.label}\`)` : 'MATCH (n)';
-
-    // Build WHERE clauses
-    const whereClauses: string[] = [];
-
-    if (params.name_pattern) {
-      whereClauses.push(`n.name =~ $namePattern`);
-    }
-
-    if (params.file_pattern) {
-      whereClauses.push(`n.filePath CONTAINS $filePattern`);
-    }
-
-    if (!params.label && excludeLabels.length > 0) {
-      // Exclude infrastructure labels when no specific label is requested
-      const excluded = excludeLabels
-        .filter(l => VALID_NODE_LABELS.has(l))
-        .map(l => `'${l}'`)
-        .join(', ');
-      if (excluded) {
-        whereClauses.push(`NOT labels(n)[0] IN [${excluded}]`);
-      }
-    }
-
-    if (params.exclude_entry_points) {
-      whereClauses.push(`(n.isEntryPoint IS NULL OR n.isEntryPoint = false)`);
-    }
-
-    const whereStr = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
-
-    // Order clause
-    const orderStr = sortBy === 'name' ? 'ORDER BY name' : 'ORDER BY total_degree DESC';
-
-    const queryParams: Record<string, any> = {};
-    if (params.name_pattern) queryParams.namePattern = params.name_pattern;
-    if (params.file_pattern) queryParams.filePattern = params.file_pattern;
-
-    // Degree filtering and sorting require a two-step approach in KuzuDB:
-    // 1. Fetch candidate nodes that match filters
-    // 2. Compute degrees per node via separate queries
-    // For simplicity, fetch nodes first then compute degrees in JS.
-
-    // Count query for total (without degree filtering — degree filter applied post-hoc)
-    let total = 0;
-    try {
-      const countQuery = `${matchClause} ${whereStr} RETURN COUNT(n) AS cnt`;
-      const countRows = await executeParameterized(repo.id, countQuery, queryParams);
-      total = countRows[0]?.cnt ?? countRows[0]?.[0] ?? 0;
-    } catch (e) { logQueryError('searchGraph:count', e); }
-
-    // Data query — fetch more than needed to allow post-hoc degree filtering
-    const fetchLimit = (params.min_degree !== undefined || params.max_degree !== undefined)
-      ? Math.min(total, 500) : limit + offset;
-    let results: any[] = [];
-    try {
-      const dataQuery = `
-        ${matchClause} ${whereStr}
-        RETURN n.id AS qn, n.name AS name, labels(n)[0] AS label,
-               n.filePath AS file, n.startLine AS startLine, n.endLine AS endLine
-        ${sortBy === 'name' ? 'ORDER BY n.name' : ''}
-        LIMIT ${fetchLimit}
-      `;
-      const rows = await executeParameterized(repo.id, dataQuery, queryParams);
-      const rawResults = await Promise.all(rows.map(async (r: any) => {
-        const qn = r.qn ?? r[0] ?? '';
-        const startLine = r.startLine ?? r[4];
-        const endLine = r.endLine ?? r[5];
-        const lines = (startLine != null && endLine != null)
-          ? `${startLine}-${endLine}`
-          : (startLine != null ? String(startLine) : '');
-
-        // Compute degrees for this node
-        let in_degree = 0, out_degree = 0;
-        try {
-          const degRows = await executeParameterized(repo.id,
-            `MATCH (caller)-[:CodeRelation]->(n {id: $nid}) RETURN COUNT(caller) AS cnt`, { nid: qn });
-          in_degree = degRows[0]?.cnt ?? degRows[0]?.[0] ?? 0;
-        } catch {}
-        try {
-          const degRows = await executeParameterized(repo.id,
-            `MATCH (n {id: $nid})-[:CodeRelation]->(callee) RETURN COUNT(callee) AS cnt`, { nid: qn });
-          out_degree = degRows[0]?.cnt ?? degRows[0]?.[0] ?? 0;
-        } catch {}
-
-        const total_degree = direction === 'inbound' ? in_degree
-          : direction === 'outbound' ? out_degree : in_degree + out_degree;
-
-        if (params.min_degree !== undefined && total_degree < params.min_degree) return null;
-        if (params.max_degree !== undefined && total_degree > params.max_degree) return null;
-
-        return { name: r.name ?? r[1] ?? '', qn, label: extractLabelFromQn(qn),
-          file: r.file ?? r[3] ?? '', lines, in_degree, out_degree, total_degree };
-      }));
-
-      let filtered = rawResults.filter(Boolean) as any[];
-      if (sortBy === 'degree') filtered.sort((a, b) => b.total_degree - a.total_degree);
-      total = filtered.length;
-      results = filtered.slice(offset, offset + limit).map(({ total_degree, ...rest }) => rest);
-    } catch (e) { logQueryError('searchGraph:data', e); }
-
-    return {
-      total,
-      results,
-      has_more: offset + results.length < total,
-    };
-  }
-
   // ─── quality_query ───────────────────────────────────────────────
 
   /**
@@ -2463,6 +2060,10 @@ export class LocalBackend {
     threshold?: number;
     function?: string;
     type?: string;
+    name_pattern?: string;
+    label?: string;
+    limit?: number;
+    offset?: number;
   }): Promise<any> {
     await this.ensureInitialized(repo.id);
 
@@ -2470,10 +2071,10 @@ export class LocalBackend {
       return { error: 'LadybugDB not ready. Index may be corrupted.' };
     }
 
-    const { preset, threshold, function: funcName, type: typeName } = params;
+    const { preset, threshold, function: funcName, type: typeName, name_pattern, label, limit, offset } = params;
 
     try {
-      const results = await this._runQualityPreset(repo, preset, { threshold, funcName, typeName });
+      const results = await this._runQualityPreset(repo, preset, { threshold, funcName, typeName, namePattern: name_pattern, label, limit, offset });
       return { preset, results, count: results.length };
     } catch (err: any) {
       return { error: err.message || `quality_query preset '${preset}' failed` };
@@ -2502,29 +2103,39 @@ export class LocalBackend {
     repoId: string,
     results: Array<{ id?: string; [k: string]: any }>,
   ): Promise<void> {
-    for (const r of results) {
-      if (!r.id) continue;
-      try {
-        const blockRows = await executeParameterized(repoId,
-          `MATCH (n {id: $id})-[:CodeRelation {type: 'CFG_CONTAINS'}]->(b:BasicBlock)
-           RETURN COUNT(b) AS total, COUNT(CASE WHEN b.isUnreachable = true THEN 1 END) AS unreachable`,
-          { id: r.id });
-        const total = blockRows[0]?.total ?? blockRows[0]?.[0] ?? 0;
-        const unreachable = blockRows[0]?.unreachable ?? blockRows[0]?.[1] ?? 0;
-        if (total > 0) {
-          r.cfgBlocks = total;
-          if (unreachable > 0) r.unreachableBlocks = unreachable;
+    const ids = results.map(r => r.id).filter((id): id is string => !!id);
+    if (ids.length === 0) return;
+    try {
+      const rows = await executeQuery(repoId,
+        `MATCH (n)-[:CodeRelation {type: 'CFG_CONTAINS'}]->(b:BasicBlock)
+         RETURN n.id AS fnId, COUNT(b) AS total, COUNT(CASE WHEN b.isUnreachable = true THEN 1 END) AS unreachable`);
+      const statsMap = new Map<string, { total: number; unreachable: number }>();
+      for (const row of rows) {
+        const fnId = row.fnId ?? row[0] ?? '';
+        const total = row.total ?? row[1] ?? 0;
+        const unreachable = row.unreachable ?? row[2] ?? 0;
+        if (fnId && total > 0) statsMap.set(fnId, { total, unreachable });
+      }
+      for (const r of results) {
+        if (!r.id) continue;
+        const stats = statsMap.get(r.id);
+        if (stats) {
+          r.cfgBlocks = stats.total;
+          if (stats.unreachable > 0) r.unreachableBlocks = stats.unreachable;
         }
-      } catch {}
+      }
+    } catch (err) {
+      // CFG augmentation is best-effort; log but don't fail the query.
+      console.warn('[CFG augment] Failed to fetch block stats:', err instanceof Error ? err.message : String(err));
     }
   }
 
   private async _runQualityPreset(
     repo: RepoHandle,
     preset: string,
-    opts: { threshold?: number; funcName?: string; typeName?: string },
+    opts: { threshold?: number; funcName?: string; typeName?: string; namePattern?: string; label?: string; limit?: number; offset?: number },
   ): Promise<any[]> {
-    const { threshold, funcName, typeName } = opts;
+    const { threshold, funcName, typeName, namePattern, label, limit: rawLimit, offset: rawOffset } = opts;
 
     switch (preset) {
 
@@ -2535,7 +2146,7 @@ export class LocalBackend {
         if (threshold === undefined) throw new Error('threshold is required for high_complexity');
         const rows = await executeParameterized(repo.id, `
           MATCH (n)
-          WHERE (labels(n)[0] IN ['Function', 'Method', 'Constructor'])
+          WHERE (n.id STARTS WITH 'Function:' OR n.id STARTS WITH 'Method:' OR n.id STARTS WITH 'Constructor:')
             AND n.complexity > $threshold
           RETURN n.id AS id, n.name AS name, labels(n)[0] AS label,
                  n.filePath AS filePath, n.startLine AS startLine,
@@ -2563,7 +2174,7 @@ export class LocalBackend {
       case 'many_optionals': {
         if (threshold === undefined) throw new Error('threshold is required for many_optionals');
         // Fetch all functions then count optional PARAM_OF edges in JS,
-        // since KuzuDB's 200-row cap limits subquery aggregation reliability.
+        // since LadybugDB's row cap limits subquery aggregation reliability.
         const paramRows = await executeQuery(repo.id, `
           MATCH (p:Parameter)-[:CodeRelation {type: 'PARAM_OF'}]->(fn)
           WHERE p.isOptional = true
@@ -2596,35 +2207,36 @@ export class LocalBackend {
       // ── dead_code ─────────────────────────────────────────────────────
       // Functions/methods with zero inbound CALLS edges, excluding entry points
       // and test-file symbols.
+      // Uses two bulk queries instead of per-node COUNT to avoid N+1.
       case 'dead_code': {
+        // Query 1: all function IDs
         const allFunctions = await executeQuery(repo.id, `
           MATCH (n)
-          WHERE labels(n)[0] IN ['Function', 'Method', 'Constructor']
-            AND (n.isEntryPoint IS NULL OR n.isEntryPoint = false)
+          WHERE (n.id STARTS WITH 'Function:' OR n.id STARTS WITH 'Method:' OR n.id STARTS WITH 'Constructor:')
           RETURN n.id AS id, n.name AS name, labels(n)[0] AS label,
                  n.filePath AS filePath, n.startLine AS startLine
         `);
+        // Query 2: all CALLS target IDs (raw edges, dedupe in JS to avoid row cap on DISTINCT)
+        const calledRows = await executeQuery(repo.id, `
+          MATCH (caller)-[:CodeRelation {type: 'CALLS'}]->(n)
+          RETURN n.id AS id
+        `);
+        const calledIds = new Set(calledRows.map((r: any) => r.id ?? r[0] ?? ''));
+
         const results: any[] = [];
         for (const r of allFunctions) {
           const id = r.id ?? r[0] ?? '';
           const filePath = r.filePath ?? r[3] ?? '';
           if (!id) continue;
-          // Skip test files
           if (isTestFilePath(filePath)) continue;
-          try {
-            const callerRows = await executeParameterized(repo.id,
-              `MATCH (caller)-[:CodeRelation {type: 'CALLS'}]->(n {id: $id}) RETURN COUNT(caller) AS cnt`,
-              { id });
-            const cnt = callerRows[0]?.cnt ?? callerRows[0]?.[0] ?? 0;
-            if (cnt === 0) {
-              results.push({
-                name: r.name ?? r[1],
-                label: r.label ?? r[2],
-                filePath,
-                startLine: r.startLine ?? r[4],
-              });
-            }
-          } catch {}
+          if (!calledIds.has(id)) {
+            results.push({
+              name: r.name ?? r[1],
+              label: r.label ?? r[2],
+              filePath,
+              startLine: r.startLine ?? r[4],
+            });
+          }
         }
         return results;
       }
@@ -2897,63 +2509,64 @@ export class LocalBackend {
       // to "entry" nodes (high fan-in = shared hubs or services that should only be
       // called by orchestrators, not by leaves).
       // Heuristic: entry node = in_degree >= 10; leaf node = in_degree <= 1, out_degree >= 3.
+      // Uses bulk aggregation queries instead of per-node COUNT to avoid N+1.
       case 'layer_violations': {
-        // Step 1: identify entry nodes (high fan-in) and leaf nodes (low fan-in, high fan-out)
-        // For performance, we do this in two passes.
+        // Bulk: fetch all CALLS edges, compute degrees in JS (avoids N+1 per-node queries)
+        const allEdges = await executeQuery(repo.id, `
+          MATCH (a)-[:CodeRelation {type: 'CALLS'}]->(b)
+          RETURN a.id AS sourceId, b.id AS targetId
+        `);
+        const inDegMap = new Map<string, number>();
+        const outDegMap = new Map<string, number>();
+        for (const r of allEdges) {
+          const src = r.sourceId ?? r[0] ?? '';
+          const tgt = r.targetId ?? r[1] ?? '';
+          if (src) outDegMap.set(src, (outDegMap.get(src) ?? 0) + 1);
+          if (tgt) inDegMap.set(tgt, (inDegMap.get(tgt) ?? 0) + 1);
+        }
+
+        // All function metadata
         const funcRows = await executeQuery(repo.id, `
           MATCH (n)
-          WHERE labels(n)[0] IN ['Function', 'Method']
+          WHERE (n.id STARTS WITH 'Function:' OR n.id STARTS WITH 'Method:')
           RETURN n.id AS id, n.name AS name, n.filePath AS filePath
           LIMIT 1000
         `);
 
-        // Compute degrees in batch
-        const nodeData: Array<{ id: string; name: string; filePath: string; inDeg: number; outDeg: number }> = [];
+        const nodeMap = new Map<string, { name: string; filePath: string; inDeg: number; outDeg: number }>();
+        const entryIds = new Set<string>();
+        const leafIds = new Set<string>();
         for (const r of funcRows) {
           const id = r.id ?? r[0] ?? '';
           if (!id) continue;
-          let inDeg = 0, outDeg = 0;
-          try {
-            const iRows = await executeParameterized(repo.id,
-              `MATCH (c)-[:CodeRelation {type: 'CALLS'}]->(n {id: $id}) RETURN COUNT(c) AS cnt`, { id });
-            inDeg = iRows[0]?.cnt ?? iRows[0]?.[0] ?? 0;
-          } catch {}
-          try {
-            const oRows = await executeParameterized(repo.id,
-              `MATCH (n {id: $id})-[:CodeRelation {type: 'CALLS'}]->(c) RETURN COUNT(c) AS cnt`, { id });
-            outDeg = oRows[0]?.cnt ?? oRows[0]?.[0] ?? 0;
-          } catch {}
-          nodeData.push({ id, name: r.name ?? r[1] ?? '', filePath: r.filePath ?? r[2] ?? '', inDeg, outDeg });
+          const inDeg = inDegMap.get(id) ?? 0;
+          const outDeg = outDegMap.get(id) ?? 0;
+          nodeMap.set(id, { name: r.name ?? r[1] ?? '', filePath: r.filePath ?? r[2] ?? '', inDeg, outDeg });
+          if (inDeg >= 10) entryIds.add(id);
+          if (inDeg <= 1 && outDeg >= 3) leafIds.add(id);
         }
-
-        const entryIds = new Set(nodeData.filter(n => n.inDeg >= 10).map(n => n.id));
-        const leafIds = new Set(nodeData.filter(n => n.inDeg <= 1 && n.outDeg >= 3).map(n => n.id));
 
         if (leafIds.size === 0 || entryIds.size === 0) return [];
 
-        // Step 2: find CALLS edges from leaf → entry
+        // Reuse already-fetched edges to find leaf → entry violations
         const violations: any[] = [];
-        for (const leafId of leafIds) {
-          try {
-            const callRows = await executeParameterized(repo.id,
-              `MATCH (leaf {id: $leafId})-[:CodeRelation {type: 'CALLS'}]->(target)
-               RETURN target.id AS targetId, target.name AS targetName, target.filePath AS targetFile`,
-              { leafId });
-            for (const cr of callRows) {
-              const targetId = cr.targetId ?? cr[0] ?? '';
-              if (entryIds.has(targetId)) {
-                const leaf = nodeData.find(n => n.id === leafId)!;
-                violations.push({
-                  caller: leaf.name,
-                  callerFile: leaf.filePath,
-                  callerInDegree: leaf.inDeg,
-                  callee: cr.targetName ?? cr[1],
-                  calleeFile: cr.targetFile ?? cr[2],
-                  calleeInDegree: nodeData.find(n => n.id === targetId)?.inDeg ?? 0,
-                });
-              }
+        for (const r of allEdges) {
+          const callerId = r.sourceId ?? r[0] ?? '';
+          const calleeId = r.targetId ?? r[1] ?? '';
+          if (leafIds.has(callerId) && entryIds.has(calleeId)) {
+            const leaf = nodeMap.get(callerId);
+            const callee = nodeMap.get(calleeId);
+            if (leaf && callee) {
+              violations.push({
+                caller: leaf.name,
+                callerFile: leaf.filePath,
+                callerInDegree: leaf.inDeg,
+                callee: callee.name,
+                calleeFile: callee.filePath,
+                calleeInDegree: callee.inDeg,
+              });
             }
-          } catch {}
+          }
         }
         return violations;
       }
@@ -2962,45 +2575,50 @@ export class LocalBackend {
       // Functions with high complexity AND high fan-out AND many params.
       // Thresholds: complexity > 10, outbound CALLS > 8, parameterCount > 4.
       // When CFG data is available, includes cfgBlocks and unreachableBlocks.
+      // Uses bulk outbound degree aggregation to avoid N+1.
       case 'god_functions': {
         const complexityThreshold = threshold ?? 10;
-        const rows = await executeParameterized(repo.id, `
-          MATCH (n)
-          WHERE labels(n)[0] IN ['Function', 'Method']
-            AND n.complexity > $complexity
-            AND n.parameterCount > 4
-          RETURN n.id AS id, n.name AS name, labels(n)[0] AS label,
-                 n.filePath AS filePath, n.startLine AS startLine,
-                 n.complexity AS complexity, n.parameterCount AS parameterCount
-          ORDER BY n.complexity DESC
-          LIMIT 200
-        `, { complexity: complexityThreshold });
+        // Bulk: fetch all CALLS source IDs for outbound degree
+        const callEdges = await executeQuery(repo.id, `
+          MATCH (n)-[:CodeRelation {type: 'CALLS'}]->(callee)
+          RETURN n.id AS sourceId
+        `);
+        const outDegMap = new Map<string, number>();
+        for (const r of callEdges) {
+          const id = r.sourceId ?? r[0] ?? '';
+          if (id) outDegMap.set(id, (outDegMap.get(id) ?? 0) + 1);
+        }
+        // Fetch candidate functions — use try/catch for optional complexity property
+        let rows: any[];
+        try {
+          rows = await executeParameterized(repo.id, `
+            MATCH (n)
+            WHERE (n.id STARTS WITH 'Function:' OR n.id STARTS WITH 'Method:')
+              AND n.complexity > $complexity
+              AND n.parameterCount > 4
+            RETURN n.id AS id, n.name AS name, labels(n)[0] AS label,
+                   n.filePath AS filePath, n.startLine AS startLine,
+                   n.complexity AS complexity, n.parameterCount AS parameterCount
+            ORDER BY n.complexity DESC
+          `, { complexity: complexityThreshold });
+        } catch {
+          // complexity property may not exist on this index
+          rows = [];
+        }
 
         const hasCfg = await this._hasCfgData(repo.id);
-        const results: any[] = [];
-        for (const r of rows) {
-          const id = r.id ?? r[0] ?? '';
-          if (!id) continue;
-          let outDeg = 0;
-          try {
-            const degRows = await executeParameterized(repo.id,
-              `MATCH (n {id: $id})-[:CodeRelation {type: 'CALLS'}]->(c) RETURN COUNT(c) AS cnt`, { id });
-            outDeg = degRows[0]?.cnt ?? degRows[0]?.[0] ?? 0;
-          } catch {}
-          if (outDeg > 8) {
-            const entry: any = {
-              id,
-              name: r.name ?? r[1],
-              label: r.label ?? r[2],
-              filePath: r.filePath ?? r[3],
-              startLine: r.startLine ?? r[4],
-              complexity: r.complexity ?? r[5],
-              parameterCount: r.parameterCount ?? r[6],
-              outboundCalls: outDeg,
-            };
-            results.push(entry);
-          }
-        }
+        const results: any[] = rows
+          .filter((r: any) => (outDegMap.get(r.id ?? r[0] ?? '') ?? 0) > 8)
+          .map((r: any) => ({
+            id: r.id ?? r[0],
+            name: r.name ?? r[1],
+            label: r.label ?? r[2],
+            filePath: r.filePath ?? r[3],
+            startLine: r.startLine ?? r[4],
+            complexity: r.complexity ?? r[5],
+            parameterCount: r.parameterCount ?? r[6],
+            outboundCalls: outDegMap.get(r.id ?? r[0] ?? '') ?? 0,
+          }));
         if (hasCfg) {
           await this._augmentWithCfgStats(repo.id, results);
         }
@@ -3247,62 +2865,57 @@ export class LocalBackend {
             instructionCount: r.instructionCount ?? r[8] ?? 0,
           });
         }
-        return [...grouped.values()];
+        const resultLimit = Math.min(rawLimit ?? 200, 200);
+        const resultOffset = rawOffset ?? 0;
+        return [...grouped.values()].slice(resultOffset, resultOffset + resultLimit);
       }
 
       // ── cfg_complexity ─────────────────────────────────────────────────
-      // True cyclomatic complexity from CFG: (edges − blocks + 2) per function.
+      // True cyclomatic complexity from CFG: (edges − blocks + 2P) per function,
+      // where P = number of connected components (accounts for disconnected
+      // subgraphs after ErrorImplicit edge filtering).
       // Requires CFG data. threshold defaults to 5.
       case 'cfg_complexity': {
         if (!await this._hasCfgData(repo.id)) {
           return [{ error: 'No CFG data available. Re-run analyze without --no-cfg to generate CFG data.' }];
         }
         const cfgThreshold = threshold ?? 5;
-        // Count blocks and edges per function
-        const blockRows = await executeQuery(repo.id, `
+        // Single query: fetch block IDs + function metadata together
+        const blockIdRows = await executeQuery(repo.id, `
           MATCH (fn)-[:CodeRelation {type: 'CFG_CONTAINS'}]->(b:BasicBlock)
           RETURN fn.id AS fnId, fn.name AS fnName, labels(fn)[0] AS fnLabel,
                  fn.filePath AS filePath, fn.startLine AS startLine,
-                 fn.complexity AS astComplexity, fn.sloc AS sloc
+                 fn.complexity AS astComplexity, fn.sloc AS sloc,
+                 b.id AS blockId
         `);
+        // Group blocks by function and collect metadata
+        const fnBlockIds = new Map<string, Set<string>>();
         const fnMap = new Map<string, {
           name: string; label: string; filePath: string; startLine: any;
-          astComplexity: any; sloc: any; blockCount: number; blockIds: string[];
+          astComplexity: any; sloc: any;
         }>();
-        // Also need block IDs to count edges between them
-        const blockIdRows = await executeQuery(repo.id, `
-          MATCH (fn)-[:CodeRelation {type: 'CFG_CONTAINS'}]->(b:BasicBlock)
-          RETURN fn.id AS fnId, b.id AS blockId
-        `);
-        // Group blocks by function
-        const fnBlockIds = new Map<string, Set<string>>();
         for (const r of blockIdRows) {
           const fnId = r.fnId ?? r[0] ?? '';
-          const blockId = r.blockId ?? r[1] ?? '';
+          const blockId = r.blockId ?? r[7] ?? '';
           if (!fnId || !blockId) continue;
           if (!fnBlockIds.has(fnId)) fnBlockIds.set(fnId, new Set());
           fnBlockIds.get(fnId)!.add(blockId);
+          if (!fnMap.has(fnId)) {
+            fnMap.set(fnId, {
+              name: r.fnName ?? r[1] ?? '',
+              label: r.fnLabel ?? r[2] ?? '',
+              filePath: r.filePath ?? r[3] ?? '',
+              startLine: r.startLine ?? r[4],
+              astComplexity: r.astComplexity ?? r[5],
+              sloc: r.sloc ?? r[6],
+            });
+          }
         }
-        for (const r of blockRows) {
-          const fnId = r.fnId ?? r[0] ?? '';
-          if (!fnId || fnMap.has(fnId)) continue;
-          fnMap.set(fnId, {
-            name: r.fnName ?? r[1] ?? '',
-            label: r.fnLabel ?? r[2] ?? '',
-            filePath: r.filePath ?? r[3] ?? '',
-            startLine: r.startLine ?? r[4],
-            astComplexity: r.astComplexity ?? r[5],
-            sloc: r.sloc ?? r[6],
-            blockCount: fnBlockIds.get(fnId)?.size ?? 0,
-            blockIds: [],
-          });
-        }
-        // Count CFG_EDGE per function
+        // Fetch CFG_EDGE pairs
         const edgeRows = await executeQuery(repo.id, `
           MATCH (b1:BasicBlock)-[:CodeRelation {type: 'CFG_EDGE'}]->(b2:BasicBlock)
           RETURN b1.id AS srcId, b2.id AS tgtId
         `);
-        const fnEdgeCounts = new Map<string, number>();
         // Reverse lookup: blockId → fnId
         const blockToFn = new Map<string, string>();
         for (const [fnId, blockIds] of fnBlockIds) {
@@ -3310,17 +2923,55 @@ export class LocalBackend {
             blockToFn.set(bid, fnId);
           }
         }
+        // Count edges and collect adjacency lists per function for connected-component analysis
+        const fnEdgeCounts = new Map<string, number>();
+        const fnAdjacency = new Map<string, Map<string, Set<string>>>();
         for (const r of edgeRows) {
           const srcId = r.srcId ?? r[0] ?? '';
+          const tgtId = r.tgtId ?? r[1] ?? '';
           const fnId = blockToFn.get(srcId);
           if (fnId) {
             fnEdgeCounts.set(fnId, (fnEdgeCounts.get(fnId) ?? 0) + 1);
+            // Build undirected adjacency for connected-component counting
+            if (!fnAdjacency.has(fnId)) fnAdjacency.set(fnId, new Map());
+            const adj = fnAdjacency.get(fnId)!;
+            if (!adj.has(srcId)) adj.set(srcId, new Set());
+            if (!adj.has(tgtId)) adj.set(tgtId, new Set());
+            adj.get(srcId)!.add(tgtId);
+            adj.get(tgtId)!.add(srcId);
           }
         }
         const results: any[] = [];
         for (const [fnId, fn] of fnMap) {
+          const blockIds = fnBlockIds.get(fnId)!;
           const edgeCount = fnEdgeCounts.get(fnId) ?? 0;
-          const cfgCyclomaticComplexity = edgeCount - fn.blockCount + 2;
+          const blockCount = blockIds.size;
+          // Count connected components via BFS over the undirected adjacency graph.
+          // Blocks with no edges are each their own component.
+          const adj = fnAdjacency.get(fnId);
+          let components = 0;
+          const visited = new Set<string>();
+          for (const bid of blockIds) {
+            if (visited.has(bid)) continue;
+            components++;
+            // BFS from this block
+            const queue = [bid];
+            visited.add(bid);
+            while (queue.length > 0) {
+              const cur = queue.pop()!;
+              const neighbors = adj?.get(cur);
+              if (neighbors) {
+                for (const nb of neighbors) {
+                  if (!visited.has(nb)) {
+                    visited.add(nb);
+                    queue.push(nb);
+                  }
+                }
+              }
+            }
+          }
+          // M = E - N + 2P (generalized cyclomatic complexity)
+          const cfgCyclomaticComplexity = edgeCount - blockCount + 2 * components;
           if (cfgCyclomaticComplexity > cfgThreshold) {
             results.push({
               name: fn.name,
@@ -3329,303 +2980,139 @@ export class LocalBackend {
               startLine: fn.startLine,
               cfgComplexity: cfgCyclomaticComplexity,
               astComplexity: fn.astComplexity,
-              cfgBlocks: fn.blockCount,
+              cfgBlocks: blockCount,
               cfgEdges: edgeCount,
               sloc: fn.sloc,
             });
           }
         }
-        return results.sort((a, b) => b.cfgComplexity - a.cfgComplexity).slice(0, 200);
+        const resultLimit = Math.min(rawLimit ?? 200, 200);
+        const resultOffset = rawOffset ?? 0;
+        return results.sort((a, b) => b.cfgComplexity - a.cfgComplexity).slice(resultOffset, resultOffset + resultLimit);
+      }
+
+      // ── hotspots ──────────────────────────────────────────────────────
+      // Functions/methods with the highest number of inbound CALLS edges.
+      // Surfaces the most-called code — useful for finding high-impact refactoring targets.
+      // Fetches all CALLS edges once and computes degrees in JS (avoids N+1 per-node queries).
+      case 'hotspots': {
+        const resultLimit = Math.min(rawLimit ?? 20, 100);
+        const resultOffset = rawOffset ?? 0;
+        // Bulk: all CALLS target IDs
+        const edgeRows = await executeQuery(repo.id, `
+          MATCH (caller)-[:CodeRelation {type: 'CALLS'}]->(n)
+          RETURN n.id AS targetId
+        `);
+        const inDegMap = new Map<string, number>();
+        for (const r of edgeRows) {
+          const id = r.targetId ?? r[0] ?? '';
+          if (id) inDegMap.set(id, (inDegMap.get(id) ?? 0) + 1);
+        }
+        // Top N by inbound degree
+        const topIds = [...inDegMap.entries()]
+          .sort((a, b) => b[1] - a[1])
+          .slice(resultOffset, resultOffset + resultLimit);
+        // Fetch metadata for the top IDs
+        const results: any[] = [];
+        for (const [id, inDeg] of topIds) {
+          try {
+            const metaRows = await executeParameterized(repo.id,
+              `MATCH (n {id: $id}) RETURN n.name AS name, labels(n)[0] AS label, n.filePath AS filePath, n.startLine AS startLine`,
+              { id });
+            if (metaRows.length > 0) {
+              const r = metaRows[0];
+              results.push({
+                name: r.name ?? r[0] ?? '',
+                label: r.label ?? r[1] ?? '',
+                filePath: r.filePath ?? r[2] ?? '',
+                startLine: r.startLine ?? r[3],
+                inboundCalls: inDeg,
+              });
+            }
+          } catch {}
+        }
+        return results;
+      }
+
+      // ── high_fan_out ──────────────────────────────────────────────────
+      // Functions/methods with the highest number of outbound CALLS edges.
+      // Surfaces functions that depend on many others — candidates for decomposition.
+      // Fetches all CALLS edges once and computes degrees in JS.
+      case 'high_fan_out': {
+        const resultLimit = Math.min(rawLimit ?? 20, 100);
+        const resultOffset = rawOffset ?? 0;
+        // Bulk: all CALLS source IDs
+        const edgeRows = await executeQuery(repo.id, `
+          MATCH (n)-[:CodeRelation {type: 'CALLS'}]->(callee)
+          RETURN n.id AS sourceId
+        `);
+        const outDegMap = new Map<string, number>();
+        for (const r of edgeRows) {
+          const id = r.sourceId ?? r[0] ?? '';
+          if (id) outDegMap.set(id, (outDegMap.get(id) ?? 0) + 1);
+        }
+        const topIds = [...outDegMap.entries()]
+          .sort((a, b) => b[1] - a[1])
+          .slice(resultOffset, resultOffset + resultLimit);
+        const results: any[] = [];
+        for (const [id, outDeg] of topIds) {
+          try {
+            const metaRows = await executeParameterized(repo.id,
+              `MATCH (n {id: $id}) RETURN n.name AS name, labels(n)[0] AS label, n.filePath AS filePath, n.startLine AS startLine`,
+              { id });
+            if (metaRows.length > 0) {
+              const r = metaRows[0];
+              results.push({
+                name: r.name ?? r[0] ?? '',
+                label: r.label ?? r[1] ?? '',
+                filePath: r.filePath ?? r[2] ?? '',
+                startLine: r.startLine ?? r[3],
+                outboundCalls: outDeg,
+              });
+            }
+          } catch {}
+        }
+        return results;
+      }
+
+      // ── by_name ───────────────────────────────────────────────────────
+      // Find nodes matching a name regex, with an optional label filter.
+      // Accepts namePattern (required) and label (optional) from opts.
+      case 'by_name': {
+        if (!namePattern) throw new Error('name_pattern is required for by_name');
+        if (label && !VALID_NODE_LABELS.has(label)) {
+          throw new Error(`Invalid label: ${label}. Valid labels: ${[...VALID_NODE_LABELS].join(', ')}`);
+        }
+        const resultLimit = Math.min(rawLimit ?? 20, 100);
+        const resultOffset = rawOffset ?? 0;
+        const matchClause = label ? `MATCH (n:\`${label}\`)` : 'MATCH (n)';
+        const rows = await executeParameterized(repo.id, `
+          ${matchClause}
+          WHERE n.name =~ $namePattern
+          RETURN n.id AS id, n.name AS name, labels(n)[0] AS label,
+                 n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine
+          ORDER BY n.name
+          LIMIT ${resultOffset + resultLimit}
+        `, { namePattern });
+        const results = rows.map((r: any) => {
+          const startLine = r.startLine ?? r[4];
+          const endLine = r.endLine ?? r[5];
+          const lines = (startLine != null && endLine != null)
+            ? `${startLine}-${endLine}`
+            : (startLine != null ? String(startLine) : '');
+          return {
+            name: r.name ?? r[1] ?? '',
+            label: r.label ?? r[2] ?? '',
+            filePath: r.filePath ?? r[3] ?? '',
+            lines,
+          };
+        });
+        return results.slice(resultOffset);
       }
 
       default:
-        throw new Error(`Unknown quality_query preset: ${preset}. Valid presets: high_complexity, many_optionals, dead_code, cross_class_field_access, encapsulation_violations, unused_injections, overused_injections, params_by_type, param_fan_in, type_coupling, layer_violations, god_functions, throw_diversity, accessor_vs_direct, conditional_calls, hot_path, guarded_paths, unreachable_code, cfg_complexity`);
+        throw new Error(`Unknown quality_query preset: ${preset}. Valid presets: high_complexity, many_optionals, dead_code, cross_class_field_access, encapsulation_violations, unused_injections, overused_injections, params_by_type, param_fan_in, type_coupling, layer_violations, god_functions, throw_diversity, accessor_vs_direct, conditional_calls, hot_path, guarded_paths, unreachable_code, cfg_complexity, hotspots, high_fan_out, by_name`);
     }
   }
 
-  // ─── get_architecture ────────────────────────────────────────────
-
-  /**
-   * Multi-aspect architecture view via aspect-specific Cypher queries.
-   */
-  private async getArchitecture(repo: RepoHandle, params: {
-    aspects?: string[];
-  }): Promise<any> {
-    await this.ensureInitialized(repo.id);
-
-    const requested = params.aspects ?? ['all'];
-    const all = requested.includes('all');
-    const wants = (aspect: string) => all || requested.includes(aspect);
-
-    const result: Record<string, any> = {};
-
-    if (wants('languages')) {
-      try {
-        // Language derived from file extensions (language property not stored in KuzuDB)
-        const rows = await executeQuery(repo.id, `MATCH (f:File) RETURN f.filePath AS fp`);
-        const extCounts = new Map<string, number>();
-        const extToLang: Record<string, string> = {
-          '.ts': 'TypeScript', '.tsx': 'TypeScript (TSX)', '.js': 'JavaScript', '.jsx': 'JavaScript (JSX)',
-          '.py': 'Python', '.go': 'Go', '.rs': 'Rust', '.java': 'Java', '.kt': 'Kotlin',
-          '.c': 'C', '.cpp': 'C++', '.h': 'C/C++ Header', '.cs': 'C#', '.rb': 'Ruby',
-          '.php': 'PHP', '.swift': 'Swift', '.vue': 'Vue', '.svelte': 'Svelte',
-        };
-        for (const r of rows) {
-          const fp = (r.fp ?? r[0]) as string;
-          const dot = fp.lastIndexOf('.');
-          if (dot < 0) continue;
-          const ext = fp.slice(dot).toLowerCase();
-          const lang = extToLang[ext];
-          if (lang) extCounts.set(lang, (extCounts.get(lang) ?? 0) + 1);
-        }
-        result.languages = [...extCounts.entries()]
-          .sort((a, b) => b[1] - a[1])
-          .map(([language, file_count]) => ({ language, file_count }));
-      } catch (e) {
-        logQueryError('getArchitecture:languages', e);
-        result.languages = [];
-      }
-    }
-
-    if (wants('packages')) {
-      try {
-        const rows = await executeQuery(repo.id, `
-          MATCH (f:File)
-          WHERE f.filePath IS NOT NULL
-          WITH split(f.filePath, '/')[0] AS topDir, COUNT(f) AS fileCount
-          WHERE topDir <> '' AND topDir IS NOT NULL
-          RETURN topDir AS name, fileCount
-          ORDER BY fileCount DESC
-          LIMIT 30
-        `);
-        result.packages = rows.map((r: any) => ({
-          name: r.name ?? r[0],
-          file_count: r.fileCount ?? r[1],
-        }));
-      } catch (e) {
-        logQueryError('getArchitecture:packages', e);
-        result.packages = [];
-      }
-    }
-
-    if (wants('entry_points')) {
-      try {
-        // Real entry points: functions/classes in index/main files, CLI commands, route handlers
-        // Not just "all exported symbols" — that's the public API, not entry points
-        const rows = await executeQuery(repo.id, `
-          MATCH (n) WHERE n.isExported = true
-          AND NOT labels(n)[0] IN ['File', 'Folder', 'Community', 'Process', 'Const']
-          AND (
-            n.filePath ENDS WITH '/index.ts'
-            OR n.filePath ENDS WITH '/main.ts'
-            OR n.filePath ENDS WITH '/index.js'
-            OR n.filePath ENDS WITH '/main.js'
-            OR n.filePath CONTAINS '/cli/'
-            OR n.filePath CONTAINS '/commands/'
-            OR n.filePath CONTAINS '/routes/'
-            OR n.filePath CONTAINS '/handlers/'
-            OR n.filePath CONTAINS '/pages/'
-            OR n.filePath CONTAINS '/views/'
-          )
-          RETURN n.id AS qn, n.name AS name, n.filePath AS filePath
-          LIMIT 30
-        `);
-        result.entry_points = groupByFile(rows.map((r: any) => ({
-          name: r.name ?? r[1],
-          label: extractLabelFromQn(r.qn ?? r[0]),
-          filePath: r.filePath ?? r[2],
-        })));
-      } catch (e) {
-        logQueryError('getArchitecture:entry_points', e);
-        result.entry_points = [];
-      }
-    }
-
-    if (wants('routes')) {
-      try {
-        const rows = await executeQuery(repo.id, `
-          MATCH (n:Route)
-          RETURN n.name AS name, n.filePath AS filePath
-          LIMIT 30
-        `);
-        result.routes = groupByFile(rows.map((r: any) => ({
-          name: r.name ?? r[0],
-          filePath: r.filePath ?? r[1],
-        })));
-      } catch (e) {
-        logQueryError('getArchitecture:routes', e);
-        result.routes = [];
-      }
-    }
-
-    if (wants('hotspots')) {
-      try {
-        // Count inbound CALLS per target, fetch top 40 (we'll split infra vs app)
-        const rows = await executeQuery(repo.id, `
-          MATCH (caller)-[r:CodeRelation {type: 'CALLS'}]->(n)
-          RETURN n.id AS qn, n.name AS name,
-                 n.filePath AS filePath, n.startLine AS startLine,
-                 COUNT(caller) AS caller_count
-          ORDER BY caller_count DESC
-          LIMIT 40
-        `);
-
-        // Classify: infrastructure = called from 5+ distinct directories (shared utility)
-        // Application = callers concentrated in fewer directories (domain coupling)
-        const infra: any[] = [];
-        const app: any[] = [];
-        for (const r of rows) {
-          const qn = r.qn ?? r[0];
-          const name = r.name ?? r[1];
-          const file = r.filePath ?? r[2];
-          const callerCount = r.caller_count ?? r[3];
-          const label = extractLabelFromQn(qn);
-          const entry = { name, label, file, caller_count: callerCount };
-
-          // Heuristic: functions in utility/core/shared paths, or with very generic names
-          const isInfraPath = file && (
-            file.includes('/core/') || file.includes('/utils/') || file.includes('/utilities/') ||
-            file.includes('/helpers/') || file.includes('/lib/') || file.includes('/shared/') ||
-            file.includes('event-bus') || file.includes('logger') || file.includes('log-')
-          );
-
-          if (isInfraPath) {
-            infra.push(entry);
-          } else {
-            app.push(entry);
-          }
-        }
-
-        result.hotspots = {
-          application: app.slice(0, 15),
-          infrastructure: infra.slice(0, 10),
-        };
-      } catch (e) {
-        logQueryError('getArchitecture:hotspots', e);
-        result.hotspots = { application: [], infrastructure: [] };
-      }
-    }
-
-    if (wants('boundaries')) {
-      try {
-        // Directory-based module boundaries — uses file path segments, NOT cluster labels.
-        // Extracts the module directory (2nd or 3rd path segment) as the boundary unit.
-        const rows = await executeQuery(repo.id, `
-          MATCH (a)-[r:CodeRelation {type: 'CALLS'}]->(b)
-          WHERE a.filePath IS NOT NULL AND b.filePath IS NOT NULL
-            AND a.filePath <> b.filePath
-          RETURN a.filePath AS from_file, b.filePath AS to_file
-        `);
-
-        // Derive module from file path: use first 2 significant segments
-        // e.g. "src/game/features/logistics/dispatcher.ts" → "game/features/logistics"
-        // e.g. "src/components/use-renderer/index.ts" → "components/use-renderer"
-        const deriveModule = (fp: string): string => {
-          const parts = fp.split('/');
-          // Skip common prefixes like 'src', 'lib', 'app'
-          const start = (parts[0] === 'src' || parts[0] === 'lib' || parts[0] === 'app') ? 1 : 0;
-          // Take up to 3 segments after prefix for granularity
-          const significant = parts.slice(start, start + 3);
-          // Drop the filename (last segment if it has an extension)
-          if (significant.length > 1 && significant[significant.length - 1].includes('.')) {
-            significant.pop();
-          }
-          return significant.join('/') || parts[0];
-        };
-
-        const pairCounts = new Map<string, number>();
-        for (const row of rows) {
-          const fromFile = (row.from_file ?? row[0]) as string;
-          const toFile = (row.to_file ?? row[1]) as string;
-          const fromMod = deriveModule(fromFile);
-          const toMod = deriveModule(toFile);
-          if (fromMod === toMod) continue; // skip intra-module
-          const key = `${fromMod}\0${toMod}`;
-          pairCounts.set(key, (pairCounts.get(key) ?? 0) + 1);
-        }
-
-        // Filter out test→test and test→source dependencies (noise for architecture analysis)
-        const isTestModule = (mod: string) =>
-          mod.startsWith('tests/') || mod.startsWith('test/') || mod.startsWith('__tests__/') || mod.includes('/test/');
-
-        result.boundaries = [...pairCounts.entries()]
-          .map(([key, count]) => {
-            const [from, to] = key.split('\0');
-            return { from_module: from, to_module: to, call_count: count };
-          })
-          .filter(b => !isTestModule(b.from_module)) // exclude test→anything
-          .sort((a, b) => b.call_count - a.call_count)
-          .slice(0, 30);
-      } catch (e) {
-        logQueryError('getArchitecture:boundaries', e);
-        result.boundaries = [];
-      }
-    }
-
-    if (wants('services')) {
-      try {
-        // Cross-service HTTP/async calls — directory-based module boundaries
-        const rows = await executeQuery(repo.id, `
-          MATCH (a)-[r:CodeRelation]->(b)
-          WHERE r.type IN ['HTTP_CALLS', 'ASYNC_CALLS']
-            AND a.filePath IS NOT NULL AND b.filePath IS NOT NULL
-          RETURN a.filePath AS from_file, b.filePath AS to_file,
-                 r.type AS call_type
-        `);
-
-        const deriveModule = (fp: string): string => {
-          const parts = fp.split('/');
-          const start = (parts[0] === 'src' || parts[0] === 'lib' || parts[0] === 'app') ? 1 : 0;
-          const significant = parts.slice(start, start + 3);
-          if (significant.length > 1 && significant[significant.length - 1].includes('.')) {
-            significant.pop();
-          }
-          return significant.join('/') || parts[0];
-        };
-
-        const pairCounts = new Map<string, { callType: string; count: number }>();
-        for (const row of rows) {
-          const fromMod = deriveModule((row.from_file ?? row[0]) as string);
-          const toMod = deriveModule((row.to_file ?? row[1]) as string);
-          const callType = (row.call_type ?? row[2]) as string;
-          const key = `${fromMod}\0${toMod}\0${callType}`;
-          const entry = pairCounts.get(key);
-          if (entry) entry.count++;
-          else pairCounts.set(key, { callType, count: 1 });
-        }
-
-        result.services = [...pairCounts.entries()]
-          .map(([key, { callType, count }]) => {
-            const parts = key.split('\0');
-            return { from_module: parts[0], to_module: parts[1], call_type: callType, call_count: count };
-          })
-          .sort((a, b) => b.call_count - a.call_count)
-          .slice(0, 30);
-      } catch (e) {
-        logQueryError('getArchitecture:services', e);
-        result.services = [];
-      }
-    }
-
-    if (wants('clusters')) {
-      try {
-        const rows = await executeQuery(repo.id, `
-          MATCH (n)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
-          RETURN c.heuristicLabel AS label, COUNT(n) AS member_count
-          ORDER BY member_count DESC
-        `);
-        result.clusters = rows
-          .map((r: any) => ({
-            label: r.label ?? r[0],
-            member_count: r.member_count ?? r[1],
-          }))
-          .filter((c: any) => c.label && !c.label.startsWith('Cluster_')); // hide unnamed clusters
-      } catch (e) {
-        logQueryError('getArchitecture:clusters', e);
-        result.clusters = [];
-      }
-    }
-
-    return result;
-  }
 }
