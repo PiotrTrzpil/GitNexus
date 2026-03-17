@@ -21,6 +21,12 @@ export interface WorkerExtractedData {
   heritage: ExtractedHeritage[];
   routes: ExtractedRoute[];
   constructorBindings: FileConstructorBindings[];
+  /** Raw parsed nodes — retained for the parse cache (incremental indexing). */
+  nodes: ParseWorkerResult['nodes'];
+  /** Raw parsed relationships — retained for the parse cache. */
+  relationships: ParseWorkerResult['relationships'];
+  /** Raw parsed symbols — retained for the parse cache. */
+  symbols: ParseWorkerResult['symbols'];
 }
 
 // isNodeExported imported from ./export-detection.js (shared module)
@@ -46,7 +52,7 @@ const processParsingWithWorkers = async (
     if (lang) parseableFiles.push({ path: file.path, content: file.content });
   }
 
-  if (parseableFiles.length === 0) return { imports: [], calls: [], heritage: [], routes: [], constructorBindings: [] };
+  if (parseableFiles.length === 0) return { nodes: [], relationships: [], symbols: [], imports: [], calls: [], heritage: [], routes: [], constructorBindings: [] };
 
   const total = files.length;
 
@@ -59,6 +65,9 @@ const processParsingWithWorkers = async (
   );
 
   // Merge results from all workers into graph and symbol table
+  const allNodes: ParseWorkerResult['nodes'] = [];
+  const allRelationships: ParseWorkerResult['relationships'] = [];
+  const allSymbols: ParseWorkerResult['symbols'] = [];
   const allImports: ExtractedImport[] = [];
   const allCalls: ExtractedCall[] = [];
   const allHeritage: ExtractedHeritage[] = [];
@@ -85,6 +94,9 @@ const processParsingWithWorkers = async (
       });
     }
 
+    allNodes.push(...result.nodes);
+    allRelationships.push(...result.relationships);
+    allSymbols.push(...result.symbols);
     allImports.push(...result.imports);
     allCalls.push(...result.calls);
     allHeritage.push(...result.heritage);
@@ -108,7 +120,7 @@ const processParsingWithWorkers = async (
 
   // Final progress
   onFileProgress?.(total, total, 'done');
-  return { imports: allImports, calls: allCalls, heritage: allHeritage, routes: allRoutes, constructorBindings: allConstructorBindings };
+  return { nodes: allNodes, relationships: allRelationships, symbols: allSymbols, imports: allImports, calls: allCalls, heritage: allHeritage, routes: allRoutes, constructorBindings: allConstructorBindings };
 };
 
 // ============================================================================
