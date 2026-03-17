@@ -14,10 +14,11 @@ export interface Definition {
   decorators: string[];
   baseClasses: string[];
   lines: number;
+  bodyHash: string;         // hash of the definition body text for detecting content-only changes
 }
 
 export interface FieldDelta {
-  field: string;             // 'param_types' | 'return_type' | 'is_exported' | 'signature' | 'decorators' | 'base_classes'
+  field: string;             // 'param_types' | 'return_type' | 'is_exported' | 'signature' | 'decorators' | 'base_classes' | 'body'
   old: string;
   new: string;
 }

@@ -196,7 +196,8 @@ describe('LocalBackend.callTool', () => {
   it('context tool returns not-found for missing symbol', async () => {
     (executeParameterized as any).mockResolvedValue([]);
     const result = await backend.callTool('context', { name: 'doesNotExist' });
-    expect(result.error).toContain('not found');
+    expect(result.status).toBe('not_found');
+    expect(result.message).toContain('not found');
   });
 
   it('context tool returns disambiguation for multiple matches', async () => {

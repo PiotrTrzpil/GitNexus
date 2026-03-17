@@ -24,6 +24,8 @@ import {
 import { isNodeExported } from '../ingestion/export-detection.js';
 import { generateId } from '../../lib/utils.js';
 import { gitShow } from '../../storage/git.js';
+import { annotateBreaking } from './breaking-changes.js';
+import { createHash } from 'node:crypto';
 
 // ---------------------------------------------------------------------------
 // Definition extraction from source
@@ -176,6 +178,10 @@ export async function extractDefinitionsFromSource(
 
     const qualifiedName = buildQualifiedName(nodeLabel, filePath, nodeName, definitionNode);
 
+    // Compute a hash of the definition body for detecting content-only changes
+    const bodyText = definitionNode?.text ?? nameNode?.text ?? '';
+    const bodyHash = createHash('sha256').update(bodyText).digest('hex').slice(0, 16);
+
     definitions.push({
       qualifiedName,
       name: nodeName,
@@ -190,10 +196,23 @@ export async function extractDefinitionsFromSource(
       decorators,
       baseClasses,
       lines: endLine - startLine + 1,
+      bodyHash,
     });
   }
 
-  return definitions;
+  // Deduplicate: overlapping tree-sitter query patterns (e.g. string-specific
+  // and general const patterns) can produce multiple Definitions with the same
+  // qualifiedName. Keep the first (most specific) match.
+  const seen = new Set<string>();
+  const deduped: Definition[] = [];
+  for (const d of definitions) {
+    if (!seen.has(d.qualifiedName)) {
+      seen.add(d.qualifiedName);
+      deduped.push(d);
+    }
+  }
+
+  return deduped;
 }
 
 /**
@@ -357,6 +376,7 @@ export async function diffFile(
   filePath: string,
   fileStatus: 'A' | 'D' | 'M' | 'R',
   ref = 'HEAD',
+  options?: { includeBody?: boolean },
 ): Promise<SymbolChange[]> {
   let oldSource = '';
   let newSource = '';
@@ -380,7 +400,9 @@ export async function diffFile(
   const oldDefs = oldSource ? await extractDefinitionsFromSource(filePath, oldSource) : [];
   const newDefs = newSource ? await extractDefinitionsFromSource(filePath, newSource) : [];
 
-  return diff(oldDefs, newDefs, filePath, fileStatus);
+  const changes = diff(oldDefs, newDefs, filePath, fileStatus, options);
+  annotateBreaking(changes, oldDefs, newDefs);
+  return changes;
 }
 
 /**
@@ -392,6 +414,7 @@ export function diff(
   newDefs: Definition[],
   filePath: string,
   fileStatus: string,
+  options?: { includeBody?: boolean },
 ): SymbolChange[] {
   const oldFiltered = filterModules(oldDefs);
   const newFiltered = filterModules(newDefs);
@@ -415,7 +438,7 @@ export function diff(
     if (newDef) {
       matchedOld.add(qn);
       matchedNew.add(qn);
-      const change = compareDefinitions(oldDef, newDef, filePath);
+      const change = compareDefinitions(oldDef, newDef, filePath, options);
       if (change) changes.push(change);
     }
   }
@@ -447,7 +470,7 @@ export function diff(
         const nd = candidates[0];
         renamedOld.add(od.qualifiedName);
         renamedNew.add(nd.qualifiedName);
-        changes.push(buildRenameChange(od, nd, filePath));
+        changes.push(buildRenameChange(od, nd, filePath, options));
       }
     }
   }
@@ -479,8 +502,9 @@ export function compareDefinitions(
   od: Definition,
   nd: Definition,
   filePath: string,
+  options?: { includeBody?: boolean },
 ): SymbolChange | null {
-  const deltas = computeDeltas(od, nd);
+  const deltas = computeDeltas(od, nd, options);
 
   if (deltas.length === 0) {
     return null;
@@ -503,7 +527,7 @@ export function compareDefinitions(
  * Compute field-level deltas between two definitions.
  * Ports computeDeltas from differ.go exactly.
  */
-export function computeDeltas(od: Definition, nd: Definition): FieldDelta[] {
+export function computeDeltas(od: Definition, nd: Definition, options?: { includeBody?: boolean }): FieldDelta[] {
   const deltas: FieldDelta[] = [];
 
   if (od.signature !== nd.signature) {
@@ -542,6 +566,11 @@ export function computeDeltas(od: Definition, nd: Definition): FieldDelta[] {
   const newBaseClasses = sortedJoin(nd.baseClasses);
   if (oldBaseClasses !== newBaseClasses) {
     deltas.push({ field: 'base_classes', old: oldBaseClasses, new: newBaseClasses });
+  }
+
+  // Body hash comparison: detects content changes even when line count is unchanged
+  if (options?.includeBody && od.bodyHash && nd.bodyHash && od.bodyHash !== nd.bodyHash) {
+    deltas.push({ field: 'body', old: od.bodyHash, new: nd.bodyHash });
   }
 
   return deltas;
@@ -628,8 +657,8 @@ function removedChange(d: Definition, filePath: string): SymbolChange {
   };
 }
 
-function buildRenameChange(od: Definition, nd: Definition, filePath: string): SymbolChange {
-  const deltas = computeDeltas(od, nd);
+function buildRenameChange(od: Definition, nd: Definition, filePath: string, options?: { includeBody?: boolean }): SymbolChange {
+  const deltas = computeDeltas(od, nd, options);
   return {
     kind: 'Renamed',
     label: nd.label,

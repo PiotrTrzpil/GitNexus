@@ -234,10 +234,12 @@ Returns: { changes: SymbolChange[], summary: { total, breaking, byKind } }`,
     inputSchema: {
       type: 'object',
       properties: {
-        file_paths: { type: 'array', items: { type: 'string' }, description: 'Specific files to diff (default: all staged/unstaged changed files)' },
+        file_paths: { type: 'array', items: { type: 'string' }, description: 'Specific repo-relative files to diff (default: all changed files per scope)' },
         ref: { type: 'string', description: 'Git ref to compare against (default: "HEAD")', default: 'HEAD' },
+        scope: { type: 'string', enum: ['unstaged', 'staged', 'all'], description: 'Which changes to diff: unstaged (working tree vs index), staged (index vs HEAD), all (working tree vs HEAD). Default: "unstaged". Ignored when file_paths is provided.', default: 'unstaged' },
         breaking_only: { type: 'boolean', description: 'Return only breaking changes (default: false)', default: false },
         group_commits: { type: 'boolean', description: 'Group changes into logical commit groups using coupling analysis (default: false)', default: false },
+        include_body: { type: 'boolean', description: 'Detect body-only changes (content edits that don\'t alter signature or line count). Default: false.', default: false },
         repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
       },
       required: [],

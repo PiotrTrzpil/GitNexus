@@ -420,12 +420,16 @@ export class LocalBackend {
     breaking_only?: boolean;
     scope?: 'unstaged' | 'staged' | 'all';
     group_commits?: boolean;
+    include_body?: boolean;
   }): Promise<any> {
     const ref = params.ref ?? 'HEAD';
     const breakingOnly = params.breaking_only ?? false;
     const groupCommits = params.group_commits ?? false;
+    const includeBody = params.include_body ?? false;
 
     // Determine files to diff: explicit list or all changed files via git
+    // fileStatusMap tracks git status (A/D/M/R) per repo-relative path
+    const fileStatusMap = new Map<string, 'A' | 'D' | 'M' | 'R'>();
     let filePaths: string[] = params.file_paths ?? [];
     if (filePaths.length === 0) {
       // Fall back to git diff to find changed files
@@ -434,15 +438,45 @@ export class LocalBackend {
         const scope = params.scope ?? 'unstaged';
         let gitCmd: string;
         if (scope === 'staged') {
-          gitCmd = 'git diff --cached --name-only';
+          gitCmd = 'git diff --cached --name-status';
         } else if (scope === 'all') {
-          gitCmd = 'git diff HEAD --name-only';
+          gitCmd = 'git diff HEAD --name-status';
         } else {
-          gitCmd = 'git diff --name-only HEAD';
+          // unstaged: working tree vs index (no ref)
+          gitCmd = 'git diff --name-status';
         }
         const raw = execSync(gitCmd, { cwd: repo.repoPath }).toString();
-        filePaths = raw.split('\n').map(l => l.trim()).filter(Boolean)
-          .map(rel => path.join(repo.repoPath, rel));
+        filePaths = [];
+        for (const line of raw.split('\n')) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          // Format: "M\tpath" or "R###\told\tnew"
+          const parts = trimmed.split('\t');
+          const statusChar = parts[0].charAt(0) as 'A' | 'D' | 'M' | 'R';
+          const status = (['A', 'D', 'M', 'R'] as const).includes(statusChar) ? statusChar : 'M';
+          // For renames, use the new path (parts[2]); otherwise parts[1]
+          const relPath = status === 'R' && parts[2] ? parts[2] : parts[1];
+          if (relPath) {
+            filePaths.push(relPath);
+            fileStatusMap.set(relPath, status);
+          }
+        }
+
+        // Include untracked files for 'unstaged' and 'all' scopes —
+        // git diff doesn't report files that have never been tracked
+        if (scope === 'unstaged' || scope === 'all') {
+          const untrackedRaw = execSync(
+            'git ls-files --others --exclude-standard',
+            { cwd: repo.repoPath },
+          ).toString();
+          for (const line of untrackedRaw.split('\n')) {
+            const relPath = line.trim();
+            if (relPath && !fileStatusMap.has(relPath)) {
+              filePaths.push(relPath);
+              fileStatusMap.set(relPath, 'A');
+            }
+          }
+        }
       } catch (err) {
         console.warn(`[semanticDiff] git diff failed for ${repo.repoPath}: ${(err as Error).message}`);
         filePaths = [];
@@ -461,13 +495,14 @@ export class LocalBackend {
     const fileSummaries: FileChangeSummary[] = [];
     for (const fp of filePaths) {
       try {
-        const fileChanges = await diffFile(repo.repoPath, fp, 'M', ref);
+        const status = fileStatusMap.get(fp) ?? 'M';
+        const fileChanges = await diffFile(repo.repoPath, fp, status, ref, { includeBody });
         allChanges.push(...fileChanges);
         if (groupCommits && fileChanges.length > 0) {
           fileSummaries.push({ path: fp, changes: fileChanges });
         }
-      } catch {
-        // Non-fatal: skip unparseable or new files
+      } catch (err) {
+        console.warn(`[semanticDiff] diffFile failed for ${fp}: ${(err as Error).message}`);
       }
     }
 

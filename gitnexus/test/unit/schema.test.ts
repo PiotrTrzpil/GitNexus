@@ -44,8 +44,8 @@ describe('LadybugDB Schema', () => {
     });
 
     it('has expected total count', () => {
-      // 9 core + 18 multi-language + 1 Route + 1 BasicBlock = 29
-      expect(NODE_TABLES).toHaveLength(29);
+      // 9 core + 18 multi-language + 1 Route + 1 BasicBlock + 1 Parameter = 30
+      expect(NODE_TABLES).toHaveLength(30);
     });
   });
 
@@ -194,7 +194,7 @@ describe('LadybugDB Schema', () => {
 
   describe('schema query ordering', () => {
     it('NODE_SCHEMA_QUERIES has correct count', () => {
-      expect(NODE_SCHEMA_QUERIES).toHaveLength(29);
+      expect(NODE_SCHEMA_QUERIES).toHaveLength(30);
     });
 
     it('REL_SCHEMA_QUERIES has one relation table', () => {
@@ -202,8 +202,8 @@ describe('LadybugDB Schema', () => {
     });
 
     it('SCHEMA_QUERIES includes all node + rel + embedding schemas', () => {
-      // 29 node + 1 rel + 1 embedding = 31
-      expect(SCHEMA_QUERIES).toHaveLength(31);
+      // 30 node + 1 rel + 1 embedding = 32
+      expect(SCHEMA_QUERIES).toHaveLength(32);
     });
 
     it('node schemas come before relation schemas in SCHEMA_QUERIES', () => {

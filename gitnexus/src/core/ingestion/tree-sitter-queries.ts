@@ -95,6 +95,19 @@ export const TYPESCRIPT_QUERIES = `
     name: (identifier) @name
     value: (template_string) @string.value)) @definition.const
 
+; Non-string constants: const FOO = 42, const FOO = true, etc.
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (_))) @definition.const
+
+; Exported non-string constants: export const FOO = 42
+(export_statement
+  declaration: (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name
+      value: (_)))) @definition.const
+
 ; Error throws: throw new Error("message")
 (throw_statement
   (new_expression
@@ -179,6 +192,19 @@ export const JAVASCRIPT_QUERIES = `
   (variable_declarator
     name: (identifier) @name
     value: (template_string) @string.value)) @definition.const
+
+; Non-string constants: const FOO = 42, const FOO = true, etc.
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (_))) @definition.const
+
+; Exported non-string constants: export const FOO = 42
+(export_statement
+  declaration: (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name
+      value: (_)))) @definition.const
 
 ; Error throws: throw new Error("message")
 (throw_statement
