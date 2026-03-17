@@ -48,7 +48,7 @@ https://github.com/user-attachments/assets/172685ba-8e54-4ea7-9ad1-e31a3398da72
 |                   | **CLI + MCP**                                            | **Web UI**                                             |
 | ----------------- | -------------------------------------------------------------- | ------------------------------------------------------------ |
 | **What**    | Index repos locally, connect AI agents via MCP                 | Visual graph explorer + AI chat in browser                   |
-| **For**     | Daily development with Cursor, Claude Code, Windsurf, OpenCode | Quick exploration, demos, one-off analysis                   |
+| **For**     | Daily development with Cursor, Claude Code, Windsurf, OpenCode, Codex | Quick exploration, demos, one-off analysis                   |
 | **Scale**   | Full repos, any size                                           | Limited by browser memory (~5k files), or unlimited via backend mode |
 | **Install** | `npm install -g gitnexus`                                    | No install —[gitnexus.vercel.app](https://gitnexus.vercel.app) |
 | **Storage** | LadybugDB native (fast, persistent)                               | LadybugDB WASM (in-memory, per session)                         |
@@ -86,6 +86,7 @@ To configure MCP for your editor, run `npx gitnexus setup` once — or set it up
 | **Cursor**      | Yes | Yes    | —                   | MCP + Skills   |
 | **Windsurf**    | Yes | —     | —                   | MCP            |
 | **OpenCode**    | Yes | Yes    | —                   | MCP + Skills   |
+| **Codex**       | Yes | —     | —                   | MCP            |
 
 > **Claude Code** gets the deepest integration: MCP tools + agent skills + PreToolUse hooks that enrich searches with graph context + PostToolUse hooks that auto-reindex after commits.
 
@@ -127,6 +128,14 @@ claude mcp add gitnexus -- npx -y gitnexus@latest mcp
     }
   }
 }
+```
+
+**Codex** (`~/.codex/config.toml` for system scope, or `.codex/config.toml` for project scope):
+
+```toml
+[mcp_servers.gitnexus]
+command = "npx"
+args = ["-y", "gitnexus@latest", "mcp"]
 ```
 
 ### CLI Commands
