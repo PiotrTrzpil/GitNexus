@@ -2,7 +2,27 @@ import { KnowledgeGraph, GraphNode } from '../graph/types.js';
 import { generateId } from '../../lib/utils.js';
 import type { ResolutionContext } from './resolution-context.js';
 import { yieldToEventLoop } from './utils.js';
-import type { ExtractedFileCfg, ExtractedFunctionCfg } from './workers/parse-worker.js';
+import type { ExtractedFileCfg, ExtractedFunctionCfg, CfgBlock, CfgEdge } from './workers/parse-worker.js';
+
+/**
+ * Build a spatial index: filePath → Function/Method/Constructor nodes in that file.
+ * Avoids O(N) full-graph scans in the line-range fallback of findParentNode.
+ */
+function buildFileNodeIndex(graph: KnowledgeGraph): Map<string, GraphNode[]> {
+  const index = new Map<string, GraphNode[]>();
+  graph.forEachNode((node) => {
+    if (node.label !== 'Function' && node.label !== 'Method' && node.label !== 'Constructor') return;
+    const fp = node.properties.filePath;
+    if (!fp) return;
+    let list = index.get(fp);
+    if (!list) {
+      list = [];
+      index.set(fp, list);
+    }
+    list.push(node);
+  });
+  return index;
+}
 
 /**
  * Find the parent Function/Method graph node for a given CFG function entry.
@@ -10,15 +30,21 @@ import type { ExtractedFileCfg, ExtractedFunctionCfg } from './workers/parse-wor
  * Resolution order:
  *  1. Direct lookup by symbolId (O(1)) — set by the parse worker when it
  *     could match the CFG function to a tree-sitter symbol by name+line.
- *  2. Line-range fallback — iterate nodes in the same file and find a
- *     Function/Method whose (startLine, endLine) encompasses the CFG
- *     function's range. Prefer exact startLine match over containment.
+ *  2. Line-range fallback — search nodes in the same file (via pre-built
+ *     spatial index) and find a Function/Method whose (startLine, endLine)
+ *     encompasses the CFG function's range. Prefer exact startLine match
+ *     over containment.
+ *
+ * NOTE: oxc startLine is 1-indexed; tree-sitter graph nodes store 0-indexed
+ * rows. The caller must pass the converted (0-indexed) line range.
  *
  * Returns the matched GraphNode, or undefined if no match is found.
  */
 function findParentNode(
   graph: KnowledgeGraph,
-  filePath: string,
+  fileNodes: GraphNode[] | undefined,
+  cfgStartLine: number,
+  cfgEndLine: number,
   cfgFn: ExtractedFunctionCfg,
 ): GraphNode | undefined {
   // Fast path: symbolId set by parse worker.
@@ -26,28 +52,25 @@ function findParentNode(
     return graph.getNode(cfgFn.symbolId);
   }
 
-  // Fallback: line-range matching.
-  // Collect candidates: Function/Method nodes in the same file whose line
-  // range encompasses the CFG function's range.
+  if (!fileNodes) return undefined;
+
+  // Fallback: line-range matching against nodes in the same file.
   let exactMatch: GraphNode | undefined;
   let containsMatch: GraphNode | undefined;
 
-  graph.forEachNode((node) => {
-    if (node.label !== 'Function' && node.label !== 'Method' && node.label !== 'Constructor') return;
-    if (node.properties.filePath !== filePath) return;
-
+  for (const node of fileNodes) {
     const nodeStart = node.properties.startLine;
     const nodeEnd = node.properties.endLine;
-    if (nodeStart === undefined || nodeEnd === undefined) return;
+    if (nodeStart === undefined || nodeEnd === undefined) continue;
 
     // Exact startLine match — strongest signal.
-    if (nodeStart === cfgFn.startLine) {
+    if (nodeStart === cfgStartLine) {
       exactMatch = node;
-      return;
+      break;
     }
 
     // Containment: CFG function range is fully inside node range.
-    if (nodeStart <= cfgFn.startLine && nodeEnd >= cfgFn.endLine) {
+    if (nodeStart <= cfgStartLine && nodeEnd >= cfgEndLine) {
       // Prefer the tightest enclosing range if multiple match.
       if (
         containsMatch === undefined ||
@@ -58,7 +81,7 @@ function findParentNode(
         containsMatch = node;
       }
     }
-  });
+  }
 
   return exactMatch ?? containsMatch;
 }
@@ -89,6 +112,10 @@ export const processCfgFromExtracted = async (
 ): Promise<void> => {
   const total = cfgData.length;
 
+  // Pre-build spatial index once — O(graph nodes) — instead of scanning
+  // the full graph on every fallback lookup.
+  const fileNodeIndex = buildFileNodeIndex(graph);
+
   for (let fileIdx = 0; fileIdx < cfgData.length; fileIdx++) {
     const fileCfg = cfgData[fileIdx];
 
@@ -98,8 +125,14 @@ export const processCfgFromExtracted = async (
       await yieldToEventLoop();
     }
 
+    const fileNodes = fileNodeIndex.get(fileCfg.filePath);
+
     for (const cfgFn of fileCfg.functions) {
-      const parentNode = findParentNode(graph, fileCfg.filePath, cfgFn);
+      // Convert oxc 1-indexed lines to tree-sitter 0-indexed for matching.
+      const cfgStartLine = cfgFn.startLine - 1;
+      const cfgEndLine = cfgFn.endLine - 1;
+
+      const parentNode = findParentNode(graph, fileNodes, cfgStartLine, cfgEndLine, cfgFn);
 
       // No matching parent — skip this function gracefully.
       if (parentNode === undefined) {
@@ -120,7 +153,7 @@ export const processCfgFromExtracted = async (
         if (block.instructions.length > 0) continue;
         // Check if this block only has incoming ErrorImplicit edges
         const hasNonErrorIncoming = cfgFn.edges.some(
-          e => e.target === block.id && e.type !== 'ErrorImplicit',
+          (e: CfgEdge) => e.target === block.id && e.type !== 'ErrorImplicit',
         );
         if (!hasNonErrorIncoming) {
           errorSinkBlockIds.add(block.id);

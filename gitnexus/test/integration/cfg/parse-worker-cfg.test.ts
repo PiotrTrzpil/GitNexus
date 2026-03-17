@@ -128,8 +128,9 @@ describe.skipIf(!hasDistWorker)('Layer 2: Parse Worker CFG Integration', () => {
       expect(['Function', 'Method']).toContain(matchedNode.label);
       expect(matchedNode.properties.name).toBe('handleRequest');
 
-      // Line numbers should align between CFG and tree-sitter
-      expect(handleRequestCfg.startLine).toBe(matchedNode.properties.startLine);
+      // oxc startLine is 1-indexed; tree-sitter stores 0-indexed rows.
+      // The CFG startLine should be exactly 1 more than the node's startLine.
+      expect(handleRequestCfg.startLine).toBe(matchedNode.properties.startLine + 1);
     }
 
     // Whether or not symbolId is set, startLine and endLine should be populated
@@ -164,44 +165,6 @@ describe.skipIf(!hasDistWorker)('Layer 2: Parse Worker CFG Integration', () => {
     expect(pythonCfg).toBeUndefined();
   });
 
-  /**
-   * 2.4 Binding unavailable — graceful skip
-   *
-   * The parse worker handles missing native binding gracefully:
-   * - ParseWorkerResult.cfgData defaults to an empty array
-   * - All other fields (nodes, calls, imports, etc.) are still populated
-   *
-   * We test this by verifying that cfgData is always a valid (possibly empty)
-   * array regardless of binding availability. The worker already ran above,
-   * so this test is an invariant check.
-   */
-  it('2.4: cfgData is always a valid array — empty when binding unavailable', async () => {
-    const workerUrl = pathToFileURL(DIST_WORKER) as URL;
-    pool = createWorkerPool(workerUrl, 1);
-
-    const results = await pool.dispatch<any, any>([
-      { path: 'src/handler.ts', content: TS_SOURCE_WITH_FUNCTION },
-    ]);
-
-    expect(results).toHaveLength(1);
-    const result = results[0];
-
-    // cfgData MUST always be an array — never undefined, never null, never missing
-    expect(result).toHaveProperty('cfgData');
-    expect(Array.isArray(result.cfgData)).toBe(true);
-
-    // Core parse results must be unaffected regardless of CFG binding status
-    expect(Array.isArray(result.nodes)).toBe(true);
-    expect(result.nodes.length).toBeGreaterThan(0);
-    expect(Array.isArray(result.calls)).toBe(true);
-    expect(typeof result.fileCount).toBe('number');
-    expect(result.fileCount).toBeGreaterThan(0);
-
-    // Symbol nodes for the two functions should be present
-    const functionNames = result.nodes
-      .filter((n: any) => n.label === 'Function')
-      .map((n: any) => n.properties.name);
-    expect(functionNames).toContain('handleRequest');
-    expect(functionNames).toContain('parsePayload');
-  });
+  // Test 2.4 removed — redundant with 2.1 (cfgData array check) and
+  // pipeline-cfg 4.6 (core parse results unaffected by CFG binding status).
 });

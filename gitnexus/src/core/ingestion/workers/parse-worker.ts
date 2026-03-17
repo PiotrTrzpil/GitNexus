@@ -224,6 +224,29 @@ export interface ExtractedFileCfg {
  * Per-function CFG after NAPI call, ready for postMessage transfer.
  * Same shape as FunctionCfg but with symbolId for tree-sitter node matching.
  */
+/** A single instruction within a BasicBlock, as returned by the oxc-cfg native binding. */
+export interface CfgInstruction {
+  kind: string;
+  startLine: number | null;
+  endLine: number | null;
+  text?: string;
+}
+
+/** A basic block within a function's CFG, as returned by the oxc-cfg native binding. */
+export interface CfgBlock {
+  id: number;
+  instructions: CfgInstruction[];
+  unreachable: boolean;
+}
+
+/** A control-flow edge between two basic blocks, as returned by the oxc-cfg native binding. */
+export interface CfgEdge {
+  source: number;
+  target: number;
+  type: string;
+  conditionText: string | null;
+}
+
 export interface ExtractedFunctionCfg {
   /** Function name */
   name: string;
@@ -232,8 +255,8 @@ export interface ExtractedFunctionCfg {
   startLine: number;
   endLine: number;
   className: string | null;
-  blocks: any[];
-  edges: any[];
+  blocks: CfgBlock[];
+  edges: CfgEdge[];
 }
 
 export interface ParseWorkerResult {
