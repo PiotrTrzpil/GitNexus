@@ -229,19 +229,21 @@ export const streamAllCSVsToDisk = async (
   const fileWriter = new BufferedCSVWriter(path.join(csvDir, 'file.csv'), 'id,name,filePath,content');
   const folderWriter = new BufferedCSVWriter(path.join(csvDir, 'folder.csv'), 'id,name,filePath');
   const codeElementHeader = 'id,name,filePath,startLine,endLine,isExported,content,description';
-  const functionWriter = new BufferedCSVWriter(path.join(csvDir, 'function.csv'), codeElementHeader);
+  const functionHeader = 'id,name,filePath,startLine,endLine,isExported,content,description,complexity,sloc,parameterCount,visibility';
+  const functionWriter = new BufferedCSVWriter(path.join(csvDir, 'function.csv'), functionHeader);
   const classWriter = new BufferedCSVWriter(path.join(csvDir, 'class.csv'), codeElementHeader);
   const interfaceWriter = new BufferedCSVWriter(path.join(csvDir, 'interface.csv'), codeElementHeader);
-  const methodHeader = 'id,name,filePath,startLine,endLine,isExported,content,description,parameterCount,returnType,className';
+  const methodHeader = 'id,name,filePath,startLine,endLine,isExported,content,description,parameterCount,returnType,className,complexity,sloc,visibility,isAccessor,isStatic,isAbstract';
   const methodWriter = new BufferedCSVWriter(path.join(csvDir, 'method.csv'), methodHeader);
   const codeElemWriter = new BufferedCSVWriter(path.join(csvDir, 'codeelement.csv'), codeElementHeader);
   const communityWriter = new BufferedCSVWriter(path.join(csvDir, 'community.csv'), 'id,label,heuristicLabel,keywords,description,enrichedBy,cohesion,symbolCount');
   const processWriter = new BufferedCSVWriter(path.join(csvDir, 'process.csv'), 'id,label,heuristicLabel,processType,stepCount,communities,entryPointId,terminalId');
 
-  // Class member types have className column
-  const classMemberHeader = 'id,name,filePath,startLine,endLine,content,description,className';
-  const propertyWriter = new BufferedCSVWriter(path.join(csvDir, 'property.csv'), classMemberHeader);
-  const constructorWriter = new BufferedCSVWriter(path.join(csvDir, 'constructor.csv'), classMemberHeader);
+  // Class member types have className column + semantic depth columns
+  const propertyHeader = 'id,name,filePath,startLine,endLine,content,description,className,visibility,isReadonly,isStatic,isAccessor';
+  const propertyWriter = new BufferedCSVWriter(path.join(csvDir, 'property.csv'), propertyHeader);
+  const constructorHeader = 'id,name,filePath,startLine,endLine,content,description,className,complexity,sloc,parameterCount,visibility';
+  const constructorWriter = new BufferedCSVWriter(path.join(csvDir, 'constructor.csv'), constructorHeader);
 
   // Multi-language node types share the same CSV shape (no isExported column)
   const multiLangHeader = 'id,name,filePath,startLine,endLine,content,description';
@@ -252,12 +254,15 @@ export const streamAllCSVsToDisk = async (
     multiLangWriters.set(t, new BufferedCSVWriter(path.join(csvDir, `${t.toLowerCase()}.csv`), multiLangHeader));
   }
 
+  // Parameter nodes
+  const parameterHeader = 'id,name,filePath,startLine,endLine,ordinal,isOptional,hasDefault,isRest,visibility';
+  const parameterWriter = new BufferedCSVWriter(path.join(csvDir, 'parameter.csv'), parameterHeader);
+
   // CFG BasicBlock nodes
   const basicBlockHeader = 'id,name,filePath,startLine,endLine,blockIndex,instructionCount,isUnreachable,cfgInstructions';
   const basicBlockWriter = new BufferedCSVWriter(path.join(csvDir, 'basicblock.csv'), basicBlockHeader);
 
   const codeWriterMap: Record<string, BufferedCSVWriter> = {
-    'Function': functionWriter,
     'Class': classWriter,
     'Interface': interfaceWriter,
     'CodeElement': codeElemWriter,
@@ -317,36 +322,100 @@ export const streamAllCSVsToDisk = async (
         ].join(','));
         break;
       }
-      case 'Method': {
+      case 'Function': {
         const content = await extractContent(node, contentCache);
-        await methodWriter.addRow([
+        const p = node.properties as any;
+        await functionWriter.addRow([
           escapeCSVField(node.id),
-          escapeCSVField(node.properties.name || ''),
-          escapeCSVField(node.properties.filePath || ''),
-          escapeCSVNumber(node.properties.startLine, -1),
-          escapeCSVNumber(node.properties.endLine, -1),
-          node.properties.isExported ? 'true' : 'false',
+          escapeCSVField(p.name || ''),
+          escapeCSVField(p.filePath || ''),
+          escapeCSVNumber(p.startLine, -1),
+          escapeCSVNumber(p.endLine, -1),
+          p.isExported ? 'true' : 'false',
           escapeCSVField(content),
-          escapeCSVField((node.properties as any).description || ''),
-          escapeCSVNumber(node.properties.parameterCount, 0),
-          escapeCSVField(node.properties.returnType || ''),
-          escapeCSVField((node.properties as any).className || ''),
+          escapeCSVField(p.description || ''),
+          escapeCSVNumber(p.complexity, 0),
+          escapeCSVNumber(p.sloc, 0),
+          escapeCSVNumber(p.parameterCount, 0),
+          escapeCSVField(p.visibility || ''),
         ].join(','));
         break;
       }
-      case 'Constructor':
+      case 'Method': {
+        const content = await extractContent(node, contentCache);
+        const p = node.properties as any;
+        await methodWriter.addRow([
+          escapeCSVField(node.id),
+          escapeCSVField(p.name || ''),
+          escapeCSVField(p.filePath || ''),
+          escapeCSVNumber(p.startLine, -1),
+          escapeCSVNumber(p.endLine, -1),
+          p.isExported ? 'true' : 'false',
+          escapeCSVField(content),
+          escapeCSVField(p.description || ''),
+          escapeCSVNumber(p.parameterCount, 0),
+          escapeCSVField(p.returnType || ''),
+          escapeCSVField(p.className || ''),
+          escapeCSVNumber(p.complexity, 0),
+          escapeCSVNumber(p.sloc, 0),
+          escapeCSVField(p.visibility || ''),
+          p.isAccessor ? 'true' : 'false',
+          p.isStatic ? 'true' : 'false',
+          p.isAbstract ? 'true' : 'false',
+        ].join(','));
+        break;
+      }
+      case 'Constructor': {
+        const content = await extractContent(node, contentCache);
+        const p = node.properties as any;
+        await constructorWriter.addRow([
+          escapeCSVField(node.id),
+          escapeCSVField(p.name || ''),
+          escapeCSVField(p.filePath || ''),
+          escapeCSVNumber(p.startLine, -1),
+          escapeCSVNumber(p.endLine, -1),
+          escapeCSVField(content),
+          escapeCSVField(p.description || ''),
+          escapeCSVField(p.className || ''),
+          escapeCSVNumber(p.complexity, 0),
+          escapeCSVNumber(p.sloc, 0),
+          escapeCSVNumber(p.parameterCount, 0),
+          escapeCSVField(p.visibility || ''),
+        ].join(','));
+        break;
+      }
       case 'Property': {
         const content = await extractContent(node, contentCache);
-        const writer = node.label === 'Constructor' ? constructorWriter : propertyWriter;
-        await writer.addRow([
+        const p = node.properties as any;
+        await propertyWriter.addRow([
           escapeCSVField(node.id),
-          escapeCSVField(node.properties.name || ''),
-          escapeCSVField(node.properties.filePath || ''),
-          escapeCSVNumber(node.properties.startLine, -1),
-          escapeCSVNumber(node.properties.endLine, -1),
+          escapeCSVField(p.name || ''),
+          escapeCSVField(p.filePath || ''),
+          escapeCSVNumber(p.startLine, -1),
+          escapeCSVNumber(p.endLine, -1),
           escapeCSVField(content),
-          escapeCSVField((node.properties as any).description || ''),
-          escapeCSVField((node.properties as any).className || ''),
+          escapeCSVField(p.description || ''),
+          escapeCSVField(p.className || ''),
+          escapeCSVField(p.visibility || ''),
+          p.isReadonly ? 'true' : 'false',
+          p.isStatic ? 'true' : 'false',
+          p.isAccessor ? 'true' : 'false',
+        ].join(','));
+        break;
+      }
+      case 'Parameter': {
+        const p = node.properties as any;
+        await parameterWriter.addRow([
+          escapeCSVField(node.id),
+          escapeCSVField(p.name || ''),
+          escapeCSVField(p.filePath || ''),
+          escapeCSVNumber(p.startLine, -1),
+          escapeCSVNumber(p.endLine, -1),
+          escapeCSVNumber(p.ordinal, 0),
+          p.isOptional ? 'true' : 'false',
+          p.hasDefault ? 'true' : 'false',
+          p.isRest ? 'true' : 'false',
+          escapeCSVField(p.visibility || ''),
         ].join(','));
         break;
       }
@@ -401,22 +470,26 @@ export const streamAllCSVsToDisk = async (
   }
 
   // Finish all node writers
-  const allWriters = [fileWriter, folderWriter, functionWriter, classWriter, interfaceWriter, methodWriter, propertyWriter, constructorWriter, codeElemWriter, communityWriter, processWriter, basicBlockWriter, ...multiLangWriters.values()];
+  const allWriters = [fileWriter, folderWriter, functionWriter, classWriter, interfaceWriter, methodWriter, propertyWriter, constructorWriter, codeElemWriter, communityWriter, processWriter, basicBlockWriter, parameterWriter, ...multiLangWriters.values()];
   await Promise.all(allWriters.map(w => w.finish()));
 
   // --- Stream relationship CSV ---
   const relCsvPath = path.join(csvDir, 'relations.csv');
-  const relWriter = new BufferedCSVWriter(relCsvPath, 'from,to,type,confidence,reason,step,cfgEdgeType,conditionText');
+  const relWriter = new BufferedCSVWriter(relCsvPath, 'from,to,type,confidence,reason,step,cfgEdgeType,conditionText,isConditional,guardExpression,branchDepth');
   for (const rel of graph.iterRelationships()) {
+    const r = rel as any;
     await relWriter.addRow([
       escapeCSVField(rel.sourceId),
       escapeCSVField(rel.targetId),
       escapeCSVField(rel.type),
       escapeCSVNumber(rel.confidence, 1.0),
       escapeCSVField(rel.reason),
-      escapeCSVNumber((rel as any).step, 0),
-      escapeCSVField((rel as any).cfgEdgeType || ''),
-      escapeCSVField((rel as any).conditionText || ''),
+      escapeCSVNumber(r.step, 0),
+      escapeCSVField(r.cfgEdgeType || ''),
+      escapeCSVField(r.conditionText || ''),
+      r.isConditional ? 'true' : 'false',
+      escapeCSVField(r.guardExpression || ''),
+      escapeCSVNumber(r.branchDepth, 0),
     ].join(','));
   }
   await relWriter.finish();
@@ -431,6 +504,7 @@ export const streamAllCSVsToDisk = async (
     ['CodeElement', codeElemWriter],
     ['Community', communityWriter], ['Process', processWriter],
     ['BasicBlock', basicBlockWriter],
+    ['Parameter', parameterWriter],
     ...Array.from(multiLangWriters.entries()).map(([name, w]) => [name as NodeTableName, w] as [NodeTableName, BufferedCSVWriter]),
   ];
   for (const [name, writer] of tableMap) {

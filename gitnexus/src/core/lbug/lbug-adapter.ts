@@ -317,7 +317,7 @@ const fallbackRelationshipInserts = async (
 };
 
 /** Tables with isExported column (TypeScript/JS-native types) */
-const TABLES_WITH_EXPORTED = new Set<string>(['Function', 'Class', 'Interface', 'Method', 'CodeElement']);
+const TABLES_WITH_EXPORTED = new Set<string>(['Class', 'Interface', 'CodeElement']);
 
 const getCopyQuery = (table: NodeTableName, filePath: string): string => {
   const t = escapeTableName(table);
@@ -333,11 +333,20 @@ const getCopyQuery = (table: NodeTableName, filePath: string): string => {
   if (table === 'Process') {
     return `COPY ${t}(id, label, heuristicLabel, processType, stepCount, communities, entryPointId, terminalId) FROM "${filePath}" ${COPY_CSV_OPTS}`;
   }
-  if (table === 'Method') {
-    return `COPY ${t}(id, name, filePath, startLine, endLine, isExported, content, description, parameterCount, returnType, className) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+  if (table === 'Function') {
+    return `COPY ${t}(id, name, filePath, startLine, endLine, isExported, content, description, complexity, sloc, parameterCount, visibility) FROM "${filePath}" ${COPY_CSV_OPTS}`;
   }
-  if (table === 'Constructor' || table === 'Property') {
-    return `COPY ${t}(id, name, filePath, startLine, endLine, content, description, className) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+  if (table === 'Method') {
+    return `COPY ${t}(id, name, filePath, startLine, endLine, isExported, content, description, parameterCount, returnType, className, complexity, sloc, visibility, isAccessor, isStatic, isAbstract) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+  }
+  if (table === 'Constructor') {
+    return `COPY ${t}(id, name, filePath, startLine, endLine, content, description, className, complexity, sloc, parameterCount, visibility) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+  }
+  if (table === 'Property') {
+    return `COPY ${t}(id, name, filePath, startLine, endLine, content, description, className, visibility, isReadonly, isStatic, isAccessor) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+  }
+  if (table === 'Parameter') {
+    return `COPY ${t}(id, name, filePath, startLine, endLine, ordinal, isOptional, hasDefault, isRest, visibility) FROM "${filePath}" ${COPY_CSV_OPTS}`;
   }
   if (table === 'BasicBlock') {
     return `COPY ${t}(id, name, filePath, startLine, endLine, blockIndex, instructionCount, isUnreachable, cfgInstructions) FROM "${filePath}" ${COPY_CSV_OPTS}`;
