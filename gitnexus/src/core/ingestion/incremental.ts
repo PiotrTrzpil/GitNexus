@@ -13,9 +13,10 @@
  */
 
 import fs from 'node:fs/promises';
+import path from 'node:path';
 import xxhashFactory, { type XXHashAPI } from 'xxhash-wasm';
 import type { ScannedFile } from './filesystem-walker.js';
-import type { ImportMap } from '../ingestion/resolution-context.js';
+import type { ImportMap } from './resolution-context.js';
 
 // ─── Exported Types (Shared Contracts) ────────────────────────────────────────
 
@@ -131,8 +132,9 @@ export const classifyFiles = async (
 /**
  * High-level entry point: classify files and also discover dependent files.
  *
- * This is the main function called from pipeline.ts between Phase 1 (scan)
- * and Phase 3 (parse).
+ * NOTE: Not yet wired into pipeline.ts — requires persisting the importMap
+ * between runs so that dependent-file discovery works on re-index.
+ * Currently exported for future use and testing.
  *
  * @param repoPath      Absolute path to the repository root
  * @param scannedFiles  Output of walkRepositoryPaths()
@@ -224,11 +226,14 @@ const computeHashesParallel = async (
     await Promise.all(
       batch.map(async ({ file, idx }) => {
         const relPath = toRelPath(repoPath, file.path);
+        const absolutePath = path.isAbsolute(file.path)
+          ? file.path
+          : path.join(repoPath, file.path);
         try {
-          const hash = await computeFileHash(file.path);
+          const hash = await computeFileHash(absolutePath);
           results[idx] = { relPath, hash };
         } catch (err) {
-          console.warn(`incremental: failed to hash ${file.path}: ${(err as Error).message}`);
+          console.warn(`incremental: failed to hash ${absolutePath}: ${(err as Error).message}`);
           results[idx] = { relPath, hash: 'error' };
         }
       }),

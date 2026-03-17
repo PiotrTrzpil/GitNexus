@@ -102,9 +102,11 @@ export const runPipelineFromRepo = async (
     });
 
     // ── Phase 2.5: Incremental classification ─────────────────────────
-    // Classify files as changed/unchanged/dependent using content hashing.
+    // Classify files as changed/unchanged using content hashing.
     // On first index all files are classified as changed (full parse).
-    // On subsequent runs only changed + dependent files are re-parsed.
+    // On subsequent runs only changed files are re-parsed.
+    // TODO: add dependent-file discovery (unchanged files that import changed
+    // modules) once the importMap is persisted between runs.
     const storagePaths = getStoragePaths(repoPath);
     let incrementalFilePaths: Set<string> | null = null;
     let currentFileHashes: import('./incremental.js').FileHash[] | null = null;
@@ -114,7 +116,7 @@ export const runPipelineFromRepo = async (
       currentFileHashes = classification.currentHashes;
       if (classification.unchangedPaths.length > 0) {
         // There are unchanged files — run in incremental mode
-        const parseSet = new Set([...classification.changedPaths]);
+        const parseSet = new Set(classification.changedPaths);
         incrementalFilePaths = parseSet;
         if (isDev) {
           console.log(`⚡ Incremental: ${classification.changedPaths.length} changed, ${classification.unchangedPaths.length} skipped`);
