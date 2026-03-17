@@ -27,7 +27,7 @@ import { GITNEXUS_TOOLS } from './tools.js';
 import type { LocalBackend } from './local/local-backend.js';
 import { getResourceDefinitions, getResourceTemplates, readResource } from './resources.js';
 import { startWatcher } from '../core/watcher/file-watcher.js';
-import { formatResult } from './output-format.js';
+
 
 /**
  * Next-step hints appended to tool responses.
@@ -169,7 +169,7 @@ export function createMCPServer(backend: LocalBackend): Server {
 
     try {
       const result = await backend.callTool(name, args);
-      const resultText = formatResult(result);
+      const resultText = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
       const hint = getNextStepHint(name, args as Record<string, any> | undefined);
 
       return {

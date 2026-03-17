@@ -12,7 +12,7 @@ import path from 'path';
  * Format source lines with right-aligned line numbers.
  * Output: "  42 | func foo() {"
  */
-export function formatWithLineNumbers(lines: string[], startLine: number): string {
+function formatWithLineNumbers(lines: string[], startLine: number): string {
   const lastLineNum = startLine + lines.length - 1;
   const width = String(lastLineNum).length;
   return lines
@@ -58,26 +58,4 @@ export async function readSourceWithContext(
   const source = formatWithLineNumbers(slice, firstLine);
 
   return { source, firstLine, lastLine };
-}
-
-/**
- * Read a full file from disk and return all lines formatted with line numbers.
- * Used by search_code for context display.
- *
- * @returns Array of file lines (unformatted), or null if not found
- */
-export async function readFileLines(
-  repoPath: string,
-  filePath: string,
-): Promise<string[] | null> {
-  const absPath = path.resolve(repoPath, filePath);
-  if (!absPath.startsWith(path.resolve(repoPath))) return null;
-
-  try {
-    const content = await fs.readFile(absPath, 'utf-8');
-    return content.split('\n');
-  } catch (err: any) {
-    if (err?.code === 'ENOENT') return null;
-    throw err;
-  }
 }

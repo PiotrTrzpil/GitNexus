@@ -132,6 +132,7 @@ Handles disambiguation: if multiple symbols share the same name, returns candida
         uid: { type: 'string', description: 'Direct symbol UID from prior tool results (zero-ambiguity lookup)' },
         file_path: { type: 'string', description: 'File path to disambiguate common names' },
         include_content: { type: 'boolean', description: 'Include full symbol source code (default: false)', default: false },
+        context_lines: { type: 'number', description: 'Lines of context around the symbol source (default: 3). Only used when include_content is true.', default: 3 },
         repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
       },
       required: [],
@@ -223,7 +224,7 @@ Confidence: 1.0 = certain, <0.8 = fuzzy match`,
 Returns a list of symbol changes (Added, Removed, Renamed, SignatureChanged, VisibilityChanged, BodyChanged) with field-level deltas and breaking change classification.
 
 WHEN TO USE: Before a PR or release — understand exactly what changed at the API surface and whether changes are breaking.
-AFTER THIS: Use plan_commits() to group the changes into logical commits.
+AFTER THIS: Use semantic_diff() with group_commits: true to group the changes into logical commits.
 
 Breaking change rules:
 - Breaking: exported symbol was Removed, Renamed, had SignatureChanged or VisibilityChanged
@@ -236,124 +237,7 @@ Returns: { changes: SymbolChange[], summary: { total, breaking, byKind } }`,
         file_paths: { type: 'array', items: { type: 'string' }, description: 'Specific files to diff (default: all staged/unstaged changed files)' },
         ref: { type: 'string', description: 'Git ref to compare against (default: "HEAD")', default: 'HEAD' },
         breaking_only: { type: 'boolean', description: 'Return only breaking changes (default: false)', default: false },
-        repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
-      },
-      required: [],
-    },
-  },
-  {
-    name: 'plan_commits',
-    description: `Group staged/unstaged symbol changes into logical commit groups using union-find.
-
-Groups changes by 3 coupling signals: graph call edges (coupled callers/callees), file co-location (same file), and test-source pairing (test file + source file).
-
-WHEN TO USE: When you have changes across multiple files and want help splitting them into clean, atomic commits.
-AFTER THIS: Review each group's draftMessage and files, then commit group by group.
-
-Returns: { groups: CommitGroup[], ungrouped: SymbolChange[] }
-Each group has: scope, draftMessage, reason, files[], changes[]`,
-    inputSchema: {
-      type: 'object',
-      properties: {
-        ref: { type: 'string', description: 'Git ref to diff against (default: "HEAD")', default: 'HEAD' },
-        scope: { type: 'string', description: 'What to analyze: "unstaged" (default), "staged", "all"', enum: ['unstaged', 'staged', 'all'], default: 'unstaged' },
-        repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
-      },
-      required: [],
-    },
-  },
-  {
-    name: 'set_output_format',
-    description: `Switch tool output between YAML (default) and JSON.
-
-YAML is more token-efficient and easier to scan. JSON is useful for programmatic consumption.
-The setting persists for the session — all subsequent tool calls use the chosen format.`,
-    inputSchema: {
-      type: 'object',
-      properties: {
-        format: { type: 'string', description: 'Output format: "yaml" (default) or "json"', enum: ['yaml', 'json'] },
-      },
-      required: ['format'],
-    },
-  },
-  {
-    name: 'get_code_snippet',
-    description: `Fetch disk-fresh source code for a named symbol with surrounding context lines.
-Resolves the symbol via 4-tier qualified name lookup (exact QN → QN suffix → name → fuzzy suggestions).
-Returns line-numbered source, file location, caller/callee counts, and optional neighbor name lists.
-
-WHEN TO USE: When you need to read the actual implementation of a specific function, class, or method. Prefer this over reading entire files — it fetches only the relevant symbol with context. Use after query() or search_graph() to inspect a result in depth.
-AFTER THIS: Use context() for full 360-degree caller/callee view, or impact() before making changes.
-
-Returns: { name, qn, label, file, lines, source, signature, callers, callees, caller_names?, callee_names?, match_method, alternatives? }
-- source: line-numbered code ("  42 | func foo() {")
-- match_method: exact_qn | qn_suffix | name | suggestions
-- alternatives: disambiguation candidates when match_method is "suggestions"`,
-    inputSchema: {
-      type: 'object',
-      properties: {
-        qualified_name: { type: 'string', description: 'Qualified name or symbol name to look up (e.g., "AuthService.validateUser" or "validateUser")' },
-        context_lines: { type: 'number', description: 'Lines of context before/after the symbol (default: 3)', default: 3 },
-        include_neighbors: { type: 'boolean', description: 'Include caller and callee name lists in addition to counts (default: false)', default: false },
-        repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
-      },
-      required: ['qualified_name'],
-    },
-  },
-  {
-    name: 'search_code',
-    description: `Text or regex search across all indexed source files with surrounding context lines.
-Operates on the indexed file set (File nodes in the graph), not the raw filesystem.
-Supports pagination via offset, glob file filtering, and optional regex mode.
-
-WHEN TO USE: Finding all occurrences of a string literal, error message, config key, or pattern across the codebase. Use when you need exact text matches rather than semantic/graph search. Complements query() (semantic) and search_graph() (structural).
-AFTER THIS: Use get_code_snippet() to fetch full source for a matched symbol, or context() to understand a matched function's role.
-
-Returns: { pattern, total_matches, limit, offset, has_more, matches[] }
-Each match: { file, line, content, context? }`,
-    inputSchema: {
-      type: 'object',
-      properties: {
-        pattern: { type: 'string', description: 'Text or regex pattern to search for' },
-        file_pattern: { type: 'string', description: 'Glob pattern to filter files (e.g., "**/*.ts", "src/**/*.py")' },
-        max_results: { type: 'number', description: 'Maximum matches to return per page (default: 20, hard cap: 100)', default: 20 },
-        offset: { type: 'number', description: 'Number of matches to skip for pagination (default: 0)', default: 0 },
-        context_lines: { type: 'number', description: 'Lines of context before/after each match, 0–5 (default: 2)', default: 2 },
-        regex: { type: 'boolean', description: 'Treat pattern as a regular expression (default: false)', default: false },
-        case_sensitive: { type: 'boolean', description: 'Case-sensitive matching (default: false)', default: false },
-        repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
-      },
-      required: ['pattern'],
-    },
-  },
-  {
-    name: 'search_graph',
-    description: `Structural search over graph nodes with degree, label, and name-pattern filters.
-Translates structured params into a Cypher query — no custom query language needed.
-Useful for finding dead code (max_degree=0), high fan-in hotspots, or symbols matching a naming pattern.
-
-WHEN TO USE: Finding nodes by structural properties (degree, label, file location, naming convention). Use instead of cypher() for common structural queries. Examples: dead code detection, finding all Handler classes, locating high-coupling hotspots, filtering by file area.
-AFTER THIS: Use get_code_snippet() or context() on individual results. Use impact() before modifying hotspots.
-
-Common patterns:
-- Dead code: { max_degree: 0, direction: "inbound", exclude_entry_points: true }
-- Hotspots: { sort_by: "degree", direction: "inbound", min_degree: 10 }
-- By name: { name_pattern: ".*Handler.*", label: "Function" }
-
-Returns: { total, has_more, results[] }
-Each result: { name, qn, label, file, lines, in_degree, out_degree }`,
-    inputSchema: {
-      type: 'object',
-      properties: {
-        name_pattern: { type: 'string', description: 'Regex pattern to match symbol names (e.g., ".*Handler.*", "^on[A-Z]")' },
-        label: { type: 'string', description: 'Node label to filter by (e.g., "Function", "Class", "Method", "Interface")' },
-        file_pattern: { type: 'string', description: 'Substring filter on file path (e.g., "src/auth", ".test.")' },
-        min_degree: { type: 'number', description: 'Minimum edge count (inclusive) in the specified direction' },
-        max_degree: { type: 'number', description: 'Maximum edge count (inclusive) in the specified direction' },
-        direction: { type: 'string', description: 'Edge direction for degree counting: "inbound" (callers) or "outbound" (callees)', enum: ['inbound', 'outbound'] },
-        sort_by: { type: 'string', description: 'Sort order: "degree" (highest first) or "name" (alphabetical)', enum: ['degree', 'name'] },
-        limit: { type: 'number', description: 'Maximum results to return (default: 20)', default: 20 },
-        exclude_labels: { type: 'array', items: { type: 'string' }, description: 'Node labels to exclude (default: ["Community", "Process", "Folder"])' },
+        group_commits: { type: 'boolean', description: 'Group changes into logical commit groups using coupling analysis (default: false)', default: false },
         repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
       },
       required: [],
@@ -366,7 +250,8 @@ Returns raw data — the caller decides what is a smell.
 
 WHEN TO USE: Answering structural code quality questions without writing Cypher:
 complexity hotspots, encapsulation violations, DI injection analysis, parameter optionality,
-field access patterns, call-chain conditionality (hot path vs guarded branches).
+field access patterns, call-chain conditionality (hot path vs guarded branches),
+structural search by name pattern or fan-in/fan-out degree.
 
 Presets and required/optional parameters:
 - high_complexity          — functions with complexity > threshold (threshold required)
@@ -386,6 +271,9 @@ Presets and required/optional parameters:
 - conditional_calls        — CALLS edges from a given function with conditionality metadata (function required)
 - hot_path                 — unconditional call chain from a given function (function required)
 - guarded_paths            — conditional call chain from a given function, grouped by guard (function required)
+- hotspots                 — functions with highest inbound CALLS (most callers)
+- high_fan_out             — functions with highest outbound CALLS (most callees)
+- by_name                  — find nodes matching a name regex + optional label filter (name_pattern required)
 
 Returns: { preset, results: [...], count }`,
     inputSchema: {
@@ -412,6 +300,9 @@ Returns: { preset, results: [...], count }`,
             'conditional_calls',
             'hot_path',
             'guarded_paths',
+            'hotspots',
+            'high_fan_out',
+            'by_name',
           ],
         },
         threshold: {
@@ -426,49 +317,20 @@ Returns: { preset, results: [...], count }`,
           type: 'string',
           description: 'Type name for the params_by_type preset',
         },
+        name_pattern: {
+          type: 'string',
+          description: 'Regex pattern to match symbol names (for by_name preset)',
+        },
+        label: {
+          type: 'string',
+          description: 'Node label filter (e.g., "Function", "Class") for by_name preset',
+        },
         repo: {
           type: 'string',
           description: 'Repository name or path. Omit if only one repo is indexed.',
         },
       },
       required: ['preset'],
-    },
-  },
-  {
-    name: 'get_architecture',
-    description: `Multi-aspect architecture overview of the indexed repository.
-Each aspect runs targeted Cypher queries and assembles a structured summary.
-Request only the aspects you need — each is a separate query.
-
-WHEN TO USE: Onboarding to an unfamiliar codebase, architectural review, understanding tech stack and structure. Use before diving into specific subsystems. More structured than query() for architectural questions.
-AFTER THIS: Use query() or search_graph() to drill into a specific area, or READ gitnexus://repo/{name}/clusters for full community breakdown.
-
-Aspects:
-- languages: file counts by language
-- packages: top-level directories with file/symbol counts
-- entry_points: nodes flagged as entry points (main, routes, CLI commands)
-- routes: HTTP route definitions grouped by method/path
-- hotspots: functions with highest fan-in (most callers)
-- boundaries: cross-community call edges (where modules depend on each other)
-- services: HTTP_CALLS and ASYNC_CALLS grouped by source/target community
-- clusters: auto-detected functional communities (Leiden algorithm)
-- all: all of the above
-
-Returns: object with one key per requested aspect, null if aspect has no data.`,
-    inputSchema: {
-      type: 'object',
-      properties: {
-        aspects: {
-          type: 'array',
-          items: {
-            type: 'string',
-            enum: ['all', 'languages', 'packages', 'entry_points', 'routes', 'hotspots', 'boundaries', 'services', 'clusters'],
-          },
-          description: 'Aspects to include (default: ["all"]). Subset for faster response.',
-        },
-        repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
-      },
-      required: [],
     },
   },
 ];

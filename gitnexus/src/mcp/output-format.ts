@@ -1,11 +1,10 @@
 /**
  * Output Format Module
  *
- * Manages the session-persistent output format (yaml or json) for MCP tool
- * responses and CLI output. YAML is the default — it is more token-efficient
- * and easier to scan than JSON for LLM consumers.
+ * Manages the per-invocation output format (yaml or json) for CLI output.
+ * YAML is the default — it is more token-efficient and easier to scan.
  *
- * Port of codebase-memory-mcp's set_output_format / result() pattern.
+ * MCP server responses are always JSON (hardcoded in server.ts).
  */
 
 import { stringify as yamlStringify } from 'yaml';
@@ -13,11 +12,6 @@ import { stringify as yamlStringify } from 'yaml';
 export type OutputFormat = 'yaml' | 'json';
 
 let currentFormat: OutputFormat = 'yaml';
-
-/** Get the current output format. */
-export function getOutputFormat(): OutputFormat {
-  return currentFormat;
-}
 
 /** Set the output format. Returns the new format string. */
 export function setOutputFormat(format: string): OutputFormat {
@@ -29,10 +23,10 @@ export function setOutputFormat(format: string): OutputFormat {
 }
 
 /**
- * Serialize a tool result to the current output format.
+ * Serialize a result to the current output format (CLI use).
  *
  * - Strings are returned as-is (already formatted — e.g. markdown tables).
- * - Objects/arrays are serialized to YAML or JSON depending on the session format.
+ * - Objects/arrays are serialized to YAML or JSON depending on the invocation format.
  */
 export function formatResult(data: any): string {
   if (typeof data === 'string') return data;
