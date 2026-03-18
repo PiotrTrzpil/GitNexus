@@ -25,7 +25,8 @@ export default defineConfig({
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
-      // Fix for Rollup failing to resolve this deep import from @langchain/anthropic
+      // Fix for pnpm strict resolution: @langchain/anthropic imports a deep subpath
+      // that Rollup can't resolve from the .pnpm store during worker bundling
       '@anthropic-ai/sdk/lib/transform-json-schema': path.resolve(__dirname, 'node_modules/@anthropic-ai/sdk/lib/transform-json-schema.mjs'),
       // Fix for mermaid d3-color prototype crash on Vercel (known issue with mermaid 10.9.0+ and Vite)
       'mermaid': path.resolve(__dirname, 'node_modules/mermaid/dist/mermaid.esm.min.mjs'),

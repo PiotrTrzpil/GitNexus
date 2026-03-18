@@ -369,7 +369,8 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
         // Call tool, format result as text, append next-step hint
         const result = await backend.callTool(toolName, args);
         const formatted = formatToolResult(toolName, result);
-        const hint = getNextStepHint(toolName);
+        const isErrorResult = result != null && typeof result === 'object' && !Array.isArray(result) && 'error' in result;
+        const hint = isErrorResult ? '' : getNextStepHint(toolName);
 
         res.setHeader('Content-Type', 'text/plain');
         res.writeHead(200);
@@ -416,25 +417,54 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
     process.exit(0);
   };
 
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
+  process.once('SIGINT', shutdown);
+  process.once('SIGTERM', shutdown);
 }
 
 export const MAX_BODY_SIZE = 1024 * 1024; // 1MB
+
+const READ_BODY_TIMEOUT_MS = 30_000;
 
 function readBody(req: http.IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let totalSize = 0;
+    let settled = false;
+
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        req.destroy(new Error('Request body read timed out'));
+        reject(new Error(`Request body read timed out after ${READ_BODY_TIMEOUT_MS}ms`));
+      }
+    }, READ_BODY_TIMEOUT_MS);
+
     req.on('data', (chunk: Buffer) => {
       totalSize += chunk.length;
       if (totalSize > MAX_BODY_SIZE) {
-        req.destroy(new Error('Request body too large (max 1MB)'));
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          req.destroy(new Error('Request body too large (max 1MB)'));
+          reject(new Error('Request body too large (max 1MB)'));
+        }
         return;
       }
       chunks.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
-    req.on('error', reject);
+    req.on('end', () => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        resolve(Buffer.concat(chunks).toString('utf-8'));
+      }
+    });
+    req.on('error', (err) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        reject(err);
+      }
+    });
   });
 }

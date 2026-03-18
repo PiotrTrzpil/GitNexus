@@ -434,18 +434,20 @@ export class LocalBackend {
     if (filePaths.length === 0) {
       // Fall back to git diff to find changed files
       try {
-        const { execSync } = await import('child_process');
+        const { execFile } = await import('child_process');
+        const { promisify } = await import('util');
+        const execFileAsync = promisify(execFile);
         const scope = params.scope ?? 'unstaged';
-        let gitCmd: string;
+        let gitDiffArgs: string[];
         if (scope === 'staged') {
-          gitCmd = 'git diff --cached --name-status';
+          gitDiffArgs = ['diff', '--cached', '--name-status'];
         } else if (scope === 'all') {
-          gitCmd = 'git diff HEAD --name-status';
+          gitDiffArgs = ['diff', 'HEAD', '--name-status'];
         } else {
           // unstaged: working tree vs index (no ref)
-          gitCmd = 'git diff --name-status';
+          gitDiffArgs = ['diff', '--name-status'];
         }
-        const raw = execSync(gitCmd, { cwd: repo.repoPath }).toString();
+        const { stdout: raw } = await execFileAsync('git', gitDiffArgs, { cwd: repo.repoPath, encoding: 'utf-8', timeout: 10_000 });
         filePaths = [];
         for (const line of raw.split('\n')) {
           const trimmed = line.trim();
@@ -465,10 +467,10 @@ export class LocalBackend {
         // Include untracked files for 'unstaged' and 'all' scopes —
         // git diff doesn't report files that have never been tracked
         if (scope === 'unstaged' || scope === 'all') {
-          const untrackedRaw = execSync(
-            'git ls-files --others --exclude-standard',
-            { cwd: repo.repoPath },
-          ).toString();
+          const { stdout: untrackedRaw } = await execFileAsync(
+            'git', ['ls-files', '--others', '--exclude-standard'],
+            { cwd: repo.repoPath, encoding: 'utf-8', timeout: 10_000 },
+          );
           for (const line of untrackedRaw.split('\n')) {
             const relPath = line.trim();
             if (relPath && !fileStatusMap.has(relPath)) {
@@ -1359,9 +1361,11 @@ export class LocalBackend {
     await this.ensureInitialized(repo.id);
     
     const scope = params.scope || 'unstaged';
-    const { execFileSync } = await import('child_process');
+    const { execFile } = await import('child_process');
+    const { promisify } = await import('util');
+    const execFileAsync = promisify(execFile);
 
-    // Build git diff args based on scope (using execFileSync to avoid shell injection)
+    // Build git diff args based on scope (using execFile to avoid shell injection)
     let diffArgs: string[];
     switch (scope) {
       case 'staged':
@@ -1382,7 +1386,7 @@ export class LocalBackend {
 
     let changedFiles: string[];
     try {
-      const output = execFileSync('git', diffArgs, { cwd: repo.repoPath, encoding: 'utf-8' });
+      const { stdout: output } = await execFileAsync('git', diffArgs, { cwd: repo.repoPath, encoding: 'utf-8', timeout: 10_000 });
       changedFiles = output.trim().split('\n').filter(f => f.length > 0);
     } catch (err: any) {
       return { error: `Git diff failed: ${err.message}` };
@@ -1565,7 +1569,9 @@ export class LocalBackend {
     
     // Simple text search across the repo for the old name (in files not already covered by graph)
     try {
-      const { execFileSync } = await import('child_process');
+      const { execFile } = await import('child_process');
+      const { promisify } = await import('util');
+      const execFileAsync = promisify(execFile);
       const rgArgs = [
         '-l',
         '--type-add', 'code:*.{ts,tsx,js,jsx,py,go,rs,java,c,h,cpp,cc,cxx,hpp,hxx,hh,cs,php,swift}',
@@ -1573,7 +1579,7 @@ export class LocalBackend {
         `\\b${oldName}\\b`,
         '.',
       ];
-      const output = execFileSync('rg', rgArgs, { cwd: repo.repoPath, encoding: 'utf-8', timeout: 5000 });
+      const { stdout: output } = await execFileAsync('rg', rgArgs, { cwd: repo.repoPath, encoding: 'utf-8', timeout: 5000 });
       const files = output.trim().split('\n').filter(f => f.length > 0);
       
       for (const file of files) {
@@ -2778,8 +2784,13 @@ export class LocalBackend {
         let frontier = [startId];
         let depth = 0;
         const MAX_DEPTH = 20;
+        const MAX_FRONTIER = 5000;
 
         while (frontier.length > 0 && depth < MAX_DEPTH) {
+          // Cap frontier to prevent runaway BFS on highly-connected graphs
+          if (frontier.length > MAX_FRONTIER) {
+            frontier = frontier.slice(0, MAX_FRONTIER);
+          }
           const nextFrontier: string[] = [];
           for (const nodeId of frontier) {
             try {
@@ -2827,8 +2838,12 @@ export class LocalBackend {
         let frontier = [startId];
         let depth = 0;
         const MAX_DEPTH = 20;
+        const MAX_FRONTIER = 5000;
 
         while (frontier.length > 0 && depth < MAX_DEPTH) {
+          if (frontier.length > MAX_FRONTIER) {
+            frontier = frontier.slice(0, MAX_FRONTIER);
+          }
           const nextFrontier: string[] = [];
           for (const nodeId of frontier) {
             try {

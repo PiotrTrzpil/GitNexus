@@ -3,21 +3,24 @@
  * Rebuild native tree-sitter grammar bindings that lack prebuilts for the
  * current Node ABI.
  *
- * Problem: tree-sitter grammar packages (tree-sitter-kotlin, etc.) ship
- * prebuilt .node binaries for a handful of Node ABI versions. When running
- * on a newer Node (e.g., Node 25 / ABI 141), the prebuilts don't match and
- * `require()` throws "No native build was found for platform=... abi=...".
+ * Problem: tree-sitter grammar packages that use node-gyp (not prebuildify)
+ * may not have prebuilt .node binaries for the current Node ABI. When running
+ * on a newer Node, `require()` throws "No native build was found for
+ * platform=... abi=...".
  *
- * Fix: For each optional grammar, try to require() it. If it fails with the
- * ABI mismatch error, rebuild from source with node-gyp. This runs as part
- * of postinstall so the fix is permanent across installs.
+ * Fix: For each grammar, try to require() it. If it fails with the ABI
+ * mismatch error, rebuild from source with node-gyp. This runs as part of
+ * postinstall so the fix is permanent across installs.
+ *
+ * NOTE: Most grammar packages (tree-sitter-javascript, tree-sitter-python,
+ * etc.) ship with prebuildify prebuilts since tree-sitter 0.22+ and do not
+ * need this script. Only grammars that still use node-gyp are listed here.
  */
 const path = require('path');
 const { execSync } = require('child_process');
 
 const GRAMMARS_TO_CHECK = [
   'tree-sitter-kotlin',
-  'tree-sitter-swift',
 ];
 
 for (const pkg of GRAMMARS_TO_CHECK) {
@@ -48,7 +51,9 @@ for (const pkg of GRAMMARS_TO_CHECK) {
     require(pkg);
     continue;
   } catch (err) {
-    if (!err.message.includes('No native build was found')) {
+    if (!err.message.includes('No native build was found') &&
+        !err.message.includes('Cannot find module') &&
+        !err.message.includes('was compiled against a different Node.js version')) {
       // Some other error — skip, don't mask it
       continue;
     }

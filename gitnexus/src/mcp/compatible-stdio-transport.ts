@@ -146,6 +146,11 @@ export class CompatibleStdioServerTransport implements Transport {
       return null;
     }
 
+    // Limit empty-line skips to prevent CPU spin on pathological input
+    // (e.g. a buffer filled entirely with bare newlines and no real messages).
+    let emptySkips = 0;
+    const MAX_EMPTY_SKIPS = 100_000;
+
     while (true) {
       const newlineIndex = this._readBuffer.indexOf('\n');
       if (newlineIndex === -1) {
@@ -155,6 +160,11 @@ export class CompatibleStdioServerTransport implements Transport {
       const line = this._readBuffer.toString('utf8', 0, newlineIndex).replace(/\r$/, '');
       this._readBuffer = this._readBuffer.subarray(newlineIndex + 1);
       if (line.trim().length === 0) {
+        if (++emptySkips >= MAX_EMPTY_SKIPS) {
+          this.onerror?.(new Error(`Skipped ${MAX_EMPTY_SKIPS} consecutive empty lines — possible protocol error`));
+          this.discardBufferedInput();
+          return null;
+        }
         continue;
       }
 

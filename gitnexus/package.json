@@ -45,7 +45,7 @@
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "prepare": "npm run build",
-    "postinstall": "node scripts/patch-tree-sitter-swift.cjs && node scripts/rebuild-native-grammars.cjs && node scripts/build-oxc-cfg.cjs"
+    "postinstall": "node scripts/rebuild-native-grammars.cjs && node scripts/build-oxc-cfg.cjs"
   },
   "dependencies": {
     "@huggingface/transformers": "^3.0.0",
@@ -63,25 +63,25 @@
     "lru-cache": "^11.0.0",
     "mnemonist": "^0.39.0",
     "pandemonium": "^2.4.0",
-    "tree-sitter": "^0.21.0",
-    "tree-sitter-c": "^0.21.0",
-    "tree-sitter-c-sharp": "^0.21.0",
-    "tree-sitter-cpp": "^0.22.0",
-    "tree-sitter-go": "^0.21.0",
-    "tree-sitter-java": "^0.21.0",
-    "tree-sitter-javascript": "^0.21.0",
-    "tree-sitter-php": "^0.23.12",
-    "tree-sitter-python": "^0.21.0",
-    "tree-sitter-ruby": "^0.23.1",
-    "tree-sitter-rust": "^0.21.0",
-    "tree-sitter-typescript": "^0.21.0",
+    "tree-sitter": "0.22.4",
+    "tree-sitter-c": "0.23.6",
+    "tree-sitter-c-sharp": "0.23.1",
+    "tree-sitter-cpp": "0.23.4",
+    "tree-sitter-go": "0.23.4",
+    "tree-sitter-java": "0.23.5",
+    "tree-sitter-javascript": "0.23.1",
+    "tree-sitter-php": "0.23.12",
+    "tree-sitter-python": "0.23.6",
+    "tree-sitter-ruby": "0.23.1",
+    "tree-sitter-rust": "0.24.0",
+    "tree-sitter-typescript": "0.23.2",
     "uuid": "^13.0.0",
     "xxhash-wasm": "^1.1.0",
     "yaml": "^2.8.2"
   },
   "optionalDependencies": {
     "tree-sitter-kotlin": "^0.3.8",
-    "tree-sitter-swift": "^0.6.0",
+    "tree-sitter-swift": "^0.7.1",
     "@gitnexus/oxc-cfg": "file:native/oxc-cfg-napi"
   },
   "devDependencies": {
@@ -97,5 +97,25 @@
   },
   "engines": {
     "node": ">=18.0.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "tree-sitter",
+      "tree-sitter-c",
+      "tree-sitter-c-sharp",
+      "tree-sitter-cpp",
+      "tree-sitter-go",
+      "tree-sitter-java",
+      "tree-sitter-javascript",
+      "tree-sitter-kotlin",
+      "tree-sitter-php",
+      "tree-sitter-python",
+      "tree-sitter-ruby",
+      "tree-sitter-rust",
+      "tree-sitter-swift",
+      "tree-sitter-typescript",
+      "fsevents",
+      "@gitnexus/oxc-cfg"
+    ]
   }
 }

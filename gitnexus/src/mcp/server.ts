@@ -170,7 +170,12 @@ export function createMCPServer(backend: LocalBackend): Server {
     try {
       const result = await backend.callTool(name, args);
       const resultText = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
-      const hint = getNextStepHint(name, args as Record<string, any> | undefined);
+
+      // Don't append next-step hints when the tool returned an error object —
+      // hints like "Review d=1 items (WILL BREAK)" are misleading after a
+      // "Target not found" error and confuse agents into skipping analysis.
+      const isErrorResult = result != null && typeof result === 'object' && !Array.isArray(result) && 'error' in result;
+      const hint = isErrorResult ? '' : getNextStepHint(name, args as Record<string, any> | undefined);
 
       return {
         content: [
@@ -309,8 +314,8 @@ export async function startMCPServer(backend: LocalBackend): Promise<void> {
   };
 
   // Handle graceful shutdown
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
+  process.once('SIGINT', shutdown);
+  process.once('SIGTERM', shutdown);
 
   // Handle stdio errors — stdin close means the parent process is gone
   process.stdin.on('end', shutdown);

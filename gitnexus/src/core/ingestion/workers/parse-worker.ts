@@ -25,10 +25,6 @@ try { Kotlin = _require('tree-sitter-kotlin'); } catch {}
 let Swift: any = null;
 try { Swift = _require('tree-sitter-swift'); } catch {}
 
-// tree-sitter-kotlin is an optionalDependency — may not be installed
-let Kotlin: any = null;
-try { Kotlin = _require('tree-sitter-kotlin'); } catch {}
-
 let analyzeCfg: ((filename: string, sourceCode: string, options?: any) => any) | null = null;
 try {
   const oxcCfg = _require('@gitnexus/oxc-cfg');
