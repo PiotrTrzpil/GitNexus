@@ -4,18 +4,16 @@
 // Removing it from here improves MCP server startup time significantly.
 
 import { Command } from 'commander';
-import { createRequire } from 'node:module';
 import { createLazyAction } from './lazy-action.js';
 import { setOutputFormat } from '../mcp/output-format.js';
+import { VERSION } from '../config/version.js';
 
-const _require = createRequire(import.meta.url);
-const pkg = _require('../../package.json');
 const program = new Command();
 
 program
   .name('gitnexus')
   .description('GitNexus local CLI and MCP server')
-  .version(pkg.version);
+  .version(VERSION);
 
 program
   .command('setup')

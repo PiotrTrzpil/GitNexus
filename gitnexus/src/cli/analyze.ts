@@ -19,6 +19,7 @@ import { getCurrentCommit, isGitRepo, getGitRoot } from '../storage/git.js';
 import { generateAIContextFiles } from './ai-context.js';
 import { generateSkillFiles, type GeneratedSkillInfo } from './skill-gen.js';
 import fs from 'fs/promises';
+import { VERSION } from '../config/version.js';
 
 
 const HEAP_MB = 8192;
@@ -117,9 +118,28 @@ export const analyzeCommand = async (
   const currentCommit = getCurrentCommit(repoPath);
   const existingMeta = await loadMeta(storagePath);
 
+  // Detect whether the existing index needs a full rebuild (not just incremental)
+  let needsFullRebuild = !!options?.force;
+
   if (existingMeta && !options?.force && !options?.skills && existingMeta.lastCommit === currentCommit) {
-    console.log('  Already up to date\n');
-    return;
+    // Verify index integrity before skipping rebuild
+    const dbExists = await fs.access(lbugPath).then(() => true, () => false);
+    const versionMatch = existingMeta.version === VERSION;
+    const statsPresent = existingMeta.stats && existingMeta.stats.nodes != null && existingMeta.stats.edges != null;
+
+    if (!dbExists) {
+      console.log('  Database missing — rebuilding index...\n');
+      needsFullRebuild = true;
+    } else if (!versionMatch) {
+      console.log(`  Index was built with ${existingMeta.version || 'unknown version'} (current: ${VERSION}) — rebuilding...\n`);
+      needsFullRebuild = true;
+    } else if (!statsPresent) {
+      console.log('  Index metadata incomplete — rebuilding...\n');
+      needsFullRebuild = true;
+    } else {
+      console.log('  Already up to date\n');
+      return;
+    }
   }
 
   if (process.env.GITNEXUS_NO_GITIGNORE) {
@@ -194,7 +214,7 @@ export const analyzeCommand = async (
   let cachedEmbeddingNodeIds = new Set<string>();
   let cachedEmbeddings: Array<{ nodeId: string; embedding: number[] }> = [];
 
-  if (options?.embeddings && existingMeta && !options?.force) {
+  if (options?.embeddings && existingMeta && !needsFullRebuild) {
     try {
       updateBar(0, 'Caching embeddings...');
       await initLbug(lbugPath);
@@ -207,14 +227,15 @@ export const analyzeCommand = async (
     }
   }
 
-  // When --force is set, delete stored file hashes so the incremental
-  // classifier treats every file as changed (full re-parse).
-  if (options?.force) {
+  // When a full rebuild is needed (--force or integrity check failure),
+  // delete stored file hashes so the incremental classifier treats every
+  // file as changed (full re-parse).
+  if (needsFullRebuild) {
     const { fileHashPath } = getStoragePaths(repoPath);
     try {
       await fs.rm(fileHashPath, { force: true });
     } catch (err: any) {
-      console.warn(`[analyze] Failed to remove file hashes for --force re-index: ${err?.message}`);
+      console.warn(`[analyze] Failed to remove file hashes for re-index: ${err?.message}`);
     }
   }
 
@@ -322,6 +343,7 @@ export const analyzeCommand = async (
     repoPath,
     lastCommit: currentCommit,
     indexedAt: new Date().toISOString(),
+    version: VERSION,
     stats: {
       files: pipelineResult.totalFileCount,
       nodes: stats.nodes,
