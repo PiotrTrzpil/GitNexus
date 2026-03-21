@@ -3,7 +3,7 @@
     "gitnexus": {
       "type": "stdio",
       "command": "node",
-      "args": ["dist/cli/index.js", "mcp"]
+      "args": ["gitnexus/dist/cli/index.js", "mcp"]
     }
   }
 }
