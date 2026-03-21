@@ -45,6 +45,8 @@ export type NodeProperties = {
   filePath: string,
   startLine?: number,
   endLine?: number,
+  startColumn?: number,
+  endColumn?: number,
   language?: SupportedLanguages,
   isExported?: boolean,
   // Optional AST-derived framework hint (e.g. @Controller, @GetMapping)

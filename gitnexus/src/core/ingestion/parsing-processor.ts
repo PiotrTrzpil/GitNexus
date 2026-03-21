@@ -261,6 +261,9 @@ const processParsingSequential = async (
         }
       }
 
+      const nodeStartColumn = nameNode ? nameNode.startPosition.column : (definitionNodeForRange ? definitionNodeForRange.startPosition.column : 0);
+      const nodeEndColumn = definitionNodeForRange ? definitionNodeForRange.endPosition.column : (nameNode ? nameNode.endPosition.column : 0);
+
       const node: GraphNode = {
         id: nodeId,
         label: nodeLabel as any,
@@ -269,6 +272,8 @@ const processParsingSequential = async (
           filePath: file.path,
           startLine: definitionNodeForRange ? definitionNodeForRange.startPosition.row : startLine,
           endLine: definitionNodeForRange ? definitionNodeForRange.endPosition.row : startLine,
+          startColumn: nodeStartColumn,
+          endColumn: nodeEndColumn,
           language: language,
           isExported: isNodeExported(nameNode || definitionNodeForRange, nodeName, language),
           ...(frameworkHint ? {

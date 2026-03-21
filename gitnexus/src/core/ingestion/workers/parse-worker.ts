@@ -72,6 +72,8 @@ interface ParsedNode {
     filePath: string;
     startLine: number;
     endLine: number;
+    startColumn?: number;
+    endColumn?: number;
     language: SupportedLanguages;
     isExported: boolean;
     astFrameworkMultiplier?: number;
@@ -1439,6 +1441,8 @@ const processFileGroup = (
                     filePath: file.path,
                     startLine: item.startLine,
                     endLine: item.endLine,
+                    startColumn: 0,
+                    endColumn: 0,
                     language,
                     isExported: true,
                     description: item.accessorType,
@@ -1677,6 +1681,8 @@ const processFileGroup = (
       // ── Semantic depth: compute new node properties ─────────────────────
       const nodeStartLine = definitionNode ? definitionNode.startPosition.row : startLine;
       const nodeEndLine = definitionNode ? definitionNode.endPosition.row : startLine;
+      const nodeStartColumn = nameNode ? nameNode.startPosition.column : (definitionNode ? definitionNode.startPosition.column : 0);
+      const nodeEndColumn = definitionNode ? definitionNode.endPosition.column : (nameNode ? nameNode.endPosition.column : 0);
       const sloc = nodeEndLine - nodeStartLine + 1;
 
       // Complexity: only for function/method/constructor nodes
@@ -1709,6 +1715,8 @@ const processFileGroup = (
           filePath: file.path,
           startLine: nodeStartLine,
           endLine: nodeEndLine,
+          startColumn: nodeStartColumn,
+          endColumn: nodeEndColumn,
           language: language,
           isExported: isNodeExported(nameNode || definitionNode, nodeName, language),
           sloc,
@@ -1777,6 +1785,8 @@ const processFileGroup = (
               filePath: param.filePath,
               startLine: param.startLine,
               endLine: param.endLine,
+              startColumn: param.startColumn,
+              endColumn: param.endColumn,
               language,
               isExported: false,
               ordinal: param.ordinal,
@@ -1819,6 +1829,8 @@ const processFileGroup = (
               filePath: promoted.filePath,
               startLine: promoted.startLine,
               endLine: promoted.endLine,
+              startColumn: promoted.startColumn,
+              endColumn: promoted.endColumn,
               language,
               isExported: false,
               visibility: promoted.visibility,

@@ -25,6 +25,8 @@ export interface ExtractedParameter {
   name: string;
   startLine: number;
   endLine: number;
+  startColumn: number;
+  endColumn: number;
   ordinal: number;
   /** Resolved type name (from annotation). Undefined when no type annotation present. */
   type?: string;
@@ -48,6 +50,8 @@ export interface PromotedProperty {
   name: string;
   startLine: number;
   endLine: number;
+  startColumn: number;
+  endColumn: number;
   type?: string;
   visibility: 'public' | 'protected' | 'private';
   isReadonly: boolean;
@@ -302,6 +306,8 @@ const buildPromotedProperty = (
     name: paramName,
     startLine: paramNode.startPosition.row + 1,
     endLine: paramNode.endPosition.row + 1,
+    startColumn: paramNode.startPosition.column,
+    endColumn: paramNode.endPosition.column,
     type: paramType,
     visibility,
     isReadonly: hasReadonlyModifier(paramNode),
@@ -393,6 +399,8 @@ export const extractParameters = (
       name: paramName,
       startLine: paramNode.startPosition.row + 1,
       endLine: paramNode.endPosition.row + 1,
+      startColumn: paramNode.startPosition.column,
+      endColumn: paramNode.endPosition.column,
       ordinal,
       type: paramType,
       isOptional,
