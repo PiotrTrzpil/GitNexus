@@ -49,6 +49,7 @@
   },
   "dependencies": {
     "@huggingface/transformers": "^3.0.0",
+    "@ladybugdb/core": "^0.15.1",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "cli-progress": "^3.12.0",
     "commander": "^12.0.0",
@@ -58,7 +59,6 @@
     "graphology": "^0.25.4",
     "graphology-indices": "^0.17.0",
     "graphology-utils": "^2.3.0",
-    "@ladybugdb/core": "^0.15.1",
     "ignore": "^7.0.5",
     "lru-cache": "^11.0.0",
     "mnemonist": "^0.39.0",
@@ -75,14 +75,15 @@
     "tree-sitter-ruby": "0.23.1",
     "tree-sitter-rust": "0.24.0",
     "tree-sitter-typescript": "0.23.2",
+    "ts-morph": "^27.0.2",
     "uuid": "^13.0.0",
     "xxhash-wasm": "^1.1.0",
     "yaml": "^2.8.2"
   },
   "optionalDependencies": {
+    "@gitnexus/oxc-cfg": "file:native/oxc-cfg-napi",
     "tree-sitter-kotlin": "^0.3.8",
-    "tree-sitter-swift": "^0.7.1",
-    "@gitnexus/oxc-cfg": "file:native/oxc-cfg-napi"
+    "tree-sitter-swift": "^0.7.1"
   },
   "devDependencies": {
     "@types/cli-progress": "^3.11.6",

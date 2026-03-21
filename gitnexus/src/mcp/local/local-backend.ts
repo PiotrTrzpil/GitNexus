@@ -21,6 +21,7 @@ import {
 } from '../../storage/repo-manager.js';
 // AI context generation is CLI-only (gitnexus analyze)
 // import { generateAIContextFiles } from '../../cli/ai-context.js';
+import { VERSION } from '../../config/version.js';
 import { diffFile } from '../../core/diff/semantic-differ.js';
 import { planCommits, type CouplingEdge, type FileChangeSummary } from '../../core/diff/commit-planner.js';
 import { readSourceWithContext } from '../source-reader.js';
@@ -297,7 +298,15 @@ export class LocalBackend {
       return this.repos.values().next().value!;
     }
 
-    return null; // Multiple repos, no param — ambiguous
+    // Multiple repos, no param — try to auto-detect from CWD
+    const cwd = process.cwd();
+    for (const handle of this.repos.values()) {
+      if (cwd === handle.repoPath || cwd.startsWith(handle.repoPath + path.sep)) {
+        return handle;
+      }
+    }
+
+    return null; // Multiple repos, CWD doesn't match any — ambiguous
   }
 
   // ─── Lazy LadybugDB Init ────────────────────────────────────────────
@@ -1465,7 +1474,13 @@ export class LocalBackend {
   }
 
   /**
-   * Rename tool — multi-file coordinated rename using graph + text search.
+   * Rename tool — multi-file coordinated rename.
+   *
+   * For TypeScript/JavaScript files, delegates to ts-morph which uses the
+   * TypeScript language service for scope-aware, semantically correct renames
+   * (handles imports, re-exports, destructuring, scoping, etc.).
+   *
+   * For other languages, falls back to graph + text search with regex.
    * Graph refs are tagged "graph" (high confidence).
    * Additional refs found via text search are tagged "text_search" (lower confidence).
    */
@@ -1477,7 +1492,7 @@ export class LocalBackend {
     dry_run?: boolean;
   }): Promise<any> {
     await this.ensureInitialized(repo.id);
-    
+
     const { new_name, file_path } = params;
     const dry_run = params.dry_run ?? true;
 
@@ -1493,38 +1508,146 @@ export class LocalBackend {
       }
       return full;
     };
-    
-    // Step 1: Find the target symbol (reuse context's lookup)
+
+    // Step 1: Find the target symbol (reuse context's lookup for disambiguation)
     const lookupResult = await this.context(repo, {
       name: params.symbol_name,
       uid: params.symbol_uid,
       file_path,
     });
-    
+
     if (lookupResult.status === 'ambiguous') {
       return lookupResult; // pass disambiguation through
     }
     if (lookupResult.error) {
       return lookupResult;
     }
-    
+
     const sym = lookupResult.symbol;
     const oldName = sym.name;
-    
+
     if (oldName === new_name) {
       return { error: 'New name is the same as the current name.' };
     }
-    
-    // Step 2: Collect edits from graph (high confidence)
+
+    // Step 2: For TS/JS files, try ts-morph (scope-aware rename via the TS language service)
+    if (sym.filePath && sym.startLine) {
+      const { isTypeScriptFile, tsMorphRename } = await import('../../core/rename/ts-morph-rename.js');
+      if (isTypeScriptFile(sym.filePath)) {
+        // tsMorphRename returns null when the symbol can't be resolved (clean fallthrough).
+        // It throws on infrastructure errors — we catch those and return them as errors
+        // rather than silently falling through to regex (which could double-apply on
+        // partial failure).
+        let tsMorphEdits;
+        try {
+          tsMorphEdits = await tsMorphRename({
+            repoPath: repo.repoPath,
+            filePath: sym.filePath,
+            line: sym.startLine,
+            column: sym.startColumn,
+            oldName,
+            newName: new_name,
+            dryRun: dry_run,
+          });
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          return { error: `ts-morph rename failed: ${msg}` };
+        }
+
+        if (tsMorphEdits && tsMorphEdits.length > 0) {
+          // Group edits by file for the response
+          const fileEdits = new Map<string, { file_path: string; edits: any[] }>();
+          for (const edit of tsMorphEdits) {
+            if (!fileEdits.has(edit.filePath)) {
+              fileEdits.set(edit.filePath, { file_path: edit.filePath, edits: [] });
+            }
+            fileEdits.get(edit.filePath)!.edits.push({
+              line: edit.line,
+              old_text: edit.old_text,
+              new_text: edit.new_text,
+              confidence: edit.confidence,
+            });
+          }
+          const changes = Array.from(fileEdits.values());
+          return {
+            status: 'success',
+            old_name: oldName,
+            new_name,
+            engine: 'ts_morph',
+            files_affected: changes.length,
+            total_edits: tsMorphEdits.length,
+            ts_morph_edits: tsMorphEdits.length,
+            changes,
+            applied: !dry_run,
+          };
+        }
+        // ts-morph returned null (symbol not resolved) — fall through to graph + text search
+      }
+
+      // For Python files, try rope (scope-aware rename via the rope refactoring library)
+      const { isPythonFile, ropeRename } = await import('../../core/rename/rope-rename.js');
+      if (isPythonFile(sym.filePath)) {
+        let ropeEdits;
+        try {
+          ropeEdits = await ropeRename({
+            repoPath: repo.repoPath,
+            filePath: sym.filePath,
+            line: sym.startLine,
+            column: sym.startColumn,
+            oldName,
+            newName: new_name,
+            dryRun: dry_run,
+          });
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          return { error: `rope rename failed: ${msg}` };
+        }
+
+        if (ropeEdits && ropeEdits.length > 0) {
+          const fileEdits = new Map<string, { file_path: string; edits: any[] }>();
+          for (const edit of ropeEdits) {
+            if (!fileEdits.has(edit.filePath)) {
+              fileEdits.set(edit.filePath, { file_path: edit.filePath, edits: [] });
+            }
+            fileEdits.get(edit.filePath)!.edits.push({
+              line: edit.line,
+              old_text: edit.old_text,
+              new_text: edit.new_text,
+              confidence: edit.confidence,
+            });
+          }
+          const changes = Array.from(fileEdits.values());
+          return {
+            status: 'success',
+            old_name: oldName,
+            new_name,
+            engine: 'rope',
+            files_affected: changes.length,
+            total_edits: ropeEdits.length,
+            rope_edits: ropeEdits.length,
+            changes,
+            applied: !dry_run,
+          };
+        }
+        // rope returned null (symbol not resolved) — fall through to graph + text search
+      }
+    }
+
+    // Step 3: Fallback — collect edits from graph + text search
     const changes = new Map<string, { file_path: string; edits: any[] }>();
-    
+    const warnings: string[] = [];
+    const nameRegex = () => new RegExp(`\\b${oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'g');
+
     const addEdit = (filePath: string, line: number, oldText: string, newText: string, confidence: string) => {
       if (!changes.has(filePath)) {
         changes.set(filePath, { file_path: filePath, edits: [] });
       }
-      changes.get(filePath)!.edits.push({ line, old_text: oldText, new_text: newText, confidence });
+      const fileEdits = changes.get(filePath)!.edits;
+      // Deduplicate: skip if we already have an edit for this exact line
+      if (fileEdits.some((e: any) => e.line === line)) return;
+      fileEdits.push({ line, old_text: oldText, new_text: newText, confidence });
     };
-    
+
     // The definition itself
     if (sym.filePath && sym.startLine) {
       try {
@@ -1532,10 +1655,12 @@ export class LocalBackend {
         const lines = content.split('\n');
         const lineIdx = sym.startLine - 1;
         if (lineIdx >= 0 && lineIdx < lines.length && lines[lineIdx].includes(oldName)) {
-          const defRegex = new RegExp(`\\b${oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'g');
-          addEdit(sym.filePath, sym.startLine, lines[lineIdx].trim(), lines[lineIdx].replace(defRegex, new_name).trim(), 'graph');
+          addEdit(sym.filePath, sym.startLine, lines[lineIdx].trim(), lines[lineIdx].replace(nameRegex(), new_name).trim(), 'graph');
         }
-      } catch (e) { logQueryError('rename:read-definition', e); }
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        warnings.push(`Could not read definition file ${sym.filePath}: ${msg}`);
+      }
     }
 
     // All incoming refs from graph (callers, importers, etc.)
@@ -1545,29 +1670,33 @@ export class LocalBackend {
       ...(lookupResult.incoming.extends || []),
       ...(lookupResult.incoming.implements || []),
     ];
-    
-    let graphEdits = changes.size > 0 ? 1 : 0; // count definition edit
-    
+
+    let graphEdits = 0;
+
     for (const ref of allIncoming) {
       if (!ref.filePath) continue;
       try {
         const content = await fs.readFile(assertSafePath(ref.filePath), 'utf-8');
         const lines = content.split('\n');
+        const regex = nameRegex();
         for (let i = 0; i < lines.length; i++) {
-          if (lines[i].includes(oldName)) {
-            addEdit(ref.filePath, i + 1, lines[i].trim(), lines[i].replace(new RegExp(`\\b${oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'g'), new_name).trim(), 'graph');
+          regex.lastIndex = 0;
+          if (regex.test(lines[i])) {
+            regex.lastIndex = 0;
+            addEdit(ref.filePath, i + 1, lines[i].trim(), lines[i].replace(nameRegex(), new_name).trim(), 'graph');
             graphEdits++;
-            break; // one edit per file from graph refs
           }
         }
-      } catch (e) { logQueryError('rename:read-ref', e); }
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        warnings.push(`Could not read reference file ${ref.filePath}: ${msg}`);
+      }
     }
 
-    // Step 3: Text search for refs the graph might have missed
-    let astSearchEdits = 0;
+    // Text search for refs the graph might have missed
+    let textSearchEdits = 0;
     const graphFiles = new Set([sym.filePath, ...allIncoming.map(r => r.filePath)].filter(Boolean));
-    
-    // Simple text search across the repo for the old name (in files not already covered by graph)
+
     try {
       const { execFile } = await import('child_process');
       const { promisify } = await import('util');
@@ -1581,54 +1710,93 @@ export class LocalBackend {
       ];
       const { stdout: output } = await execFileAsync('rg', rgArgs, { cwd: repo.repoPath, encoding: 'utf-8', timeout: 5000 });
       const files = output.trim().split('\n').filter(f => f.length > 0);
-      
+
       for (const file of files) {
         const normalizedFile = file.replace(/\\/g, '/').replace(/^\.\//, '');
         if (graphFiles.has(normalizedFile)) continue; // already covered by graph
-        
+
         try {
           const content = await fs.readFile(assertSafePath(normalizedFile), 'utf-8');
           const lines = content.split('\n');
-          const regex = new RegExp(`\\b${oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'g');
+          const regex = nameRegex();
           for (let i = 0; i < lines.length; i++) {
             regex.lastIndex = 0;
             if (regex.test(lines[i])) {
               regex.lastIndex = 0;
-              addEdit(normalizedFile, i + 1, lines[i].trim(), lines[i].replace(regex, new_name).trim(), 'text_search');
-              astSearchEdits++;
+              addEdit(normalizedFile, i + 1, lines[i].trim(), lines[i].replace(nameRegex(), new_name).trim(), 'text_search');
+              textSearchEdits++;
             }
           }
-        } catch (e) { logQueryError('rename:text-search-read', e); }
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          warnings.push(`Could not read text-search file ${normalizedFile}: ${msg}`);
+        }
       }
-    } catch (e) { logQueryError('rename:ripgrep', e); }
-    
+    } catch (e) {
+      // rg exit code 1 = no matches (not an error)
+      const isNoMatch = e instanceof Error && 'code' in e && (e as any).code === 1;
+      if (!isNoMatch) {
+        const msg = e instanceof Error ? e.message : String(e);
+        warnings.push(`Text search (rg) failed: ${msg}`);
+      }
+    }
+
     // Step 4: Apply or preview
     const allChanges = Array.from(changes.values());
     const totalEdits = allChanges.reduce((sum, c) => sum + c.edits.length, 0);
-    
+
     if (!dry_run) {
-      // Apply edits to files
+      const applyFailures: string[] = [];
       for (const change of allChanges) {
         try {
           const fullPath = assertSafePath(change.file_path);
           let content = await fs.readFile(fullPath, 'utf-8');
-          const regex = new RegExp(`\\b${oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'g');
-          content = content.replace(regex, new_name);
-          await fs.writeFile(fullPath, content, 'utf-8');
-        } catch (e) { logQueryError('rename:apply-edit', e); }
+          // Apply only the specific lines from the preview (no blanket replace)
+          const lines = content.split('\n');
+          const regex = nameRegex();
+          for (const edit of change.edits) {
+            const lineIdx = edit.line - 1;
+            if (lineIdx >= 0 && lineIdx < lines.length) {
+              lines[lineIdx] = lines[lineIdx].replace(regex, new_name);
+            }
+          }
+          await fs.writeFile(fullPath, lines.join('\n'), 'utf-8');
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          applyFailures.push(`${change.file_path}: ${msg}`);
+        }
+      }
+
+      if (applyFailures.length > 0) {
+        return {
+          status: 'partial',
+          error: `Failed to apply edits to ${applyFailures.length}/${allChanges.length} file(s)`,
+          old_name: oldName,
+          new_name,
+          engine: 'graph_text_search',
+          apply_failures: applyFailures,
+          files_affected: allChanges.length,
+          total_edits: totalEdits,
+          graph_edits: graphEdits,
+          text_search_edits: textSearchEdits,
+          changes: allChanges,
+          ...(warnings.length > 0 ? { warnings } : {}),
+        };
       }
     }
-    
+
     return {
       status: 'success',
       old_name: oldName,
       new_name,
+      engine: 'graph_text_search',
       files_affected: allChanges.length,
       total_edits: totalEdits,
       graph_edits: graphEdits,
-      text_search_edits: astSearchEdits,
+      text_search_edits: textSearchEdits,
       changes: allChanges,
       applied: !dry_run,
+      ...(warnings.length > 0 ? { warnings } : {}),
     };
   }
 
@@ -2073,16 +2241,24 @@ export class LocalBackend {
     }
     await initCoreLbug(lbugPath);
     await loadGraphToLbug(result.graph, resolved, storagePath);
+
+    // Get accurate stats from the database before closing
+    const { getLbugStats } = await import('../../core/lbug/lbug-adapter.js');
+    const dbStats = await getLbugStats();
     await closeCoreLbug();
 
-    // Update meta
+    // Update meta with complete stats (matching analyze CLI output)
     const meta = {
       repoPath: resolved,
       lastCommit: getCurrentCommit(resolved),
       indexedAt: new Date().toISOString(),
+      version: VERSION,
       stats: {
         files: result.totalFileCount,
-        nodes: result.graph.nodeCount,
+        nodes: dbStats.nodes,
+        edges: dbStats.edges,
+        communities: result.communityResult?.stats?.totalCommunities,
+        processes: result.processResult?.stats?.totalProcesses,
       },
     };
     await saveMeta(storagePath, meta);

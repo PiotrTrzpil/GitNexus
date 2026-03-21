@@ -165,7 +165,15 @@ Finds all references via graph (high confidence) and regex text search (lower co
 WHEN TO USE: Renaming a function, class, method, or variable across the codebase. Safer than find-and-replace.
 AFTER THIS: Run detect_changes() to verify no unexpected side effects.
 
+For TypeScript/JavaScript files, uses ts-morph (TypeScript language service) for scope-aware,
+semantically correct renames — handles imports, re-exports, destructuring, and scoping automatically.
+For Python files, uses rope (Python refactoring library) for scope-aware renames —
+handles imports, module references, and class hierarchies.
+Falls back to graph + text search for other languages or if the language-specific engine cannot resolve the symbol.
+
 Each edit is tagged with confidence:
+- "ts_morph": found via TypeScript language service (highest confidence, scope-aware)
+- "rope": found via Python rope refactoring library (highest confidence, scope-aware)
 - "graph": found via knowledge graph relationships (high confidence, safe to accept)
 - "text_search": found via regex text search (lower confidence, review carefully)`,
     inputSchema: {
