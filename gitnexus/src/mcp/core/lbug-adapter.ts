@@ -27,6 +27,8 @@ interface PoolEntry {
   waiters: Array<(conn: lbug.Connection) => void>;
   lastUsed: number;
   dbPath: string;
+  /** mtime of the DB file when this pool entry was created */
+  openedAtMtime: number;
 }
 
 const pool = new Map<string, PoolEntry>();
@@ -40,6 +42,8 @@ interface SharedDB {
   db: lbug.Database;
   refCount: number;
   ftsLoaded: boolean;
+  /** mtime of the DB file when opened — used for staleness detection */
+  openedAtMtime: number;
 }
 const dbCache = new Map<string, SharedDB>();
 
@@ -153,17 +157,25 @@ const LOCK_RETRY_DELAY_MS = 2000;
  * Retries on lock errors (e.g., when `gitnexus analyze` is running).
  */
 export const initLbug = async (repoId: string, dbPath: string): Promise<void> => {
-  const existing = pool.get(repoId);
-  if (existing) {
-    existing.lastUsed = Date.now();
-    return;
-  }
-
-  // Check if database exists
+  // Check if database exists and get its mtime
+  let currentMtime: number;
   try {
-    await fs.stat(dbPath);
+    const stat = await fs.stat(dbPath);
+    currentMtime = stat.mtimeMs;
   } catch {
     throw new Error(`LadybugDB not found at ${dbPath}. Run: gitnexus analyze`);
+  }
+
+  const existing = pool.get(repoId);
+  if (existing) {
+    // Staleness check: if the DB file was rewritten since we opened it,
+    // close the stale connection and re-open with fresh data.
+    if (existing.openedAtMtime < currentMtime) {
+      closeOne(repoId);
+    } else {
+      existing.lastUsed = Date.now();
+      return;
+    }
   }
 
   evictLRU();
@@ -171,6 +183,11 @@ export const initLbug = async (repoId: string, dbPath: string): Promise<void> =>
   // Reuse an existing native Database if another repoId already opened this path.
   // This prevents buffer manager exhaustion from multiple mmap regions on the same file.
   let shared = dbCache.get(dbPath);
+  if (shared && shared.openedAtMtime < currentMtime) {
+    // DB file was rewritten — evict stale shared handle
+    dbCache.delete(dbPath);
+    shared = undefined;
+  }
   if (!shared) {
     // Open in read-only mode — MCP server never writes to the database.
     // This allows multiple MCP server instances to read concurrently, and
@@ -186,7 +203,7 @@ export const initLbug = async (repoId: string, dbPath: string): Promise<void> =>
           true,  // readOnly
         );
         restoreStdout();
-        shared = { db, refCount: 0, ftsLoaded: false };
+        shared = { db, refCount: 0, ftsLoaded: false, openedAtMtime: currentMtime };
         dbCache.set(dbPath, shared);
         break;
       } catch (err: any) {
@@ -216,7 +233,7 @@ export const initLbug = async (repoId: string, dbPath: string): Promise<void> =>
     available.push(createConnection(db));
   }
 
-  pool.set(repoId, { db, available, checkedOut: 0, waiters: [], lastUsed: Date.now(), dbPath });
+  pool.set(repoId, { db, available, checkedOut: 0, waiters: [], lastUsed: Date.now(), dbPath, openedAtMtime: currentMtime });
   ensureIdleTimer();
 
   // Load FTS extension once per shared Database

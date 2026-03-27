@@ -266,6 +266,18 @@ export const analyzeCommand = async (
   const lbugTime = ((Date.now() - t0Lbug) / 1000).toFixed(1);
   const lbugWarnings = lbugResult.warnings;
 
+  // Persist file hashes NOW — after LBUG loading succeeded. If saved earlier
+  // (in the pipeline) and LBUG crashes, the next run skips parsing because it
+  // thinks all files are unchanged.
+  if (pipelineResult.currentFileHashes) {
+    try {
+      const { saveFileHashes } = await import('../storage/file-hashes.js');
+      await saveFileHashes(storagePath, pipelineResult.currentFileHashes);
+    } catch {
+      // Non-fatal — worst case next run is a full re-parse
+    }
+  }
+
   // ── Phase 3: FTS (85–90%) ─────────────────────────────────────────
   updateBar(85, 'Creating search indexes...');
 

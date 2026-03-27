@@ -25,6 +25,8 @@ export interface PipelineResult {
   totalFileCount: number;
   communityResult?: CommunityDetectionResult;
   processResult?: ProcessDetectionResult;
+  /** File hashes for incremental indexing — caller should persist AFTER full index succeeds */
+  currentFileHashes?: Array<{ relPath: string; hash: string }> | null;
 }
 
 // Serializable version for Web Worker communication

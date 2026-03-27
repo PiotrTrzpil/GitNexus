@@ -585,16 +585,11 @@ export const runPipelineFromRepo = async (
 
     astCache.clear();
 
-    // Persist file hashes for incremental indexing on the next run
-    if (currentFileHashes) {
-      try {
-        await saveFileHashes(storagePaths.storagePath, currentFileHashes);
-      } catch {
-        // Non-fatal — worst case next run is a full index
-      }
-    }
-
-    return { graph, repoPath, totalFileCount: totalFiles, communityResult, processResult };
+    // Return file hashes so the caller can persist them AFTER the full index
+    // (including LBUG loading) succeeds. Saving here is too early — if LBUG
+    // loading crashes, the next run would see all files as "unchanged" and
+    // skip parsing entirely.
+    return { graph, repoPath, totalFileCount: totalFiles, communityResult, processResult, currentFileHashes };
   } catch (error) {
     cleanup();
     throw error;

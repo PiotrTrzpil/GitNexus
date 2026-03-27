@@ -334,29 +334,29 @@ const getCopyQuery = (table: NodeTableName, filePath: string): string => {
     return `COPY ${t}(id, label, heuristicLabel, processType, stepCount, communities, entryPointId, terminalId) FROM "${filePath}" ${COPY_CSV_OPTS}`;
   }
   if (table === 'Function') {
-    return `COPY ${t}(id, name, filePath, startLine, endLine, isExported, content, description, complexity, sloc, parameterCount, visibility) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+    return `COPY ${t}(id, name, filePath, startLine, endLine, startColumn, endColumn, isExported, content, description, complexity, sloc, parameterCount, visibility) FROM "${filePath}" ${COPY_CSV_OPTS}`;
   }
   if (table === 'Method') {
-    return `COPY ${t}(id, name, filePath, startLine, endLine, isExported, content, description, parameterCount, returnType, className, complexity, sloc, visibility, isAccessor, isStatic, isAbstract) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+    return `COPY ${t}(id, name, filePath, startLine, endLine, startColumn, endColumn, isExported, content, description, parameterCount, returnType, className, complexity, sloc, visibility, isAccessor, isStatic, isAbstract) FROM "${filePath}" ${COPY_CSV_OPTS}`;
   }
   if (table === 'Constructor') {
-    return `COPY ${t}(id, name, filePath, startLine, endLine, content, description, className, complexity, sloc, parameterCount, visibility) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+    return `COPY ${t}(id, name, filePath, startLine, endLine, startColumn, endColumn, content, description, className, complexity, sloc, parameterCount, visibility) FROM "${filePath}" ${COPY_CSV_OPTS}`;
   }
   if (table === 'Property') {
-    return `COPY ${t}(id, name, filePath, startLine, endLine, content, description, className, visibility, isReadonly, isStatic, isAccessor) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+    return `COPY ${t}(id, name, filePath, startLine, endLine, startColumn, endColumn, content, description, className, visibility, isReadonly, isStatic, isAccessor) FROM "${filePath}" ${COPY_CSV_OPTS}`;
   }
   if (table === 'Parameter') {
-    return `COPY ${t}(id, name, filePath, startLine, endLine, ordinal, isOptional, hasDefault, isRest, visibility) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+    return `COPY ${t}(id, name, filePath, startLine, endLine, startColumn, endColumn, ordinal, isOptional, hasDefault, isRest, visibility) FROM "${filePath}" ${COPY_CSV_OPTS}`;
   }
   if (table === 'BasicBlock') {
-    return `COPY ${t}(id, name, filePath, startLine, endLine, blockIndex, instructionCount, isUnreachable, cfgInstructions) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+    return `COPY ${t}(id, name, filePath, startLine, endLine, startColumn, endColumn, blockIndex, instructionCount, isUnreachable, cfgInstructions) FROM "${filePath}" ${COPY_CSV_OPTS}`;
   }
   // TypeScript/JS code element tables have isExported; multi-language tables do not
   if (TABLES_WITH_EXPORTED.has(table)) {
-    return `COPY ${t}(id, name, filePath, startLine, endLine, isExported, content, description) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+    return `COPY ${t}(id, name, filePath, startLine, endLine, startColumn, endColumn, isExported, content, description) FROM "${filePath}" ${COPY_CSV_OPTS}`;
   }
   // Multi-language tables (Struct, Impl, Trait, Macro, etc.)
-  return `COPY ${t}(id, name, filePath, startLine, endLine, content, description) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+  return `COPY ${t}(id, name, filePath, startLine, endLine, startColumn, endColumn, content, description) FROM "${filePath}" ${COPY_CSV_OPTS}`;
 };
 
 /**
