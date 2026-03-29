@@ -24,9 +24,9 @@ export interface TsMorphEdit {
   confidence: 'ts_morph';
 }
 
-/** Walk up from sourceFile to find the nearest tsconfig.json within repoPath. */
-async function findTsConfig(repoPath: string, sourceFile: string): Promise<string | undefined> {
-  let dir = path.dirname(sourceFile);
+/** Walk up from startPath to find the nearest tsconfig.json within repoPath. */
+export async function findTsConfig(repoPath: string, startPath: string): Promise<string | undefined> {
+  let dir = path.dirname(startPath);
   while (dir.startsWith(repoPath)) {
     const candidate = path.join(dir, 'tsconfig.json');
     try {

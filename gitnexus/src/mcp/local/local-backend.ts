@@ -1488,6 +1488,7 @@ export class LocalBackend {
     symbol_name?: string;
     symbol_uid?: string;
     new_name: string;
+    type?: 'symbol' | 'directory';
     file_path?: string;
     dry_run?: boolean;
   }): Promise<any> {
@@ -1495,10 +1496,6 @@ export class LocalBackend {
 
     const { new_name, file_path } = params;
     const dry_run = params.dry_run ?? true;
-
-    if (!params.symbol_name && !params.symbol_uid) {
-      return { error: 'Either symbol_name or symbol_uid is required.' };
-    }
 
     /** Guard: ensure a file path resolves within the repo root (prevents path traversal) */
     const assertSafePath = (filePath: string): string => {
@@ -1508,6 +1505,66 @@ export class LocalBackend {
       }
       return full;
     };
+
+    // --- Directory rename: move files + update import paths ---
+    if (params.type === 'directory') {
+      if (!params.symbol_name) {
+        return { error: 'symbol_name is required for directory rename (the old directory path).' };
+      }
+
+      const oldDir = params.symbol_name;
+      const newDir = new_name;
+
+      // Safety: both paths must be within the repo
+      assertSafePath(oldDir);
+      assertSafePath(newDir);
+
+      try {
+        const { directoryRename } = await import('../../core/rename/directory-rename.js');
+        const result = await directoryRename({
+          repoPath: repo.repoPath,
+          oldDir,
+          newDir,
+          dryRun: dry_run,
+        });
+
+        const changes = new Map<string, { file_path: string; edits: any[] }>();
+        for (const edit of result.edits) {
+          if (!changes.has(edit.filePath)) {
+            changes.set(edit.filePath, { file_path: edit.filePath, edits: [] });
+          }
+          changes.get(edit.filePath)!.edits.push({
+            line: edit.line,
+            old_text: edit.old_text,
+            new_text: edit.new_text,
+            confidence: edit.confidence,
+          });
+        }
+
+        return {
+          status: 'success',
+          old_name: oldDir,
+          new_name: newDir,
+          type: 'directory',
+          engine: 'ts_morph',
+          files_moved: result.files_moved.length,
+          files_affected: changes.size,
+          total_edits: result.edits.length,
+          ts_morph_edits: result.edits.length,
+          moves: result.files_moved,
+          changes: Array.from(changes.values()),
+          applied: !dry_run,
+        };
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return { error: `Directory rename failed: ${msg}` };
+      }
+    }
+
+    // --- Symbol rename ---
+    if (!params.symbol_name && !params.symbol_uid) {
+      return { error: 'Either symbol_name or symbol_uid is required.' };
+    }
 
     // Step 1: Find the target symbol (reuse context's lookup for disambiguation)
     const lookupResult = await this.context(repo, {
