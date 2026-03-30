@@ -1488,7 +1488,7 @@ export class LocalBackend {
     symbol_name?: string;
     symbol_uid?: string;
     new_name: string;
-    type?: 'symbol' | 'directory';
+    type?: 'symbol' | 'file' | 'directory';
     file_path?: string;
     dry_run?: boolean;
   }): Promise<any> {
@@ -1505,6 +1505,61 @@ export class LocalBackend {
       }
       return full;
     };
+
+    // --- File rename/move: move a single file + update import paths ---
+    if (params.type === 'file') {
+      if (!params.symbol_name) {
+        return { error: 'symbol_name is required for file rename (the old file path).' };
+      }
+
+      const oldFile = params.symbol_name;
+      const newFile = new_name;
+
+      // Safety: both paths must be within the repo
+      assertSafePath(oldFile);
+      assertSafePath(newFile);
+
+      try {
+        const { fileRename } = await import('../../core/rename/file-rename.js');
+        const result = await fileRename({
+          repoPath: repo.repoPath,
+          oldFile,
+          newFile,
+          dryRun: dry_run,
+        });
+
+        const changes = new Map<string, { file_path: string; edits: any[] }>();
+        for (const edit of result.edits) {
+          if (!changes.has(edit.filePath)) {
+            changes.set(edit.filePath, { file_path: edit.filePath, edits: [] });
+          }
+          changes.get(edit.filePath)!.edits.push({
+            line: edit.line,
+            old_text: edit.old_text,
+            new_text: edit.new_text,
+            confidence: edit.confidence,
+          });
+        }
+
+        return {
+          status: 'success',
+          old_name: oldFile,
+          new_name: newFile,
+          type: 'file',
+          engine: 'ts_morph',
+          files_moved: result.files_moved.length,
+          files_affected: changes.size,
+          total_edits: result.edits.length,
+          ts_morph_edits: result.edits.length,
+          moves: result.files_moved,
+          changes: Array.from(changes.values()),
+          applied: !dry_run,
+        };
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return { error: `File rename failed: ${msg}` };
+      }
+    }
 
     // --- Directory rename: move files + update import paths ---
     if (params.type === 'directory') {

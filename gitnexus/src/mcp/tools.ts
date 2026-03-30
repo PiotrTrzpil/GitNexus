@@ -163,7 +163,7 @@ Returns: changed symbols, affected processes, and a risk summary.`,
 Finds all references via graph (high confidence) and regex text search (lower confidence). Preview by default.
 
 WHEN TO USE: Renaming a function, class, method, or variable across the codebase. Safer than find-and-replace.
-Also supports renaming directories (module paths) — moves all files and updates import paths.
+Also supports renaming directories and moving single files — moves files and updates import paths.
 AFTER THIS: Run detect_changes() to verify no unexpected side effects.
 
 For symbol renames (default):
@@ -172,6 +172,11 @@ For symbol renames (default):
   For Python files, uses rope (Python refactoring library) for scope-aware renames —
   handles imports, module references, and class hierarchies.
   Falls back to graph + text search for other languages or if the language-specific engine cannot resolve the symbol.
+
+For file moves (type: "file"):
+  Moves a single file to a new location and updates all import/export paths across the codebase
+  using ts-morph's SourceFile.move() API. Non-TS files are moved via filesystem (no import rewriting).
+  Usage: rename(symbol_name: "src/utils/helpers.ts", new_name: "src/lib/helpers.ts", type: "file")
 
 For directory renames (type: "directory"):
   Moves all files from old directory to new directory, and updates all import/export paths
@@ -186,10 +191,10 @@ Each edit is tagged with confidence:
     inputSchema: {
       type: 'object',
       properties: {
-        symbol_name: { type: 'string', description: 'Current symbol name to rename, or old directory path when type is "directory"' },
+        symbol_name: { type: 'string', description: 'Current symbol name to rename, or old file/directory path when type is "file"/"directory"' },
         symbol_uid: { type: 'string', description: 'Direct symbol UID from prior tool results (zero-ambiguity)' },
-        new_name: { type: 'string', description: 'The new name for the symbol, or new directory path when type is "directory"' },
-        type: { type: 'string', description: 'Rename type: "symbol" (default) or "directory" for renaming module paths', enum: ['symbol', 'directory'] },
+        new_name: { type: 'string', description: 'The new name for the symbol, or new file/directory path when type is "file"/"directory"' },
+        type: { type: 'string', description: 'Rename type: "symbol" (default), "file" for moving a single file, or "directory" for renaming module paths', enum: ['symbol', 'file', 'directory'] },
         file_path: { type: 'string', description: 'File path to disambiguate common names (symbol rename only)' },
         dry_run: { type: 'boolean', description: 'Preview edits without modifying files (default: true)', default: true },
         repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
