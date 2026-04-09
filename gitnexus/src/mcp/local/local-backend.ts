@@ -1746,36 +1746,6 @@ export class LocalBackend {
     }
 
     // Step 3: Fallback — collect edits from graph + text search
-    const changes = new Map<string, { file_path: string; edits: any[] }>();
-    const warnings: string[] = [];
-    const nameRegex = () => new RegExp(`\\b${oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'g');
-
-    const addEdit = (filePath: string, line: number, oldText: string, newText: string, confidence: string) => {
-      if (!changes.has(filePath)) {
-        changes.set(filePath, { file_path: filePath, edits: [] });
-      }
-      const fileEdits = changes.get(filePath)!.edits;
-      // Deduplicate: skip if we already have an edit for this exact line
-      if (fileEdits.some((e: any) => e.line === line)) return;
-      fileEdits.push({ line, old_text: oldText, new_text: newText, confidence });
-    };
-
-    // The definition itself
-    if (sym.filePath && sym.startLine) {
-      try {
-        const content = await fs.readFile(assertSafePath(sym.filePath), 'utf-8');
-        const lines = content.split('\n');
-        const lineIdx = sym.startLine - 1;
-        if (lineIdx >= 0 && lineIdx < lines.length && lines[lineIdx].includes(oldName)) {
-          addEdit(sym.filePath, sym.startLine, lines[lineIdx].trim(), lines[lineIdx].replace(nameRegex(), new_name).trim(), 'graph');
-        }
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        warnings.push(`Could not read definition file ${sym.filePath}: ${msg}`);
-      }
-    }
-
-    // All incoming refs from graph (callers, importers, etc.)
     const allIncoming = [
       ...(lookupResult.incoming.calls || []),
       ...(lookupResult.incoming.imports || []),
@@ -1783,119 +1753,33 @@ export class LocalBackend {
       ...(lookupResult.incoming.implements || []),
     ];
 
-    let graphEdits = 0;
+    const { graphTextSearchRename } = await import('../../core/rename/graph-rename.js');
+    const fallbackResult = await graphTextSearchRename({
+      repoPath: repo.repoPath,
+      defFile: sym.filePath,
+      incomingRefs: allIncoming,
+      oldName,
+      newName: new_name,
+      dryRun: dry_run,
+    });
 
-    for (const ref of allIncoming) {
-      if (!ref.filePath) continue;
-      try {
-        const content = await fs.readFile(assertSafePath(ref.filePath), 'utf-8');
-        const lines = content.split('\n');
-        const regex = nameRegex();
-        for (let i = 0; i < lines.length; i++) {
-          regex.lastIndex = 0;
-          if (regex.test(lines[i])) {
-            regex.lastIndex = 0;
-            addEdit(ref.filePath, i + 1, lines[i].trim(), lines[i].replace(nameRegex(), new_name).trim(), 'graph');
-            graphEdits++;
-          }
-        }
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        warnings.push(`Could not read reference file ${ref.filePath}: ${msg}`);
+    // Step 4: Format response
+    const changes = new Map<string, { file_path: string; edits: any[] }>();
+    for (const edit of fallbackResult.edits) {
+      if (!changes.has(edit.filePath)) {
+        changes.set(edit.filePath, { file_path: edit.filePath, edits: [] });
       }
+      changes.get(edit.filePath)!.edits.push({
+        line: edit.line,
+        old_text: edit.old_text,
+        new_text: edit.new_text,
+        confidence: edit.confidence,
+      });
     }
 
-    // Text search for refs the graph might have missed
-    let textSearchEdits = 0;
-    const graphFiles = new Set([sym.filePath, ...allIncoming.map(r => r.filePath)].filter(Boolean));
-
-    try {
-      const { execFile } = await import('child_process');
-      const { promisify } = await import('util');
-      const execFileAsync = promisify(execFile);
-      const rgArgs = [
-        '-l',
-        '--type-add', 'code:*.{ts,tsx,js,jsx,py,go,rs,java,c,h,cpp,cc,cxx,hpp,hxx,hh,cs,php,swift}',
-        '-t', 'code',
-        `\\b${oldName}\\b`,
-        '.',
-      ];
-      const { stdout: output } = await execFileAsync('rg', rgArgs, { cwd: repo.repoPath, encoding: 'utf-8', timeout: 5000 });
-      const files = output.trim().split('\n').filter(f => f.length > 0);
-
-      for (const file of files) {
-        const normalizedFile = file.replace(/\\/g, '/').replace(/^\.\//, '');
-        if (graphFiles.has(normalizedFile)) continue; // already covered by graph
-
-        try {
-          const content = await fs.readFile(assertSafePath(normalizedFile), 'utf-8');
-          const lines = content.split('\n');
-          const regex = nameRegex();
-          for (let i = 0; i < lines.length; i++) {
-            regex.lastIndex = 0;
-            if (regex.test(lines[i])) {
-              regex.lastIndex = 0;
-              addEdit(normalizedFile, i + 1, lines[i].trim(), lines[i].replace(nameRegex(), new_name).trim(), 'text_search');
-              textSearchEdits++;
-            }
-          }
-        } catch (e) {
-          const msg = e instanceof Error ? e.message : String(e);
-          warnings.push(`Could not read text-search file ${normalizedFile}: ${msg}`);
-        }
-      }
-    } catch (e) {
-      // rg exit code 1 = no matches (not an error)
-      const isNoMatch = e instanceof Error && 'code' in e && (e as any).code === 1;
-      if (!isNoMatch) {
-        const msg = e instanceof Error ? e.message : String(e);
-        warnings.push(`Text search (rg) failed: ${msg}`);
-      }
-    }
-
-    // Step 4: Apply or preview
     const allChanges = Array.from(changes.values());
-    const totalEdits = allChanges.reduce((sum, c) => sum + c.edits.length, 0);
-
-    if (!dry_run) {
-      const applyFailures: string[] = [];
-      for (const change of allChanges) {
-        try {
-          const fullPath = assertSafePath(change.file_path);
-          let content = await fs.readFile(fullPath, 'utf-8');
-          // Apply only the specific lines from the preview (no blanket replace)
-          const lines = content.split('\n');
-          const regex = nameRegex();
-          for (const edit of change.edits) {
-            const lineIdx = edit.line - 1;
-            if (lineIdx >= 0 && lineIdx < lines.length) {
-              lines[lineIdx] = lines[lineIdx].replace(regex, new_name);
-            }
-          }
-          await fs.writeFile(fullPath, lines.join('\n'), 'utf-8');
-        } catch (e) {
-          const msg = e instanceof Error ? e.message : String(e);
-          applyFailures.push(`${change.file_path}: ${msg}`);
-        }
-      }
-
-      if (applyFailures.length > 0) {
-        return {
-          status: 'partial',
-          error: `Failed to apply edits to ${applyFailures.length}/${allChanges.length} file(s)`,
-          old_name: oldName,
-          new_name,
-          engine: 'graph_text_search',
-          apply_failures: applyFailures,
-          files_affected: allChanges.length,
-          total_edits: totalEdits,
-          graph_edits: graphEdits,
-          text_search_edits: textSearchEdits,
-          changes: allChanges,
-          ...(warnings.length > 0 ? { warnings } : {}),
-        };
-      }
-    }
+    const totalEdits = fallbackResult.edits.length;
+    const { graphEdits, textSearchEdits, warnings } = fallbackResult;
 
     return {
       status: 'success',
