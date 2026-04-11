@@ -209,6 +209,16 @@ export const initLbug = async (repoId: string, dbPath: string): Promise<void> =>
       } catch (err: any) {
         restoreStdout();
         lastError = err instanceof Error ? err : new Error(String(err));
+
+        // WAL corruption: delete the .wal file and retry once.
+        // The DB itself is intact — only uncommitted WAL entries are lost.
+        const isWalCorrupt = lastError.message.includes('Corrupted wal')
+          || lastError.message.includes('invalid WAL');
+        if (isWalCorrupt) {
+          try { await fs.unlink(`${dbPath}.wal`); } catch {}
+          continue; // retry with the .wal file removed
+        }
+
         const isLockError = lastError.message.includes('Could not set lock')
           || lastError.message.includes('lock');
         if (!isLockError || attempt === LOCK_RETRY_ATTEMPTS) break;
@@ -310,6 +320,30 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
+/**
+ * Detect WAL corruption errors and auto-recover by deleting the corrupt WAL
+ * file, evicting the stale pool entry, and re-initializing the database.
+ * Returns true if recovery succeeded and the caller should retry.
+ */
+async function recoverFromWalCorruption(repoId: string, err: Error): Promise<boolean> {
+  const isWalCorrupt = err.message.includes('Corrupted wal')
+    || err.message.includes('invalid WAL');
+  if (!isWalCorrupt) return false;
+
+  const entry = pool.get(repoId);
+  if (!entry) return false;
+
+  const { dbPath } = entry;
+  closeOne(repoId);
+  try { await fs.unlink(`${dbPath}.wal`); } catch {}
+  try {
+    await initLbug(repoId, dbPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export const executeQuery = async (repoId: string, cypher: string): Promise<any[]> => {
   const entry = pool.get(repoId);
   if (!entry) {
@@ -324,6 +358,13 @@ export const executeQuery = async (repoId: string, cypher: string): Promise<any[
     const result = Array.isArray(queryResult) ? queryResult[0] : queryResult;
     const rows = await result.getAll();
     return rows;
+  } catch (err: any) {
+    const error = err instanceof Error ? err : new Error(String(err));
+    if (await recoverFromWalCorruption(repoId, error)) {
+      // Retry once after WAL recovery (original conn is dead, get a fresh one)
+      return executeQuery(repoId, cypher);
+    }
+    throw error;
   } finally {
     checkin(entry, conn);
   }
@@ -356,6 +397,12 @@ export const executeParameterized = async (
     const result = Array.isArray(queryResult) ? queryResult[0] : queryResult;
     const rows = await result.getAll();
     return rows;
+  } catch (err: any) {
+    const error = err instanceof Error ? err : new Error(String(err));
+    if (await recoverFromWalCorruption(repoId, error)) {
+      return executeParameterized(repoId, cypher, params);
+    }
+    throw error;
   } finally {
     checkin(entry, conn);
   }

@@ -1628,14 +1628,14 @@ export class LocalBackend {
       file_path,
     });
 
-    if (lookupResult.status === 'ambiguous') {
-      return lookupResult; // pass disambiguation through
+    if (lookupResult.status !== 'found') {
+      return lookupResult; // pass not_found / ambiguous / class_node through
     }
     if (lookupResult.error) {
       return lookupResult;
     }
 
-    const sym = lookupResult.symbol;
+    const sym = lookupResult.symbol!;
     const oldName = sym.name;
 
     if (oldName === new_name) {
