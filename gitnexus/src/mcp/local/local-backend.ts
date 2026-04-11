@@ -146,6 +146,7 @@ export class LocalBackend {
   private repos: Map<string, RepoHandle> = new Map();
   private contextCache: Map<string, CodebaseContext> = new Map();
   private initializedRepos: Set<string> = new Set();
+  private clientRoots: string[] = [];
 
   // ─── Initialization ──────────────────────────────────────────────
 
@@ -156,6 +157,21 @@ export class LocalBackend {
   async init(): Promise<boolean> {
     await this.refreshRepos();
     return this.repos.size > 0;
+  }
+
+  /**
+   * Set workspace roots reported by the MCP client (e.g. Claude Code).
+   * Used for auto-detecting the correct repo when `repo` param is omitted.
+   * Accepts file:// URIs or plain paths.
+   */
+  setClientRoots(roots: string[]): void {
+    this.clientRoots = roots.map((r) => {
+      try {
+        return r.startsWith('file://') ? new URL(r).pathname : path.resolve(r);
+      } catch {
+        return path.resolve(r);
+      }
+    });
   }
 
   /**
@@ -298,15 +314,17 @@ export class LocalBackend {
       return this.repos.values().next().value!;
     }
 
-    // Multiple repos, no param — try to auto-detect from CWD
-    const cwd = process.cwd();
-    for (const handle of this.repos.values()) {
-      if (cwd === handle.repoPath || cwd.startsWith(handle.repoPath + path.sep)) {
-        return handle;
+    // Multiple repos, no param — try to auto-detect from CWD or client roots
+    const candidates = [process.cwd(), ...this.clientRoots];
+    for (const candidate of candidates) {
+      for (const handle of this.repos.values()) {
+        if (candidate === handle.repoPath || candidate.startsWith(handle.repoPath + path.sep)) {
+          return handle;
+        }
       }
     }
 
-    return null; // Multiple repos, CWD doesn't match any — ambiguous
+    return null; // Multiple repos, no candidate matches any — ambiguous
   }
 
   // ─── Lazy LadybugDB Init ────────────────────────────────────────────
@@ -585,16 +603,17 @@ export class LocalBackend {
     
     // Step 1: Run hybrid search to get matching symbols
     const searchLimit = processLimit * maxSymbolsPerProcess; // fetch enough raw results
-    const [bm25Results, semanticResults] = await Promise.all([
+    const [bm25Output, semanticOutput] = await Promise.all([
       this.bm25Search(repo, searchQuery, searchLimit),
       this.semanticSearch(repo, searchQuery, searchLimit),
     ]);
-    
+    const searchWarnings = [...bm25Output.warnings, ...semanticOutput.warnings];
+
     // Merge via reciprocal rank fusion
     const scoreMap = new Map<string, { score: number; data: any }>();
-    
-    for (let i = 0; i < bm25Results.length; i++) {
-      const result = bm25Results[i];
+
+    for (let i = 0; i < bm25Output.results.length; i++) {
+      const result = bm25Output.results[i];
       const key = result.nodeId || result.filePath;
       const rrfScore = 1 / (60 + i);
       const existing = scoreMap.get(key);
@@ -604,9 +623,9 @@ export class LocalBackend {
         scoreMap.set(key, { score: rrfScore, data: result });
       }
     }
-    
-    for (let i = 0; i < semanticResults.length; i++) {
-      const result = semanticResults[i];
+
+    for (let i = 0; i < semanticOutput.results.length; i++) {
+      const result = semanticOutput.results[i];
       const key = result.nodeId || result.filePath;
       const rrfScore = 1 / (60 + i);
       const existing = scoreMap.get(key);
@@ -770,25 +789,53 @@ export class LocalBackend {
       return true;
     });
     
-    return {
+    const response: Record<string, any> = {
       processes,
       process_symbols: groupByFile(dedupedSymbols),
       definitions: groupByFile(definitions.slice(0, 20)), // cap standalone definitions
     };
+
+    // Surface search mode and warnings
+    const hasEmbeddings = semanticOutput.results.length > 0 || semanticOutput.warnings.length === 0;
+    if (!hasEmbeddings) {
+      response.search_mode = 'keyword-only (no embeddings)';
+      response.search_mode_hint = 'Run `gitnexus analyze --embeddings` to enable semantic search for better results. On macOS this uses CoreML (Metal/ANE) acceleration.';
+    }
+
+    if (searchWarnings.length > 0) {
+      const uniqueWarnings = [...new Set(searchWarnings)];
+      const hasResults = processes.length > 0 || definitions.length > 0;
+
+      if (!hasResults) {
+        const errorWarnings = uniqueWarnings.filter((w) => !w.startsWith('Semantic search unavailable'));
+        if (errorWarnings.length > 0) {
+          response.warnings = errorWarnings;
+        }
+        const indexMissing = errorWarnings.some((w) => w.includes("doesn't have an index"));
+        if (indexMissing) {
+          response.error = 'FTS search indexes are missing. Run `gitnexus analyze` to rebuild them.';
+        }
+      }
+    }
+
+    return response;
   }
 
   /**
    * BM25 keyword search helper - uses LadybugDB FTS for always-fresh results
    */
-  private async bm25Search(repo: RepoHandle, query: string, limit: number): Promise<any[]> {
+  private async bm25Search(
+    repo: RepoHandle, query: string, limit: number,
+  ): Promise<{ results: any[]; warnings: string[] }> {
     const { searchFTSFromLbug } = await import('../../core/search/bm25-index.js');
-    let bm25Results;
+    let ftsOutput;
     try {
-      bm25Results = await searchFTSFromLbug(query, limit, repo.id);
+      ftsOutput = await searchFTSFromLbug(query, limit, repo.id);
     } catch (err: any) {
-      console.error('GitNexus: BM25/FTS search failed (FTS indexes may not exist) -', err.message);
-      return [];
+      return { results: [], warnings: [`BM25/FTS search failed: ${err.message}`] };
     }
+    const bm25Results = ftsOutput.results;
+    const warnings = ftsOutput.warnings;
     
     const results: any[] = [];
     
@@ -834,17 +881,30 @@ export class LocalBackend {
       }
     }
     
-    return results;
+    return { results, warnings };
   }
 
   /**
    * Semantic vector search helper
    */
-  private async semanticSearch(repo: RepoHandle, query: string, limit: number): Promise<any[]> {
+  private async semanticSearch(
+    repo: RepoHandle, query: string, limit: number,
+  ): Promise<{ results: any[]; warnings: string[] }> {
     try {
       // Check if embedding table exists before loading the model (avoids heavy model init when embeddings are off)
       const tableCheck = await executeQuery(repo.id, `MATCH (e:CodeEmbedding) RETURN COUNT(*) AS cnt LIMIT 1`);
-      if (!tableCheck.length || (tableCheck[0].cnt ?? tableCheck[0][0]) === 0) return [];
+      if (!tableCheck.length || (tableCheck[0].cnt ?? tableCheck[0][0]) === 0) {
+        const embCount = repo.stats?.embeddings ?? 0;
+        const nodeCount = repo.stats?.nodes ?? 0;
+        const LIMIT = 200_000;
+        let reason: string;
+        if (nodeCount > LIMIT) {
+          reason = `Semantic search unavailable: repo has ${nodeCount.toLocaleString()} nodes (limit: ${LIMIT.toLocaleString()}). Only BM25 keyword search is active.`;
+        } else {
+          reason = 'Semantic search unavailable: no embeddings indexed. Run `gitnexus analyze --embeddings` to enable.';
+        }
+        return { results: [], warnings: [reason] };
+      }
 
       const { embedQuery, getEmbeddingDims } = await import('../core/embedder.js');
       const queryVec = await embedQuery(query);
@@ -863,7 +923,7 @@ export class LocalBackend {
       
       const embResults = await executeQuery(repo.id, vectorQuery);
       
-      if (embResults.length === 0) return [];
+      if (embResults.length === 0) return { results: [], warnings: [] };
       
       const results: any[] = [];
       
@@ -898,10 +958,10 @@ export class LocalBackend {
         } catch {}
       }
       
-      return results;
+      return { results, warnings: [] };
     } catch {
       // Expected when embeddings are disabled — silently fall back to BM25-only
-      return [];
+      return { results: [], warnings: [] };
     }
   }
 

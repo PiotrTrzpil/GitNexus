@@ -101,18 +101,64 @@ const doInitLbug = async (dbPath: string) => {
   const parentDir = path.dirname(dbPath);
   await fs.mkdir(parentDir, { recursive: true });
 
-  db = new lbug.Database(dbPath);
-  conn = new lbug.Connection(db);
+  // Retry DB creation with backoff — another process (MCP server) may hold a
+  // lock briefly during its own staleness-detection close cycle.
+  const MAX_INIT_ATTEMPTS = 5;
+  const INIT_RETRY_DELAY_MS = 2000;
 
-  for (const schemaQuery of SCHEMA_QUERIES) {
+  for (let attempt = 1; attempt <= MAX_INIT_ATTEMPTS; attempt++) {
+    // Clean up any partial state from a failed attempt
+    if (db || conn) {
+      try { if (conn) await conn.close(); } catch {}
+      try { if (db) await db.close(); } catch {}
+      conn = null;
+      db = null;
+    }
+
     try {
-      await conn.query(schemaQuery);
-    } catch (err) {
-      // Only ignore "already exists" errors - log everything else
-      const msg = err instanceof Error ? err.message : String(err);
-      if (!msg.includes('already exists')) {
-        console.warn(`⚠️ Schema creation warning: ${msg.slice(0, 120)}`);
+      db = new lbug.Database(dbPath);
+      conn = new lbug.Connection(db);
+
+      let lockError = false;
+      for (const schemaQuery of SCHEMA_QUERIES) {
+        try {
+          await conn.query(schemaQuery);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (msg.includes('already exists')) continue;
+          if (msg.includes('Could not set lock') || msg.includes('lock')) {
+            lockError = true;
+            break;
+          }
+          // Non-lock errors are still fatal — unknown failures shouldn't be swallowed
+          throw err;
+        }
       }
+
+      if (lockError) {
+        if (attempt < MAX_INIT_ATTEMPTS) {
+          console.warn(`⚠️ Database locked (attempt ${attempt}/${MAX_INIT_ATTEMPTS}), retrying in ${INIT_RETRY_DELAY_MS / 1000}s...`);
+          try { if (conn) await conn.close(); } catch {}
+          try { if (db) await db.close(); } catch {}
+          conn = null;
+          db = null;
+          await new Promise(resolve => setTimeout(resolve, INIT_RETRY_DELAY_MS * attempt));
+          continue;
+        }
+        throw new Error(`Database locked after ${MAX_INIT_ATTEMPTS} attempts. An MCP server may be holding the connection — restart it and retry.`);
+      }
+
+      // Schema created successfully
+      break;
+    } catch (err) {
+      if (attempt === MAX_INIT_ATTEMPTS) throw err;
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('Could not set lock') || msg.includes('lock')) {
+        console.warn(`⚠️ Database locked (attempt ${attempt}/${MAX_INIT_ATTEMPTS}), retrying...`);
+        await new Promise(resolve => setTimeout(resolve, INIT_RETRY_DELAY_MS * attempt));
+        continue;
+      }
+      throw err; // Non-lock errors fail immediately
     }
   }
 
@@ -597,6 +643,12 @@ export const loadCachedEmbeddings = async (): Promise<{
 
 export const closeLbug = async (): Promise<void> => {
   if (conn) {
+    // Force a WAL checkpoint so all data (including FTS indexes) is flushed
+    // to the main DB file. Without this, read-only connections (MCP server)
+    // cannot see WAL-only entries like FTS indexes.
+    try {
+      await conn.query('CHECKPOINT');
+    } catch {}
     try {
       await conn.close();
     } catch {}

@@ -83,7 +83,7 @@ function ensureIdleTimer(): void {
 /**
  * Evict the least-recently-used repo if pool is at capacity
  */
-function evictLRU(): void {
+async function evictLRU(): Promise<void> {
   if (pool.size < MAX_POOL_SIZE) return;
 
   let oldestId: string | null = null;
@@ -95,27 +95,42 @@ function evictLRU(): void {
     }
   }
   if (oldestId) {
-    closeOne(oldestId);
+    await closeOne(oldestId);
   }
 }
 
 /**
  * Remove a repo from the pool and release its shared Database ref.
+ * When refCount drops to 0, close the native Database handle to release
+ * the file lock — otherwise `gitnexus analyze` and subsequent reopens
+ * will fail with "Could not set lock on file".
  *
- * LadybugDB's native .closeSync() triggers N-API destructor hooks that
- * segfault on Linux/macOS.  Pool databases are opened read-only, so
- * there is no WAL to flush — just deleting the pool entry and letting
- * the GC (or process exit) reclaim native resources is safe.
+ * Uses async close() which works safely (unlike closeSync() which
+ * segfaults via N-API destructor hooks on Linux/macOS).
  */
-function closeOne(repoId: string): void {
+async function closeOne(repoId: string): Promise<void> {
   const entry = pool.get(repoId);
-  if (entry) {
-    const shared = dbCache.get(entry.dbPath);
-    if (shared && shared.refCount > 0) {
-      shared.refCount--;
-    }
+  if (!entry) {
+    pool.delete(repoId);
+    return;
   }
+
+  const { dbPath } = entry;
   pool.delete(repoId);
+
+  const shared = dbCache.get(dbPath);
+  if (!shared) return;
+
+  if (shared.refCount > 0) shared.refCount--;
+
+  if (shared.refCount <= 0) {
+    dbCache.delete(dbPath);
+    // Close connections and DB to release the file lock.
+    for (const conn of entry.available) {
+      try { await conn.close(); } catch {}
+    }
+    try { await shared.db.close(); } catch {}
+  }
 }
 
 /**
@@ -171,21 +186,22 @@ export const initLbug = async (repoId: string, dbPath: string): Promise<void> =>
     // Staleness check: if the DB file was rewritten since we opened it,
     // close the stale connection and re-open with fresh data.
     if (existing.openedAtMtime < currentMtime) {
-      closeOne(repoId);
+      await closeOne(repoId);
     } else {
       existing.lastUsed = Date.now();
       return;
     }
   }
 
-  evictLRU();
+  await evictLRU();
 
   // Reuse an existing native Database if another repoId already opened this path.
   // This prevents buffer manager exhaustion from multiple mmap regions on the same file.
   let shared = dbCache.get(dbPath);
   if (shared && shared.openedAtMtime < currentMtime) {
-    // DB file was rewritten — evict stale shared handle
+    // DB file was rewritten — close stale handle to release file lock
     dbCache.delete(dbPath);
+    try { await shared.db.close(); } catch {}
     shared = undefined;
   }
   if (!shared) {
@@ -334,7 +350,7 @@ async function recoverFromWalCorruption(repoId: string, err: Error): Promise<boo
   if (!entry) return false;
 
   const { dbPath } = entry;
-  closeOne(repoId);
+  await closeOne(repoId);
   try { await fs.unlink(`${dbPath}.wal`); } catch {}
   try {
     await initLbug(repoId, dbPath);
@@ -415,12 +431,12 @@ export const executeParameterized = async (
  */
 export const closeLbug = async (repoId?: string): Promise<void> => {
   if (repoId) {
-    closeOne(repoId);
+    await closeOne(repoId);
     return;
   }
 
   for (const id of [...pool.keys()]) {
-    closeOne(id);
+    await closeOne(id);
   }
 
   if (idleTimer) {

@@ -21,6 +21,7 @@ import {
   ListResourceTemplatesRequestSchema,
   ListPromptsRequestSchema,
   GetPromptRequestSchema,
+  RootsListChangedNotificationSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { GITNEXUS_TOOLS } from './tools.js';
 import type { LocalBackend } from './local/local-backend.js';
@@ -82,6 +83,19 @@ function getNextStepHint(toolName: string, args: Record<string, any> | undefined
  * Create a configured MCP Server with all handlers registered.
  * Transport-agnostic — caller connects the desired transport.
  */
+/**
+ * Fetch client workspace roots and pass them to the backend for repo auto-detection.
+ * Silently no-ops if the client doesn't support roots.
+ */
+async function syncClientRoots(server: Server, backend: LocalBackend): Promise<void> {
+  try {
+    const { roots } = await server.listRoots();
+    backend.setClientRoots(roots.map((r) => r.uri));
+  } catch {
+    // Client doesn't support roots — that's fine, fall back to process.cwd()
+  }
+}
+
 export function createMCPServer(backend: LocalBackend): Server {
   const server = new Server(
     {
@@ -96,6 +110,15 @@ export function createMCPServer(backend: LocalBackend): Server {
       },
     }
   );
+
+  // Sync client workspace roots for repo auto-detection.
+  // oninitialized fires after the client handshake completes — listRoots() is safe to call.
+  server.oninitialized = () => { syncClientRoots(server, backend); };
+
+  // Re-sync when the client reports changed roots (e.g. user switched project)
+  server.setNotificationHandler(RootsListChangedNotificationSchema, async () => {
+    await syncClientRoots(server, backend);
+  });
 
   // Handle list resources request
   server.setRequestHandler(ListResourcesRequestSchema, async () => {

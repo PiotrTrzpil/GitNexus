@@ -23,7 +23,7 @@ async function queryFTSViaExecutor(
   indexName: string,
   query: string,
   limit: number,
-): Promise<Array<{ filePath: string; score: number }>> {
+): Promise<{ results: Array<{ filePath: string; score: number }>; error?: string }> {
   // Escape single quotes and backslashes to prevent Cypher injection
   const escapedQuery = query.replace(/\\/g, '\\\\').replace(/'/g, "''");
   const cypher = `
@@ -34,16 +34,19 @@ async function queryFTSViaExecutor(
   `;
   try {
     const rows = await executor(cypher);
-    return rows.map((row: any) => {
-      const node = row.node || row[0] || {};
-      const score = row.score ?? row[1] ?? 0;
-      return {
-        filePath: node.filePath || '',
-        score: typeof score === 'number' ? score : parseFloat(score) || 0,
-      };
-    });
-  } catch {
-    return [];
+    return {
+      results: rows.map((row: any) => {
+        const node = row.node || row[0] || {};
+        const score = row.score ?? row[1] ?? 0;
+        return {
+          filePath: node.filePath || '',
+          score: typeof score === 'number' ? score : parseFloat(score) || 0,
+        };
+      }),
+    };
+  } catch (e: any) {
+    const msg = e?.message || String(e);
+    return { results: [], error: `FTS query on ${tableName}/${indexName} failed: ${msg}` };
   }
 }
 
@@ -58,33 +61,48 @@ async function queryFTSViaExecutor(
  * @param repoId - If provided, queries will be routed via the MCP connection pool
  * @returns Ranked search results from FTS indexes
  */
-export const searchFTSFromLbug = async (query: string, limit: number = 20, repoId?: string): Promise<BM25SearchResult[]> => {
-  let fileResults: any[], functionResults: any[], classResults: any[], methodResults: any[], interfaceResults: any[];
+export interface FTSSearchOutput {
+  results: BM25SearchResult[];
+  warnings: string[];
+}
+
+export const searchFTSFromLbug = async (
+  query: string, limit: number = 20, repoId?: string,
+): Promise<FTSSearchOutput> => {
+  const warnings: string[] = [];
+
+  const tables: Array<{ table: string; index: string }> = [
+    { table: 'File', index: 'file_fts' },
+    { table: 'Function', index: 'function_fts' },
+    { table: 'Class', index: 'class_fts' },
+    { table: 'Method', index: 'method_fts' },
+    { table: 'Interface', index: 'interface_fts' },
+  ];
+
+  const allResults: Array<{ filePath: string; score: number }>[] = [];
 
   if (repoId) {
-    // Use MCP connection pool via dynamic import
-    // IMPORTANT: FTS queries run sequentially to avoid connection contention.
-    // The MCP pool supports multiple connections, but FTS is best run serially.
     const { executeQuery } = await import('../../mcp/core/lbug-adapter.js');
     const executor = (cypher: string) => executeQuery(repoId, cypher);
-    fileResults = await queryFTSViaExecutor(executor, 'File', 'file_fts', query, limit);
-    functionResults = await queryFTSViaExecutor(executor, 'Function', 'function_fts', query, limit);
-    classResults = await queryFTSViaExecutor(executor, 'Class', 'class_fts', query, limit);
-    methodResults = await queryFTSViaExecutor(executor, 'Method', 'method_fts', query, limit);
-    interfaceResults = await queryFTSViaExecutor(executor, 'Interface', 'interface_fts', query, limit);
+    for (const { table, index } of tables) {
+      const out = await queryFTSViaExecutor(executor, table, index, query, limit);
+      allResults.push(out.results);
+      if (out.error) warnings.push(out.error);
+    }
   } else {
-    // Use core lbug adapter (CLI / pipeline context) — also sequential for safety
-    fileResults = await queryFTS('File', 'file_fts', query, limit, false).catch(() => []);
-    functionResults = await queryFTS('Function', 'function_fts', query, limit, false).catch(() => []);
-    classResults = await queryFTS('Class', 'class_fts', query, limit, false).catch(() => []);
-    methodResults = await queryFTS('Method', 'method_fts', query, limit, false).catch(() => []);
-    interfaceResults = await queryFTS('Interface', 'interface_fts', query, limit, false).catch(() => []);
+    for (const { table, index } of tables) {
+      try {
+        allResults.push(await queryFTS(table, index, query, limit, false));
+      } catch (e: any) {
+        allResults.push([]);
+        warnings.push(`FTS query on ${table}/${index} failed: ${e?.message || e}`);
+      }
+    }
   }
-  
+
   // Merge results by filePath, summing scores for same file
   const merged = new Map<string, { filePath: string; score: number }>();
-  
-  const addResults = (results: any[]) => {
+  for (const results of allResults) {
     for (const r of results) {
       const existing = merged.get(r.filePath);
       if (existing) {
@@ -93,22 +111,19 @@ export const searchFTSFromLbug = async (query: string, limit: number = 20, repoI
         merged.set(r.filePath, { filePath: r.filePath, score: r.score });
       }
     }
-  };
-  
-  addResults(fileResults);
-  addResults(functionResults);
-  addResults(classResults);
-  addResults(methodResults);
-  addResults(interfaceResults);
-  
+  }
+
   // Sort by score descending and add rank
   const sorted = Array.from(merged.values())
     .sort((a, b) => b.score - a.score)
     .slice(0, limit);
-  
-  return sorted.map((r, index) => ({
-    filePath: r.filePath,
-    score: r.score,
-    rank: index + 1,
-  }));
+
+  return {
+    results: sorted.map((r, index) => ({
+      filePath: r.filePath,
+      score: r.score,
+      rank: index + 1,
+    })),
+    warnings,
+  };
 };

@@ -3,21 +3,24 @@ import { searchFTSFromLbug, type BM25SearchResult } from '../../src/core/search/
 
 describe('BM25 search', () => {
   describe('searchFTSFromLbug', () => {
-    it('returns empty array when LadybugDB is not initialized', async () => {
-      // Without LadybugDB init, search should return empty (not crash)
-      const results = await searchFTSFromLbug('test query');
-      expect(Array.isArray(results)).toBe(true);
-      expect(results).toHaveLength(0);
+    it('returns empty results with warnings when LadybugDB is not initialized', async () => {
+      // Without LadybugDB init, search should return empty results with warnings (not crash)
+      const output = await searchFTSFromLbug('test query');
+      expect(Array.isArray(output.results)).toBe(true);
+      expect(output.results).toHaveLength(0);
+      expect(Array.isArray(output.warnings)).toBe(true);
+      // Should have warnings since FTS queries fail without init
+      expect(output.warnings.length).toBeGreaterThan(0);
     });
 
     it('handles empty query', async () => {
-      const results = await searchFTSFromLbug('');
-      expect(Array.isArray(results)).toBe(true);
+      const output = await searchFTSFromLbug('');
+      expect(Array.isArray(output.results)).toBe(true);
     });
 
     it('accepts custom limit parameter', async () => {
-      const results = await searchFTSFromLbug('test', 5);
-      expect(Array.isArray(results)).toBe(true);
+      const output = await searchFTSFromLbug('test', 5);
+      expect(Array.isArray(output.results)).toBe(true);
     });
   });
 

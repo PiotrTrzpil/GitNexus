@@ -104,10 +104,10 @@ export async function augment(pattern: string, cwd?: string): Promise<string> {
     }
 
     // Step 1: BM25 search (fast, no embeddings)
-    const bm25Results = await searchFTSFromLbug(pattern, 10, repoId);
-    
-    if (bm25Results.length === 0) return '';
-    
+    const bm25Output = await searchFTSFromLbug(pattern, 10, repoId);
+
+    if (bm25Output.results.length === 0) return '';
+
     // Step 2: Map BM25 file results to symbols
     const symbolMatches: Array<{
       nodeId: string;
@@ -116,8 +116,8 @@ export async function augment(pattern: string, cwd?: string): Promise<string> {
       filePath: string;
       score: number;
     }> = [];
-    
-    for (const result of bm25Results.slice(0, 5)) {
+
+    for (const result of bm25Output.results.slice(0, 5)) {
       const escaped = result.filePath.replace(/'/g, "''");
       try {
         const symbols = await executeQuery(repoId, `
