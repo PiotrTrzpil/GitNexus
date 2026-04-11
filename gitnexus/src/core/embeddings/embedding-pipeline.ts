@@ -222,24 +222,27 @@ export const runEmbeddingPipeline = async (
       totalBatches,
     });
 
+    // Pipeline: overlap DB writes with next batch's inference
+    let pendingWrite: Promise<void> | null = null;
+
     for (let batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
       const start = batchIndex * batchSize;
       const end = Math.min(start + batchSize, totalNodes);
       const batch = nodes.slice(start, end);
 
-      // Generate texts for this batch
+      // Generate texts and embed
       const texts = generateBatchEmbeddingTexts(batch, finalConfig);
-
-      // Embed the batch
       const embeddings = await embedBatch(texts);
 
-      // Update LadybugDB with embeddings
+      // Wait for previous batch's DB write before starting the next one
+      if (pendingWrite) await pendingWrite;
+
+      // Start DB write (runs in background while next batch embeds)
       const updates = batch.map((node, i) => ({
         id: node.id,
         embedding: embeddingToArray(embeddings[i]),
       }));
-
-      await batchInsertEmbeddings(executeWithReusedStatement, updates);
+      pendingWrite = batchInsertEmbeddings(executeWithReusedStatement, updates);
 
       processedNodes += batch.length;
 
@@ -254,6 +257,9 @@ export const runEmbeddingPipeline = async (
         totalBatches,
       });
     }
+
+    // Wait for final batch's DB write
+    if (pendingWrite) await pendingWrite;
 
     // Phase 4: Create vector index
     onProgress({

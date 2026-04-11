@@ -59,8 +59,8 @@ export interface EmbeddingConfig {
   batchSize: number;
   /** Embedding vector dimensions */
   dimensions: number;
-  /** Device to use for inference: 'auto' tries GPU first (DirectML on Windows, CUDA on Linux), falls back to CPU */
-  device: 'auto' | 'dml' | 'cuda' | 'cpu' | 'wasm';
+  /** Device to use for inference: 'auto' tries GPU first (DirectML on Windows, CUDA on Linux, CoreML on macOS), falls back to CPU */
+  device: 'auto' | 'dml' | 'cuda' | 'coreml' | 'cpu' | 'wasm';
   /** Maximum characters of code snippet to include */
   maxSnippetLength: number;
 }
@@ -72,7 +72,7 @@ export interface EmbeddingConfig {
  */
 export const DEFAULT_EMBEDDING_CONFIG: EmbeddingConfig = {
   modelId: 'Snowflake/snowflake-arctic-embed-xs',
-  batchSize: 16,
+  batchSize: 64,
   dimensions: 384,
   device: 'auto',
   maxSnippetLength: 500,

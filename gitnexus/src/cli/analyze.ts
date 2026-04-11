@@ -53,7 +53,7 @@ export interface AnalyzeOptions {
 }
 
 /** Threshold: auto-skip embeddings for repos with more nodes than this */
-const EMBEDDING_NODE_LIMIT = 50_000;
+const EMBEDDING_NODE_LIMIT = 200_000;
 
 const PHASE_LABELS: Record<string, string> = {
   extracting: 'Scanning files',
@@ -137,8 +137,34 @@ export const analyzeCommand = async (
       console.log('  Index metadata incomplete — rebuilding...\n');
       needsFullRebuild = true;
     } else {
-      console.log('  Already up to date\n');
-      return;
+      // Verify FTS indexes are actually present in the DB before skipping rebuild.
+      // Open read-only to avoid lock conflicts with the MCP server.
+      let ftsIntact = false;
+      try {
+        const lbugMod = await import('@ladybugdb/core');
+        const testDb = new lbugMod.default.Database(lbugPath, 0, false, true);
+        const testConn = new lbugMod.default.Connection(testDb);
+        try {
+          await testConn.query('LOAD EXTENSION fts');
+          await testConn.query(
+            `CALL QUERY_FTS_INDEX('File', 'file_fts', 'test', conjunctive := false) RETURN node LIMIT 1`,
+          );
+          ftsIntact = true;
+        } finally {
+          try { await testConn.close(); } catch {}
+          try { await testDb.close(); } catch {}
+        }
+      } catch {
+        // FTS index missing, broken, or DB locked
+      }
+
+      if (!ftsIntact) {
+        console.log('  FTS search indexes missing — rebuilding...\n');
+        needsFullRebuild = true;
+      } else {
+        console.log('  Already up to date\n');
+        return;
+      }
     }
   }
 
@@ -293,6 +319,12 @@ export const analyzeCommand = async (
   }
   const ftsTime = ((Date.now() - t0Fts) / 1000).toFixed(1);
 
+  // Flush FTS indexes to the main DB file immediately. Without this,
+  // FTS data lives only in the WAL — if the process crashes later
+  // (e.g. ONNX Runtime's native cleanup during exit), the MCP server
+  // will auto-delete the corrupted WAL and lose the indexes.
+  try { await executeQuery('CHECKPOINT'); } catch {}
+
   // ── Phase 3.5: Re-insert cached embeddings ────────────────────────
   if (cachedEmbeddings.length > 0) {
     updateBar(88, `Restoring ${cachedEmbeddings.length} cached embeddings...`);
@@ -339,6 +371,9 @@ export const analyzeCommand = async (
       cachedEmbeddingNodeIds.size > 0 ? cachedEmbeddingNodeIds : undefined,
     );
     embeddingTime = ((Date.now() - t0Emb) / 1000).toFixed(1);
+
+    // Flush embeddings to main DB file before the crash-prone exit
+    try { await executeQuery('CHECKPOINT'); } catch {}
   }
 
   // ── Phase 5: Finalize (98–100%) ───────────────────────────────────
@@ -397,9 +432,11 @@ export const analyzeCommand = async (
   }, generatedSkills);
 
   await closeLbug();
-  // Note: we intentionally do NOT call disposeEmbedder() here.
-  // ONNX Runtime's native cleanup segfaults on macOS and some Linux configs.
-  // Since the process exits immediately after, Node.js reclaims everything.
+
+  // Remove any WAL file left after close. ONNX Runtime's native atexit hooks
+  // can crash the process, and if a WAL exists at that point the crash corrupts
+  // it — making the DB unopenable until the WAL is manually deleted.
+  try { await fs.rm(`${lbugPath}.wal`, { force: true }); } catch {}
 
   const totalTime = ((Date.now() - t0Global) / 1000).toFixed(1);
 
@@ -442,7 +479,8 @@ export const analyzeCommand = async (
   console.log('');
 
   // LadybugDB's native module holds open handles that prevent Node from exiting.
-  // ONNX Runtime also registers native atexit hooks that segfault on some
-  // platforms (#38, #40). Force-exit to ensure clean termination.
-  process.exit(0);
+  // ONNX Runtime also registers native atexit hooks that crash via C++ mutex
+  // errors on macOS/Linux (#38, #40). Use _exit to skip atexit handlers entirely
+  // — all data is already checkpointed and the DB is closed.
+  (process as any)._exit(0);
 };

@@ -57,7 +57,7 @@ function isCudaAvailable(): boolean {
 let embedderInstance: FeatureExtractionPipeline | null = null;
 let isInitializing = false;
 let initPromise: Promise<FeatureExtractionPipeline> | null = null;
-let currentDevice: 'dml' | 'cuda' | 'cpu' | 'wasm' | null = null;
+let currentDevice: 'dml' | 'cuda' | 'coreml' | 'cpu' | 'wasm' | null = null;
 
 /**
  * Progress callback type for model loading
@@ -67,7 +67,7 @@ export type ModelProgressCallback = (progress: ModelProgress) => void;
 /**
  * Get the current device being used for inference
  */
-export const getCurrentDevice = (): 'dml' | 'cuda' | 'cpu' | 'wasm' | null => currentDevice;
+export const getCurrentDevice = (): 'dml' | 'cuda' | 'coreml' | 'cpu' | 'wasm' | null => currentDevice;
 
 /**
  * Initialize the embedding model
@@ -81,7 +81,7 @@ export const getCurrentDevice = (): 'dml' | 'cuda' | 'cpu' | 'wasm' | null => cu
 export const initEmbedder = async (
   onProgress?: ModelProgressCallback,
   config: Partial<EmbeddingConfig> = {},
-  forceDevice?: 'dml' | 'cuda' | 'cpu' | 'wasm'
+  forceDevice?: 'dml' | 'cuda' | 'coreml' | 'cpu' | 'wasm'
 ): Promise<FeatureExtractionPipeline> => {
   // Return existing instance if available
   if (embedderInstance) {
@@ -101,6 +101,9 @@ export const initEmbedder = async (
   // Probe for CUDA first — ONNX Runtime crashes (uncatchable native error)
   // if we attempt CUDA without the required shared libraries
   const isWindows = process.platform === 'win32';
+  // CoreML adds overhead (model compilation, ANE dispatch) that makes it slower
+  // than CPU for small models like snowflake-arctic-embed-xs (22M params).
+  // Only use GPU acceleration on platforms where it's a net win.
   const gpuDevice = isWindows ? 'dml' : (isCudaAvailable() ? 'cuda' : 'cpu');
   let requestedDevice = forceDevice || (finalConfig.device === 'auto' ? gpuDevice : finalConfig.device);
 
@@ -125,11 +128,11 @@ export const initEmbedder = async (
         onProgress(progress);
       } : undefined;
 
-      // Try GPU first if auto, fall back to CPU
-      // Windows: dml (DirectML/DirectX12), Linux: cuda
-      const devicesToTry: Array<'dml' | 'cuda' | 'cpu' | 'wasm'> = 
-        (requestedDevice === 'dml' || requestedDevice === 'cuda') 
-          ? [requestedDevice, 'cpu'] 
+      // Try GPU/accelerator first if auto, fall back to CPU
+      // Windows: dml (DirectML/DirectX12), Linux: cuda, macOS: coreml (Metal/ANE)
+      const devicesToTry: Array<'dml' | 'cuda' | 'coreml' | 'cpu' | 'wasm'> =
+        (requestedDevice === 'dml' || requestedDevice === 'cuda' || requestedDevice === 'coreml')
+          ? [requestedDevice, 'cpu']
           : [requestedDevice as 'cpu' | 'wasm'];
 
       for (const device of devicesToTry) {
@@ -138,6 +141,8 @@ export const initEmbedder = async (
             console.log('🔧 Trying DirectML (DirectX12) GPU backend...');
           } else if (isDev && device === 'cuda') {
             console.log('🔧 Trying CUDA GPU backend...');
+          } else if (isDev && device === 'coreml') {
+            console.log('🔧 Trying CoreML (Metal/ANE) backend...');
           } else if (isDev && device === 'cpu') {
             console.log('🔧 Using CPU backend...');
           } else if (isDev && device === 'wasm') {
@@ -146,13 +151,17 @@ export const initEmbedder = async (
 
           // Build pipeline options - force CPU providers when using CPU device to avoid
           // CUDA provider bridge crash (#288). When using GPU, let ONNX pick the provider.
+          // CoreML is not a recognized transformers.js device, so we pass it via
+          // executionProviders and set device to 'cpu' to satisfy the framework.
           const pipelineOptions: any = {
-            device: device,
+            device: device === 'coreml' ? 'cpu' : device,
             dtype: 'fp32',
             progress_callback: progressCallback,
             session_options: { logSeverityLevel: 3 },
           };
-          if (device === 'cpu' || device === 'wasm') {
+          if (device === 'coreml') {
+            pipelineOptions.session_options.executionProviders = ['coreml', 'cpu'];
+          } else if (device === 'cpu' || device === 'wasm') {
             pipelineOptions.executionProviders = ['cpu'];
           }
 
@@ -164,8 +173,9 @@ export const initEmbedder = async (
           currentDevice = device;
 
           if (isDev) {
-            const label = device === 'dml' ? 'GPU (DirectML/DirectX12)' 
-                        : device === 'cuda' ? 'GPU (CUDA)' 
+            const label = device === 'dml' ? 'GPU (DirectML/DirectX12)'
+                        : device === 'cuda' ? 'GPU (CUDA)'
+                        : device === 'coreml' ? 'GPU (CoreML/Metal)'
                         : device.toUpperCase();
             console.log(`✅ Using ${label} backend`);
             console.log('✅ Embedding model loaded successfully');
@@ -173,8 +183,8 @@ export const initEmbedder = async (
 
           return embedderInstance!;
         } catch (deviceError) {
-          if (isDev && (device === 'cuda' || device === 'dml')) {
-            const gpuType = device === 'dml' ? 'DirectML' : 'CUDA';
+          if (isDev && (device === 'cuda' || device === 'dml' || device === 'coreml')) {
+            const gpuType = device === 'dml' ? 'DirectML' : device === 'coreml' ? 'CoreML' : 'CUDA';
             console.log(`⚠️  ${gpuType} not available, falling back to CPU...`);
           }
           // Continue to next device in list
