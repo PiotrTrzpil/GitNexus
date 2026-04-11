@@ -108,6 +108,50 @@ export const TYPESCRIPT_QUERIES = `
       name: (identifier) @name
       value: (_)))) @definition.const
 
+; Abstract class declarations: abstract class Foo { ... }
+(abstract_class_declaration
+  name: (type_identifier) @name) @definition.class
+
+; Type alias declarations: type Foo = { ... }
+(type_alias_declaration
+  name: (type_identifier) @name) @definition.type
+
+; Enum declarations: enum Direction { ... }
+(enum_declaration
+  name: (identifier) @name) @definition.enum
+
+; Class field declarations: class Foo { bar: string; baz = 42; }
+(public_field_definition
+  name: (property_identifier) @name) @definition.property
+
+; Private class field declarations: class Foo { #secret: string; }
+(public_field_definition
+  name: (private_property_identifier) @name) @definition.property
+
+; Interface property signatures: interface Foo { bar: string; }
+(property_signature
+  name: (property_identifier) @name) @definition.property
+
+; Interface method signatures: interface Foo { bar(): void; }
+(method_signature
+  name: (property_identifier) @name) @definition.method
+
+; Abstract method signatures: abstract class Foo { abstract bar(): void; }
+(abstract_method_signature
+  name: (property_identifier) @name) @definition.method
+
+; Enum members with values: enum Foo { Bar = 1 }
+(enum_assignment
+  name: (property_identifier) @name) @definition.property
+
+; Bare enum members without values: enum Foo { Bar, Baz }
+(enum_body
+  name: (property_identifier) @name @definition.property)
+
+; Ambient function declarations: declare function foo(): void; / overload signatures
+(function_signature
+  name: (identifier) @name) @definition.function
+
 ; Error throws: throw new Error("message")
 (throw_statement
   (new_expression

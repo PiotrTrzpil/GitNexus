@@ -263,6 +263,7 @@ export const isBuiltInOrNoise = (name: string): boolean => BUILT_IN_NAMES.has(na
 export const CLASS_CONTAINER_TYPES = new Set([
   'class_declaration', 'abstract_class_declaration',
   'interface_declaration', 'struct_declaration', 'record_declaration',
+  'type_alias_declaration', 'enum_declaration',
   'class_specifier', 'struct_specifier',
   'impl_item', 'trait_item',
   'class_definition',
@@ -288,6 +289,8 @@ export const CONTAINER_TYPE_TO_LABEL: Record<string, string> = {
   trait_item: 'Trait',
   trait_declaration: 'Trait',
   record_declaration: 'Record',
+  type_alias_declaration: 'TypeAlias',
+  enum_declaration: 'Enum',
   protocol_declaration: 'Interface',
   class: 'Class',
   module: 'Module',
