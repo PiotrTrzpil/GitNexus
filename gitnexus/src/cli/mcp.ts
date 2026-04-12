@@ -10,16 +10,41 @@ import { startMCPServer } from '../mcp/server.js';
 import { LocalBackend } from '../mcp/local/local-backend.js';
 
 export const mcpCommand = async () => {
+  // Import logger for crash diagnostics
+  const { mcpLogger } = await import('../util/logger.js');
+
+  // Log startup
+  mcpLogger.info('MCP server starting');
+
   // Prevent unhandled errors from crashing the MCP server process.
   // LadybugDB lock conflicts and transient errors should degrade gracefully.
   process.on('uncaughtException', (err) => {
-    console.error(`GitNexus MCP: uncaught exception — ${err.message}`);
+    mcpLogger.fatal({ err }, 'Uncaught exception — exiting');
+    console.error(`GitNexus MCP: uncaught exception — ${err.message}\n${err.stack}`);
     // Process is in an undefined state after uncaughtException — exit after flushing
     setTimeout(() => process.exit(1), 100);
   });
   process.on('unhandledRejection', (reason) => {
-    const msg = reason instanceof Error ? reason.message : String(reason);
-    console.error(`GitNexus MCP: unhandled rejection — ${msg}`);
+    const err = reason instanceof Error ? reason : new Error(String(reason));
+    mcpLogger.error({ err }, 'Unhandled rejection');
+    console.error(`GitNexus MCP: unhandled rejection — ${err.message}`);
+  });
+
+  // Log ALL signals for crash tracking
+  const signals = ['SIGTERM', 'SIGINT', 'SIGHUP', 'SIGABRT', 'SIGSEGV', 'SIGBUS', 'SIGILL', 'SIGFPE'];
+  for (const sig of signals) {
+    process.on(sig, () => {
+      // Sync write to stderr - logger may not flush
+      try { require('fs').writeSync(2, `\n[MCP CRASH] Received ${sig}\n`); } catch {}
+      mcpLogger.fatal(`Received ${sig}, shutting down`);
+      mcpLogger.flush();
+      process.exit(128 + (signals.indexOf(sig) + 1));
+    });
+  }
+
+  // Log process exit
+  process.on('exit', (code) => {
+    try { require('fs').writeSync(2, `[MCP] Process exiting with code ${code}\n`); } catch {}
   });
 
   // Initialize multi-repo backend from registry.

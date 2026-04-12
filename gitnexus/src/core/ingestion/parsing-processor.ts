@@ -161,18 +161,14 @@ const processParsingSequential = async (
     // Skip files larger than the max tree-sitter buffer (32 MB)
     if (file.content.length > TREE_SITTER_MAX_BUFFER) continue;
 
-    try {
-      await loadLanguage(language, file.path);
-    } catch {
-      continue;  // parser unavailable — safety net
-    }
+    await loadLanguage(language, file.path);
 
     let tree;
     try {
       tree = parser.parse(file.content, undefined, { bufferSize: getTreeSitterBufferSize(file.content.length) });
     } catch (parseError) {
-      console.warn(`Skipping unparseable file: ${file.path}`);
-      continue;
+      const msg = parseError instanceof Error ? parseError.message : String(parseError);
+      throw new Error(`Failed to parse ${file.path}: ${msg}`);
     }
 
     astCache.set(file.path, tree);
@@ -182,16 +178,9 @@ const processParsingSequential = async (
       continue;
     }
 
-    let query;
-    let matches;
-    try {
-      const language = parser.getLanguage();
-      query = new Parser.Query(language, queryString);
-      matches = query.matches(tree.rootNode);
-    } catch (queryError) {
-      console.warn(`Query error for ${file.path}:`, queryError);
-      continue;
-    }
+    const tsLanguage = parser.getLanguage();
+    const query = new Parser.Query(tsLanguage, queryString);
+    const matches = query.matches(tree.rootNode);
 
     matches.forEach(match => {
       const captureMap: Record<string, any> = {};
@@ -240,8 +229,17 @@ const processParsingSequential = async (
       else if (captureMap['definition.template']) nodeLabel = 'Template';
 
       const definitionNodeForRange = getDefinitionNodeFromCaptures(captureMap);
-      const startLine = definitionNodeForRange ? definitionNodeForRange.startPosition.row : (nameNode ? nameNode.startPosition.row : 0);
-      const nodeId = generateId(nodeLabel, `${file.path}:${nodeName}`);
+      // tree-sitter rows are 0-indexed; we store 1-based line numbers for UI/tool compatibility
+      const startLine = definitionNodeForRange ? definitionNodeForRange.startPosition.row + 1 : (nameNode ? nameNode.startPosition.row + 1 : 1);
+
+      // Compute enclosing class for Method/Constructor/Property/Function — needed for unique IDs
+      // and HAS_METHOD edges. Function is included because Kotlin/Rust/Python capture class methods
+      // as Function nodes. Without this, same-named members in different classes collide.
+      const needsOwner = nodeLabel === 'Method' || nodeLabel === 'Constructor' || nodeLabel === 'Property' || nodeLabel === 'Function';
+      const enclosingClassId = needsOwner ? findEnclosingClassId(nameNode || definitionNodeForRange, file.path) : null;
+      const className = enclosingClassId ? enclosingClassId.split(':').pop()! : undefined;
+      const qualifiedName = className ? `${className}.${nodeName}` : nodeName;
+      const nodeId = generateId(nodeLabel, `${file.path}:${qualifiedName}`);
 
       const definitionNode = getDefinitionNodeFromCaptures(captureMap);
       const frameworkHint = definitionNode
@@ -270,8 +268,8 @@ const processParsingSequential = async (
         properties: {
           name: nodeName,
           filePath: file.path,
-          startLine: definitionNodeForRange ? definitionNodeForRange.startPosition.row : startLine,
-          endLine: definitionNodeForRange ? definitionNodeForRange.endPosition.row : startLine,
+          startLine: definitionNodeForRange ? definitionNodeForRange.startPosition.row + 1 : startLine,
+          endLine: definitionNodeForRange ? definitionNodeForRange.endPosition.row + 1 : startLine,
           startColumn: nodeStartColumn,
           endColumn: nodeEndColumn,
           language: language,
@@ -284,15 +282,11 @@ const processParsingSequential = async (
             parameterCount: methodSig.parameterCount,
             returnType: methodSig.returnType,
           } : {}),
+          ...(className ? { className } : {}),
         },
       };
 
       graph.addNode(node);
-
-      // Compute enclosing class for Method/Constructor/Property/Function — used for both ownerId and HAS_METHOD
-      // Function is included because Kotlin/Rust/Python capture class methods as Function nodes
-      const needsOwner = nodeLabel === 'Method' || nodeLabel === 'Constructor' || nodeLabel === 'Property' || nodeLabel === 'Function';
-      const enclosingClassId = needsOwner ? findEnclosingClassId(nameNode || definitionNodeForRange, file.path) : null;
 
       symbolTable.add(file.path, nodeName, nodeId, nodeLabel, {
         parameterCount: methodSig?.parameterCount,

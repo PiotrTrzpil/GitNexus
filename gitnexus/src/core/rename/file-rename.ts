@@ -12,6 +12,7 @@
 import * as path from 'path';
 import * as fs from 'fs/promises';
 import { findTsConfig, isTypeScriptFile } from './ts-morph-rename.js';
+import { renameLogger } from '../../util/logger.js';
 
 export interface FileRenameEdit {
   filePath: string;
@@ -48,17 +49,20 @@ export async function fileRename(opts: {
   // Validate source exists and is a file
   const stat = await fs.stat(absoluteOldFile);
   if (!stat.isFile()) {
+    renameLogger.error({ oldFile }, 'Source is not a file');
     throw new Error(`${oldFile} is not a file`);
   }
 
   // Validate target doesn't already exist
   try {
     await fs.access(absoluteNewFile);
+    renameLogger.error({ newFile }, 'Target file already exists');
     throw new Error(`Target file ${newFile} already exists`);
   } catch (e) {
     if (e instanceof Error && 'code' in e && (e as NodeJS.ErrnoException).code === 'ENOENT') {
       // Good — target doesn't exist
     } else {
+      renameLogger.error({ err: e, newFile }, 'Error checking target file');
       throw e;
     }
   }
@@ -74,20 +78,26 @@ export async function fileRename(opts: {
 
     const tsConfigPath = await findTsConfig(repoPath, absoluteOldFile);
 
+    // Use skipAddingFilesFromTsConfig to avoid eagerly loading ALL project files synchronously.
+    // Then manually add files via addSourceFilesAtPaths which gives us the same result but
+    // allows the event loop to tick between file parses, making timeouts actually work.
     const project = tsConfigPath
-      ? new Project({ tsConfigFilePath: tsConfigPath })
+      ? new Project({
+          tsConfigFilePath: tsConfigPath,
+          skipAddingFilesFromTsConfig: true,
+        })
       : new Project({
           compilerOptions: { allowJs: true, checkJs: false, noEmit: true },
         });
 
-    // Add source files if no tsconfig
-    if (!tsConfigPath) {
-      project.addSourceFilesAtPaths([
-        path.join(repoPath, 'src/**/*.{ts,tsx,js,jsx,mts,cts,mjs,cjs}'),
-        path.join(repoPath, 'lib/**/*.{ts,tsx,js,jsx,mts,cts,mjs,cjs}'),
-        path.join(repoPath, '*.{ts,tsx,js,jsx,mts,cts,mjs,cjs}'),
-      ]);
-    }
+    // Add source files explicitly - this is needed for sf.move() to update import paths.
+    // Using addSourceFilesAtPaths instead of letting ts-morph load from tsconfig because
+    // the former parses files incrementally while the latter does it all synchronously.
+    project.addSourceFilesAtPaths([
+      path.join(repoPath, 'src/**/*.{ts,tsx,js,jsx,mts,cts,mjs,cjs}'),
+      path.join(repoPath, 'lib/**/*.{ts,tsx,js,jsx,mts,cts,mjs,cjs}'),
+      path.join(repoPath, '*.{ts,tsx,js,jsx,mts,cts,mjs,cjs}'),
+    ]);
 
     // Ensure the file is loaded
     if (!project.getSourceFile(absoluteOldFile)) {

@@ -136,8 +136,9 @@ export function routeRubyCall(calledName: string, callNode: any): RubyCallRoutin
         items.push({
           propName: arg.text.startsWith(':') ? arg.text.slice(1) : arg.text,
           accessorType: calledName as RubyAccessorType,
-          startLine: arg.startPosition.row,
-          endLine: arg.endPosition.row,
+          // tree-sitter rows are 0-indexed; we store 1-based line numbers
+          startLine: arg.startPosition.row + 1,
+          endLine: arg.endPosition.row + 1,
         });
       }
     }

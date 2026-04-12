@@ -11,9 +11,42 @@ import { executeParameterized } from '../core/lbug-adapter.js';
 const NODE_SELECT = `
   RETURN n.id AS qn, n.name AS name, labels(n)[0] AS label,
          n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine,
-         n.description AS description
+         n.startColumn AS startColumn, n.description AS description
   LIMIT 10
 `;
+
+/**
+ * Symbol kind priority for disambiguation.
+ * Lower number = higher priority.
+ * Type definitions and their members are preferred over local variables/parameters.
+ */
+const KIND_PRIORITY: Record<string, number> = {
+  Interface: 1,
+  TypeAlias: 1,
+  Class: 1,
+  Enum: 1,
+  Property: 2,
+  Field: 2,
+  EnumMember: 2,
+  Function: 3,
+  Method: 3,
+  Variable: 4,
+  Parameter: 5,
+};
+const DEFAULT_PRIORITY = 6;
+
+/** Sort symbol rows by kind priority, then by file path */
+export function sortByKindPriority<T extends { label?: string; filePath?: string }>(rows: T[]): T[] {
+  return rows.sort((a, b) => {
+    const aLabel = a.label ?? '';
+    const bLabel = b.label ?? '';
+    const aPriority = KIND_PRIORITY[aLabel] ?? DEFAULT_PRIORITY;
+    const bPriority = KIND_PRIORITY[bLabel] ?? DEFAULT_PRIORITY;
+    if (aPriority !== bPriority) return aPriority - bPriority;
+    // Secondary sort by file path for stability
+    return (a.filePath ?? '').localeCompare(b.filePath ?? '');
+  });
+}
 
 /** Fuzzy suggestion row shape */
 export interface SymbolSuggestion {
@@ -31,6 +64,7 @@ export interface ResolvedSymbol {
   filePath: string;
   startLine: number;
   endLine: number;
+  startColumn?: number;
   description?: string;
 }
 
@@ -69,12 +103,13 @@ function labelFromQn(qn: string): string {
 }
 
 /**
- * 4-tier symbol lookup.
+ * 5-tier symbol lookup.
  *
  * Tier 1 — exact QN (`n.id = qn`)
- * Tier 2 — QN suffix (`n.id ENDS WITH .qn`)
- * Tier 3 — name match (`n.name = qn`)
- * Tier 4 — fuzzy: `n.name CONTAINS fragment`, returns suggestions only (no node)
+ * Tier 2 — dotted syntax: `Parent.child` → QN suffix `:Parent.child`
+ * Tier 3 — simple suffix (`n.id ENDS WITH .qn`)
+ * Tier 4 — name match (`n.name = qn`)
+ * Tier 5 — fuzzy: `n.name CONTAINS fragment`, returns suggestions only (no node)
  *
  * @param repoId  LadybugDB repo ID
  * @param qn      The qualified name or symbol name supplied by the caller
@@ -90,7 +125,19 @@ export async function findSymbol(repoId: string, qn: string): Promise<SymbolLook
       { qn });
   } catch (e) { logErr('findSymbol:exact_qn', e); }
 
-  // Tier 2: QN suffix
+  // Tier 2: dotted syntax - e.g., "Interface.property" or "Class.method"
+  // QN format is "Label:path:Parent.child", so we search for ":Parent.child" suffix
+  if (rows.length === 0 && qn.includes('.') && !qn.includes(':') && !qn.includes('/')) {
+    matchMethod = 'dotted_syntax';
+    const colonSuffix = `:${qn}`;
+    try {
+      rows = await executeParameterized(repoId,
+        `MATCH (n) WHERE n.id ENDS WITH $suffix ${NODE_SELECT}`,
+        { suffix: colonSuffix });
+    } catch (e) { logErr('findSymbol:dotted_syntax', e); }
+  }
+
+  // Tier 3: simple QN suffix (for single names like "myFunction")
   if (rows.length === 0) {
     matchMethod = 'qn_suffix';
     const suffix = qn.startsWith('.') ? qn : `.${qn}`;
@@ -101,7 +148,7 @@ export async function findSymbol(repoId: string, qn: string): Promise<SymbolLook
     } catch (e) { logErr('findSymbol:qn_suffix', e); }
   }
 
-  // Tier 3: name match
+  // Tier 4: name match
   if (rows.length === 0) {
     matchMethod = 'name';
     try {
@@ -111,7 +158,7 @@ export async function findSymbol(repoId: string, qn: string): Promise<SymbolLook
     } catch (e) { logErr('findSymbol:name', e); }
   }
 
-  // Tier 4: fuzzy suggestions
+  // Tier 5: fuzzy suggestions
   if (rows.length === 0) {
     let suggestions: any[] = [];
     try {
@@ -135,24 +182,44 @@ export async function findSymbol(repoId: string, qn: string): Promise<SymbolLook
     };
   }
 
-  // Build resolved node from first row
-  const row = rows[0];
+  // Normalize rows to a consistent format for sorting
+  // Always extract label from QN (node ID) since labels(n)[0] is unreliable in LadybugDB
+  const normalizedRows = rows.map(r => {
+    const qn = r.qn ?? r[0];
+    return {
+      qn,
+      name: r.name ?? r[1],
+      label: labelFromQn(qn), // Always extract from ID, labels(n)[0] returns physical table name
+      filePath: r.filePath ?? r[3],
+      startLine: r.startLine ?? r[4],
+      endLine: r.endLine ?? r[5],
+      startColumn: r.startColumn ?? r[6],
+      description: r.description ?? r[7],
+    };
+  });
+
+  // Sort by kind priority (type definitions > members > functions > variables > parameters)
+  const sortedRows = sortByKindPriority(normalizedRows);
+
+  // Build resolved node from first (highest priority) row
+  const row = sortedRows[0];
   const node: ResolvedSymbol = {
-    name: row.name ?? row[1],
-    qn: row.qn ?? row[0],
-    label: labelFromQn(row.qn ?? row[0]),
-    filePath: row.filePath ?? row[3],
-    startLine: row.startLine ?? row[4],
-    endLine: row.endLine ?? row[5],
-    description: row.description ?? row[6],
+    name: row.name,
+    qn: row.qn,
+    label: row.label,
+    filePath: row.filePath,
+    startLine: row.startLine,
+    endLine: row.endLine,
+    startColumn: row.startColumn,
+    description: row.description,
   };
 
-  const alternatives: SymbolSuggestion[] | undefined = rows.length > 1
-    ? rows.slice(1).map(r => ({
-        name: r.name ?? r[1],
-        qn: r.qn ?? r[0],
-        label: labelFromQn(r.qn ?? r[0]),
-        file: r.filePath ?? r[3],
+  const alternatives: SymbolSuggestion[] | undefined = sortedRows.length > 1
+    ? sortedRows.slice(1).map(r => ({
+        name: r.name,
+        qn: r.qn,
+        label: r.label,
+        file: r.filePath,
       }))
     : undefined;
 

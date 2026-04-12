@@ -1245,4 +1245,216 @@ describe('tsMorphRename', () => {
     });
   });
 
+  // ═══════════════════════════════════════════════════════════════════════
+  // 8. Interface member rename (semantic, not text-based)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  describe('interface member rename — semantic (regression test)', () => {
+    let project: TempProject;
+
+    beforeAll(async () => {
+      project = await createTempProject({
+        'src/types.ts': [
+          'export interface JobRecord {',
+          '    sourceId: number;',
+          '    destBuilding: number;  // interface field',
+          '}',
+        ].join('\n'),
+        'src/service.ts': [
+          'import type { JobRecord } from "./types";',
+          '',
+          '// Local variable with same name — should NOT be renamed',
+          'function resolveDestination(destBuilding: number) {',
+          '    const entity = getEntity(destBuilding);',
+          '    return entity;',
+          '}',
+          '',
+          'export function createJob(record: JobRecord) {',
+          '    // Property access — should be renamed',
+          '    const dest = record.destBuilding;',
+          '    return { dest };',
+          '}',
+        ].join('\n'),
+        'src/store.ts': [
+          'import type { JobRecord } from "./types";',
+          '',
+          'export function findByDest(jobs: JobRecord[], id: number) {',
+          '    // Property access in filter — should be renamed',
+          '    return jobs.filter(j => j.destBuilding === id);',
+          '}',
+        ].join('\n'),
+      });
+    });
+
+    afterAll(async () => { await project.cleanup(); });
+
+    it('renames interface property but not local variables with same name', async () => {
+      // Line 3 is where "destBuilding: number;" is defined in types.ts
+      const edits = await renameAndAssert(project, {
+        filePath: 'src/types.ts',
+        line: 3,
+        oldName: 'destBuilding',
+        newName: 'destBuildingId',
+      });
+
+      // Verify interface definition is renamed
+      const typesContent = await readFile(project, 'src/types.ts');
+      expect(typesContent).toContain('destBuildingId: number;');
+      expect(typesContent).not.toContain('destBuilding:');
+
+      // Verify property accesses are renamed
+      const serviceContent = await readFile(project, 'src/service.ts');
+      expect(serviceContent).toContain('record.destBuildingId');
+      // Use regex to check for old name not followed by 'Id' (avoid substring match)
+      expect(serviceContent).not.toMatch(/record\.destBuilding(?!Id)/);
+
+      const storeContent = await readFile(project, 'src/store.ts');
+      expect(storeContent).toContain('j.destBuildingId');
+      expect(storeContent).not.toMatch(/j\.destBuilding(?!Id)/);
+
+      // CRITICAL: Local variables with same name must NOT be renamed
+      // These are semantically different from the interface property
+      expect(serviceContent).toContain('function resolveDestination(destBuilding: number)');
+      expect(serviceContent).toContain('getEntity(destBuilding)');
+      expect(serviceContent).not.toContain('destBuildingId: number)'); // param should NOT be renamed
+
+      // Verify edit count — should only touch interface + property accesses, not local vars
+      // Expected: types.ts:1 + service.ts:1 + store.ts:1 = 3 edits minimum
+      // Should NOT be 6+ (which would include local var renames)
+      expect(edits.length).toBeLessThanOrEqual(5);
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 9. Shorthand property expansion during interface rename
+  // ═══════════════════════════════════════════════════════════════════════
+
+  describe('shorthand property expansion (regression test)', () => {
+    let project: TempProject;
+
+    beforeAll(async () => {
+      project = await createTempProject({
+        'src/types.ts': [
+          'export interface TransportJobRecord {',
+          '    sourceId: number;',
+          '    destBuilding: number;',
+          '}',
+        ].join('\n'),
+        'src/factory.ts': [
+          'import type { TransportJobRecord } from "./types";',
+          '',
+          '// Function with parameter named destBuilding — same name as interface property',
+          'export function createDeliveryOnlyRecord(',
+          '    sourceId: number,',
+          '    destBuilding: number,',
+          '): TransportJobRecord {',
+          '    // Shorthand property syntax: { destBuilding } means { destBuilding: destBuilding }',
+          '    // When renaming the interface property, we must expand this to explicit syntax',
+          '    return {',
+          '        sourceId,',
+          '        destBuilding,  // shorthand — variable destBuilding still exists',
+          '    };',
+          '}',
+        ].join('\n'),
+        'src/consumer.ts': [
+          'import type { TransportJobRecord } from "./types";',
+          '',
+          'export function readBuilding(record: TransportJobRecord): number {',
+          '    // Property access — should be renamed',
+          '    return record.destBuilding;',
+          '}',
+        ].join('\n'),
+      });
+    });
+
+    afterAll(async () => { await project.cleanup(); });
+
+    it('expands shorthand property when renaming interface field', async () => {
+      // Rename the interface property destBuilding → destBuildingId
+      const edits = await renameAndAssert(project, {
+        filePath: 'src/types.ts',
+        line: 3,
+        oldName: 'destBuilding',
+        newName: 'destBuildingId',
+      });
+
+      // Verify interface definition is renamed
+      const typesContent = await readFile(project, 'src/types.ts');
+      expect(typesContent).toContain('destBuildingId: number;');
+      expect(typesContent).not.toMatch(/\bdestBuilding:/);
+
+      // CRITICAL: Shorthand must be expanded, not broken
+      // Before: { destBuilding }  (shorthand for { destBuilding: destBuilding })
+      // After:  { destBuildingId: destBuilding }  (expanded with new key, old variable)
+      const factoryContent = await readFile(project, 'src/factory.ts');
+
+      // The parameter must NOT be renamed (it's a different symbol)
+      expect(factoryContent).toContain('destBuilding: number,');
+
+      // The shorthand must be expanded to explicit syntax with the new property name
+      // and the old variable reference preserved
+      expect(factoryContent).toContain('destBuildingId: destBuilding');
+
+      // Must NOT have broken shorthand { destBuildingId } (no such variable exists)
+      expect(factoryContent).not.toMatch(/{\s*[^}]*\bdestBuildingId\s*,/);
+      expect(factoryContent).not.toMatch(/,\s*destBuildingId\s*[,}]/);
+
+      // Property access in consumer should be renamed normally
+      const consumerContent = await readFile(project, 'src/consumer.ts');
+      expect(consumerContent).toContain('record.destBuildingId');
+
+      // Verify edits include the expanded shorthand
+      const factoryEdit = edits.find((e) => e.filePath === 'src/factory.ts');
+      expect(factoryEdit).toBeDefined();
+      expect(factoryEdit!.new_text).toContain('destBuildingId: destBuilding');
+    });
+
+    it('preview (dry-run) shows correct expanded shorthand', async () => {
+      // Create a fresh project for dry-run test
+      const dryRunProject = await createTempProject({
+        'src/types.ts': [
+          'export interface Record {',
+          '    field: number;',
+          '}',
+        ].join('\n'),
+        'src/builder.ts': [
+          'import type { Record } from "./types";',
+          '',
+          'export function build(field: number): Record {',
+          '    return { field };  // shorthand',
+          '}',
+        ].join('\n'),
+      });
+
+      try {
+        const edits = await tsMorphRename({
+          repoPath: dryRunProject.root,
+          filePath: 'src/types.ts',
+          line: 2,
+          oldName: 'field',
+          newName: 'fieldId',
+          dryRun: true,
+        });
+
+        expect(edits).not.toBeNull();
+        expect(edits!.length).toBeGreaterThan(0);
+
+        // Find the builder.ts edit
+        const builderEdit = edits!.find((e) => e.filePath === 'src/builder.ts');
+        expect(builderEdit).toBeDefined();
+
+        // Dry-run preview must show the expanded form
+        expect(builderEdit!.old_text).toContain('{ field }');
+        expect(builderEdit!.new_text).toContain('fieldId: field');
+
+        // Verify file was NOT modified (dry run)
+        const builderContent = await readFile(dryRunProject, 'src/builder.ts');
+        expect(builderContent).toContain('{ field }');
+        expect(builderContent).not.toContain('fieldId');
+      } finally {
+        await dryRunProject.cleanup();
+      }
+    });
+  });
+
 });

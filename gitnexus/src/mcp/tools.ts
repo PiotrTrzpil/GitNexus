@@ -159,8 +159,8 @@ Returns: changed symbols, affected processes, and a risk summary.`,
   },
   {
     name: 'rename',
-    description: `Multi-file coordinated rename using the knowledge graph + text search.
-Finds all references via graph (high confidence) and regex text search (lower confidence). Preview by default.
+    description: `Multi-file coordinated rename using semantic analysis and knowledge graph.
+Preview by default. Safe by default — no blind text_search fallback.
 
 WHEN TO USE: Renaming a function, class, method, or variable across the codebase. Safer than find-and-replace.
 Also supports renaming directories and moving single files — moves files and updates import paths.
@@ -171,7 +171,7 @@ For symbol renames (default):
   semantically correct renames — handles imports, re-exports, destructuring, and scoping automatically.
   For Python files, uses rope (Python refactoring library) for scope-aware renames —
   handles imports, module references, and class hierarchies.
-  Falls back to graph + text search for other languages or if the language-specific engine cannot resolve the symbol.
+  Falls back to graph-only (no text_search) for other languages or if the semantic engine cannot resolve the symbol.
 
 For file moves (type: "file"):
   Moves a single file to a new location and updates all import/export paths across the codebase
@@ -183,11 +183,17 @@ For directory renames (type: "directory"):
   across the codebase using ts-morph's SourceFile.move() API. Non-TS files are moved via filesystem.
   Usage: rename(symbol_name: "src/canvas", new_name: "src/view", type: "directory")
 
+Engine selection (for symbol renames):
+- "auto" (default): ts_morph/rope → graph-only fallback (safe, NO text_search)
+- "semantic_only": ts_morph/rope only, fail if not resolved (strictest)
+- "graph_only": Skip ts_morph/rope, use graph edges only (fast but less precise)
+- "with_text_search": ts_morph/rope → graph + text_search (aggressive, may over-match — use with caution)
+
 Each edit is tagged with confidence:
 - "ts_morph": found via TypeScript language service (highest confidence, scope-aware)
 - "rope": found via Python rope refactoring library (highest confidence, scope-aware)
 - "graph": found via knowledge graph relationships (high confidence, safe to accept)
-- "text_search": found via regex text search (lower confidence, review carefully)`,
+- "text_search": found via regex text search (lower confidence, review carefully — only with engine=with_text_search)`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -197,6 +203,7 @@ Each edit is tagged with confidence:
         type: { type: 'string', description: 'Rename type: "symbol" (default), "file" for moving a single file, or "directory" for renaming module paths', enum: ['symbol', 'file', 'directory'] },
         file_path: { type: 'string', description: 'File path to disambiguate common names (symbol rename only)' },
         dry_run: { type: 'boolean', description: 'Preview edits without modifying files (default: true)', default: true },
+        engine: { type: 'string', description: 'Engine selection: "auto" (default, safe), "semantic_only" (strictest), "graph_only" (fast), "with_text_search" (aggressive)', enum: ['auto', 'semantic_only', 'graph_only', 'with_text_search'], default: 'auto' },
         repo: { type: 'string', description: 'Repository name or path. Auto-detected from client workspace when omitted.' },
       },
       required: ['new_name'],

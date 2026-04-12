@@ -15,6 +15,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import { glob } from 'glob';
 import { createIgnoreFilter } from '../../config/ignore-service.js';
+import { tryAcquireLock, releaseLock } from '../../util/lockfile.js';
 
 export interface WatcherOptions {
   onReindex: (repoPath: string) => Promise<void>;
@@ -104,55 +105,18 @@ function snapshotsEqual(
 
 // ─── Cross-process lockfile ──────────────────────────────────────────────
 // Prevents multiple MCP instances from reindexing the same repo concurrently.
-// Uses a simple PID-based lockfile with a stale timeout.
+// Uses shared lockfile utility with PID-based stale detection.
 
-const LOCK_STALE_MS = 5 * 60 * 1000; // 5 minutes — if lock is older, treat as stale
-
-function lockPath(repoPath: string): string {
+function reindexLockPath(repoPath: string): string {
   return path.join(repoPath, '.gitnexus', 'reindex.lock');
 }
 
-async function tryAcquireLock(repoPath: string): Promise<boolean> {
-  const lp = lockPath(repoPath);
-  try {
-    // O_WRONLY | O_CREAT | O_EXCL — atomic create-if-not-exists
-    const fd = await fs.open(lp, 'wx');
-    await fd.writeFile(JSON.stringify({ pid: process.pid, ts: Date.now() }));
-    await fd.close();
-    return true;
-  } catch (err: any) {
-    if (err?.code !== 'EEXIST') return false;
-    // Lock exists — check if stale
-    try {
-      const content = await fs.readFile(lp, 'utf-8');
-      const { pid, ts } = JSON.parse(content);
-      const age = Date.now() - ts;
-      if (age > LOCK_STALE_MS) {
-        // Stale lock — try to replace it
-        await fs.writeFile(lp, JSON.stringify({ pid: process.pid, ts: Date.now() }));
-        return true;
-      }
-      // Check if the owning process is still alive
-      try {
-        process.kill(pid, 0); // signal 0 = existence check, no signal sent
-        return false; // Process alive, lock is valid
-      } catch {
-        // Process gone — take over the lock
-        await fs.writeFile(lp, JSON.stringify({ pid: process.pid, ts: Date.now() }));
-        return true;
-      }
-    } catch {
-      return false; // Can't read/parse lock — leave it alone
-    }
-  }
+async function tryAcquireReindexLock(repoPath: string): Promise<boolean> {
+  return tryAcquireLock(reindexLockPath(repoPath));
 }
 
-async function releaseLock(repoPath: string): Promise<void> {
-  try {
-    await fs.unlink(lockPath(repoPath));
-  } catch {
-    // Best effort — lock may have been cleaned up already
-  }
+async function releaseReindexLock(repoPath: string): Promise<void> {
+  return releaseLock(reindexLockPath(repoPath));
 }
 
 /**
@@ -210,7 +174,7 @@ async function pollRepo(
   }
 
   // Cross-process lock — another MCP instance may already be reindexing
-  if (!(await tryAcquireLock(repo.path))) {
+  if (!(await tryAcquireReindexLock(repo.path))) {
     // Another process holds the lock — skip this cycle, update snapshot
     // so we don't re-trigger on the same diff next cycle
     state.snapshot = snap;
@@ -229,7 +193,7 @@ async function pollRepo(
     // Keep old snapshot so we retry next cycle
     state.nextPollAt = Date.now() + interval;
   } finally {
-    await releaseLock(repo.path);
+    await releaseReindexLock(repo.path);
     state.reindexing = false;
   }
 }

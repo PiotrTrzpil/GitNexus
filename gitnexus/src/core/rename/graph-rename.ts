@@ -11,10 +11,19 @@
 
 import * as path from 'path';
 import * as fs from 'fs/promises';
-import { execFile } from 'child_process';
+import { execFile, execFileSync } from 'child_process';
 import { promisify } from 'util';
+import { renameLogger } from '../../util/logger.js';
 
 const execFileAsync = promisify(execFile);
+
+// Resolve full path to ripgrep at module load — avoids PATH inheritance issues in test environments
+let rgPath = 'rg';
+try {
+  rgPath = execFileSync('which', ['rg'], { encoding: 'utf-8' }).trim() || 'rg';
+} catch {
+  // Fall back to bare 'rg' and let the caller handle ENOENT
+}
 
 export interface GraphRenameEdit {
   filePath: string;
@@ -56,8 +65,10 @@ export async function graphTextSearchRename(opts: {
   oldName: string;
   newName: string;
   dryRun: boolean;
+  /** Skip ripgrep text search — only use graph edges. Default: true (text_search must be explicit). */
+  includeTextSearch?: boolean;
 }): Promise<GraphRenameResult> {
-  const { repoPath, defFile, incomingRefs, oldName, newName, dryRun } = opts;
+  const { repoPath, defFile, incomingRefs, oldName, newName, dryRun, includeTextSearch = false } = opts;
 
   const changes = new Map<string, { filePath: string; edits: GraphRenameEdit[] }>();
   const warnings: string[] = [];
@@ -102,6 +113,7 @@ export async function graphTextSearchRename(opts: {
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
+      renameLogger.warn({ err: e, file: filePath, oldName }, 'Could not read file for rename scan');
       warnings.push(`Could not read file ${filePath}: ${msg}`);
     }
   };
@@ -117,31 +129,34 @@ export async function graphTextSearchRename(opts: {
     await scanFile(ref.filePath, 'graph');
   }
 
-  // 3. Text search for refs the graph might have missed
-  const graphFiles = new Set([defFile, ...incomingRefs.map(r => r.filePath)].filter(Boolean));
+  // 3. Text search for refs the graph might have missed (opt-in only)
+  if (includeTextSearch) {
+    const graphFiles = new Set([defFile, ...incomingRefs.map(r => r.filePath)].filter(Boolean));
 
-  try {
-    const rgArgs = [
-      '-l',
-      '--type-add', 'code:*.{ts,tsx,js,jsx,py,go,rs,java,c,h,cpp,cc,cxx,hpp,hxx,hh,cs,php,swift}',
-      '-t', 'code',
-      `\\b${oldName}\\b`,
-      '.',
-    ];
-    const { stdout: output } = await execFileAsync('rg', rgArgs, { cwd: repoPath, encoding: 'utf-8', timeout: 5000 });
-    const files = output.trim().split('\n').filter(f => f.length > 0);
+    try {
+      const rgArgs = [
+        '-l',
+        '--type-add', 'code:*.{ts,tsx,js,jsx,py,go,rs,java,c,h,cpp,cc,cxx,hpp,hxx,hh,cs,php,swift}',
+        '-t', 'code',
+        `\\b${oldName}\\b`,
+        '.',
+      ];
+      const { stdout: output } = await execFileAsync(rgPath, rgArgs, { cwd: repoPath, encoding: 'utf-8', timeout: 5000 });
+      const files = output.trim().split('\n').filter(f => f.length > 0);
 
-    for (const file of files) {
-      const normalizedFile = file.replace(/\\/g, '/').replace(/^\.\//, '');
-      if (graphFiles.has(normalizedFile)) continue; // already covered by graph
-      await scanFile(normalizedFile, 'text_search');
-    }
-  } catch (e) {
-    // rg exit code 1 = no matches (not an error)
-    const isNoMatch = e instanceof Error && 'code' in e && (e as any).code === 1;
-    if (!isNoMatch) {
-      const msg = e instanceof Error ? e.message : String(e);
-      warnings.push(`Text search (rg) failed: ${msg}`);
+      for (const file of files) {
+        const normalizedFile = file.replace(/\\/g, '/').replace(/^\.\//, '');
+        if (graphFiles.has(normalizedFile)) continue; // already covered by graph
+        await scanFile(normalizedFile, 'text_search');
+      }
+    } catch (e) {
+      // rg exit code 1 = no matches (not an error)
+      const isNoMatch = e instanceof Error && 'code' in e && (e as any).code === 1;
+      if (!isNoMatch) {
+        const msg = e instanceof Error ? e.message : String(e);
+        renameLogger.warn({ err: e, oldName, repoPath }, 'Text search (rg) failed');
+        warnings.push(`Text search (rg) failed: ${msg}`);
+      }
     }
   }
 
@@ -169,6 +184,7 @@ export async function graphTextSearchRename(opts: {
         await fs.writeFile(fullPath, lines.join('\n'), 'utf-8');
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
+        renameLogger.error({ err: e, file: filePath, oldName, newName }, 'Failed to apply rename edits');
         applyFailures.push(`${filePath}: ${msg}`);
       }
     }

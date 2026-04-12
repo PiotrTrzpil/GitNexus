@@ -11,6 +11,7 @@
 import * as path from 'path';
 import { spawn, execFile } from 'child_process';
 import { promisify } from 'util';
+import { renameLogger } from '../../util/logger.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -63,6 +64,7 @@ async function findPython(): Promise<string> {
       if (stdout.includes('Python 3')) return candidate;
     } catch { /* try next */ }
   }
+  renameLogger.error('Python 3 not found for rope rename');
   throw new Error(
     'Python 3 not found. Install Python 3 and ensure "python3" or "python" is on PATH.',
   );
@@ -101,25 +103,30 @@ export async function ropeRename(opts: {
     try {
       const parsed = JSON.parse(stdout);
       if (parsed.status === 'error') {
+        renameLogger.error({ message: parsed.message, filePath, oldName }, 'Rope returned error status');
         throw new Error(parsed.message);
       }
       if (parsed.status === 'not_found') {
+        renameLogger.debug({ filePath, oldName }, 'Rope could not find symbol');
         return null;
       }
     } catch (parseErr) {
       if (parseErr instanceof SyntaxError) {
         // JSON parse failed — use raw output
+        renameLogger.error({ exitCode, stderr, stdout: stdout.slice(0, 500), filePath, oldName }, 'Rope failed with non-JSON output');
         throw new Error(`rope-rename failed (exit ${exitCode}): ${stderr || stdout}`);
       }
       throw parseErr; // re-throw our Error from parsed.message
     }
+    renameLogger.error({ exitCode, stderr, stdout: stdout.slice(0, 500), filePath, oldName }, 'Rope failed');
     throw new Error(`rope-rename failed (exit ${exitCode}): ${stderr || stdout}`);
   }
 
   let parsed: any;
   try {
     parsed = JSON.parse(stdout);
-  } catch {
+  } catch (err) {
+    renameLogger.error({ err, stdout: stdout.slice(0, 500), filePath, oldName }, 'Rope returned invalid JSON');
     throw new Error(`rope-rename returned invalid JSON: ${stdout.slice(0, 200)}`);
   }
 
@@ -128,6 +135,7 @@ export async function ropeRename(opts: {
   }
 
   if (parsed.status === 'error') {
+    renameLogger.error({ message: parsed.message, filePath, oldName }, 'Rope returned error');
     throw new Error(parsed.message);
   }
 
@@ -136,11 +144,13 @@ export async function ropeRename(opts: {
     // Validate edit structure
     for (const edit of edits) {
       if (!edit.filePath || !edit.line || edit.old_text == null || edit.new_text == null) {
+        renameLogger.error({ edit, filePath, oldName }, 'Rope returned malformed edit');
         throw new Error(`rope-rename returned malformed edit: ${JSON.stringify(edit)}`);
       }
     }
     return edits.length > 0 ? edits : null;
   }
 
+  renameLogger.error({ status: parsed.status, filePath, oldName }, 'Rope returned unexpected status');
   throw new Error(`rope-rename returned unexpected status: ${parsed.status}`);
 }

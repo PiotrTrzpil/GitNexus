@@ -105,6 +105,8 @@ export const createWorkerPool = (workerUrl: URL, poolSize?: number): WorkerPool 
             }
           } else if (msg && msg.type === 'sub-batch-done') {
             sendNextSubBatch();
+          } else if (msg && msg.type === 'warning') {
+            console.warn(`Worker ${i}: ${msg.message}`);
           } else if (msg && msg.type === 'error') {
             settled = true;
             cleanup();
@@ -116,7 +118,7 @@ export const createWorkerPool = (workerUrl: URL, poolSize?: number): WorkerPool 
           } else {
             settled = true;
             cleanup();
-            resolve(msg);
+            reject(new Error(`Worker ${i}: unknown message ${JSON.stringify(msg)?.slice(0, 200)}`));
           }
         };
 

@@ -119,3 +119,30 @@ export async function cypherCommand(query: string, options?: {
   });
   output(result);
 }
+
+export async function renameCommand(symbolName: string, newName: string, options?: {
+  repo?: string;
+  uid?: string;
+  file?: string;
+  type?: string;
+  engine?: string;
+  dryRun?: boolean;
+}): Promise<void> {
+  if (!newName?.trim()) {
+    console.error('Usage: gitnexus rename <symbol_name> <new_name> [--uid <uid>] [--file <path>] [--type symbol|file|directory] [--engine auto|semantic_only|graph_only|with_text_search] [--apply]');
+    process.exit(1);
+  }
+
+  const backend = await getBackend();
+  const result = await backend.callTool('rename', {
+    symbol_name: symbolName || undefined,
+    symbol_uid: options?.uid,
+    new_name: newName,
+    file_path: options?.file,
+    type: options?.type as 'symbol' | 'file' | 'directory' | undefined,
+    engine: options?.engine as 'auto' | 'semantic_only' | 'graph_only' | 'with_text_search' | undefined,
+    dry_run: options?.dryRun !== false, // default to dry run
+    repo: options?.repo,
+  });
+  output(result);
+}

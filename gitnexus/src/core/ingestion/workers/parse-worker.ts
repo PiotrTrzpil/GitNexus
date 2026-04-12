@@ -15,6 +15,7 @@ import { createRequire } from 'node:module';
 import { SupportedLanguages } from '../../../config/supported-languages.js';
 import { LANGUAGE_QUERIES } from '../tree-sitter-queries.js';
 import { getTreeSitterBufferSize, TREE_SITTER_MAX_BUFFER } from '../constants.js';
+import { workerLogger } from '../../../util/logger.js';
 
 const _require = createRequire(import.meta.url);
 
@@ -30,7 +31,7 @@ try {
   const oxcCfg = _require('@gitnexus/oxc-cfg');
   analyzeCfg = oxcCfg.analyzeCfg;
 } catch {
-  console.warn('[@gitnexus/oxc-cfg] Native CFG module not found — control flow graph analysis will be skipped. Build it with: cd native/oxc-cfg-napi && pnpm install && pnpm build');
+  workerLogger.warn('Native CFG module not found — control flow graph analysis will be skipped');
 }
 import {
   getLanguageFromFilename,
@@ -783,12 +784,8 @@ const processBatch = (files: ParseWorkerInput[], onProgress?: (filesProcessed: n
     // Process regular files for this language
     if (regularFiles.length > 0) {
       if (isLanguageAvailable(language, regularFiles[0].path)) {
-        try {
-          setLanguage(language, regularFiles[0].path);
-          processFileGroup(regularFiles, language, queryString, result, onFileProcessed);
-        } catch {
-          // parser unavailable — skip this language group
-        }
+        setLanguage(language, regularFiles[0].path);
+        processFileGroup(regularFiles, language, queryString, result, onFileProcessed);
       } else {
         result.skippedLanguages[language] = (result.skippedLanguages[language] || 0) + regularFiles.length;
       }
@@ -797,12 +794,8 @@ const processBatch = (files: ParseWorkerInput[], onProgress?: (filesProcessed: n
     // Process tsx files separately (different grammar)
     if (tsxFiles.length > 0) {
       if (isLanguageAvailable(language, tsxFiles[0].path)) {
-        try {
-          setLanguage(language, tsxFiles[0].path);
-          processFileGroup(tsxFiles, language, queryString, result, onFileProcessed);
-        } catch {
-          // parser unavailable — skip this language group
-        }
+        setLanguage(language, tsxFiles[0].path);
+        processFileGroup(tsxFiles, language, queryString, result, onFileProcessed);
       } else {
         result.skippedLanguages[language] = (result.skippedLanguages[language] || 0) + tsxFiles.length;
       }
@@ -1339,7 +1332,7 @@ const processFileGroup = (
     if (parentPort) {
       parentPort.postMessage({ type: 'warning', message });
     } else {
-      console.warn(message);
+      workerLogger.warn({ language }, message);
     }
     return;
   }
@@ -1352,7 +1345,7 @@ const processFileGroup = (
     try {
       tree = parser.parse(file.content, undefined, { bufferSize: getTreeSitterBufferSize(file.content.length) });
     } catch (err) {
-      console.warn(`Failed to parse file ${file.path}: ${err instanceof Error ? err.message : String(err)}`);
+      workerLogger.warn({ err, file: file.path }, 'Failed to parse file');
       continue;
     }
 
@@ -1372,7 +1365,7 @@ const processFileGroup = (
     try {
       matches = query.matches(tree.rootNode);
     } catch (err) {
-      console.warn(`Query execution failed for ${file.path}: ${err instanceof Error ? err.message : String(err)}`);
+      workerLogger.warn({ err, file: file.path }, 'Query execution failed');
       continue;
     }
 
@@ -1618,7 +1611,8 @@ const processFileGroup = (
       if (!nameNode && nodeLabel !== 'Constructor') continue;
       const nodeName = nameNode ? nameNode.text : 'init';
       const definitionNode = getDefinitionNodeFromCaptures(captureMap);
-      const startLine = definitionNode ? definitionNode.startPosition.row : (nameNode ? nameNode.startPosition.row : 0);
+      // tree-sitter rows are 0-indexed; we store 1-based line numbers for UI/tool compatibility
+      const startLine = definitionNode ? definitionNode.startPosition.row + 1 : (nameNode ? nameNode.startPosition.row + 1 : 1);
 
       // Compute enclosing class early — needed for unique method IDs.
       // Without this, methods with the same name in different classes (e.g. Sequence.tick,
@@ -1679,8 +1673,9 @@ const processFileGroup = (
       }
 
       // ── Semantic depth: compute new node properties ─────────────────────
-      const nodeStartLine = definitionNode ? definitionNode.startPosition.row : startLine;
-      const nodeEndLine = definitionNode ? definitionNode.endPosition.row : startLine;
+      // startLine is already 1-based; only add +1 when reading directly from tree-sitter
+      const nodeStartLine = definitionNode ? definitionNode.startPosition.row + 1 : startLine;
+      const nodeEndLine = definitionNode ? definitionNode.endPosition.row + 1 : startLine;
       const nodeStartColumn = nameNode ? nameNode.startPosition.column : (definitionNode ? definitionNode.startPosition.column : 0);
       const nodeEndColumn = definitionNode ? definitionNode.endPosition.column : (nameNode ? nameNode.endPosition.column : 0);
       const sloc = nodeEndLine - nodeStartLine + 1;
@@ -1918,7 +1913,7 @@ const processFileGroup = (
         if (parentPort) {
           parentPort.postMessage({ type: 'warning', message });
         } else {
-          console.warn(message);
+          workerLogger.warn({ err, file: file.path }, 'oxc-cfg analysis failed');
         }
       }
     }

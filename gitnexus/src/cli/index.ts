@@ -120,6 +120,21 @@ program
   .option('--format <fmt>', 'Output format: yaml (default) or json', 'yaml')
   .action((query: string, opts: any) => { if (opts.format) setOutputFormat(opts.format); return createLazyAction(() => import('./tool.js'), 'cypherCommand')(query, opts); });
 
+program
+  .command('rename <symbol_name> <new_name>')
+  .description('Rename a symbol, file, or directory across the codebase')
+  .option('-r, --repo <name>', 'Target repository')
+  .option('-u, --uid <uid>', 'Direct symbol UID (zero-ambiguity lookup)')
+  .option('-f, --file <path>', 'File path to disambiguate common names')
+  .option('-t, --type <type>', 'Type of rename: symbol (default), file, or directory')
+  .option('-e, --engine <engine>', 'Engine: auto (default), semantic_only, graph_only, with_text_search', 'auto')
+  .option('--apply', 'Apply changes (default is dry-run)')
+  .option('--format <fmt>', 'Output format: yaml (default) or json', 'yaml')
+  .action((symbolName: string, newName: string, opts: any) => {
+    if (opts.format) setOutputFormat(opts.format);
+    return createLazyAction(() => import('./tool.js'), 'renameCommand')(symbolName, newName, { ...opts, dryRun: !opts.apply });
+  });
+
 // ─── Eval Server (persistent daemon for SWE-bench) ─────────────────
 
 program

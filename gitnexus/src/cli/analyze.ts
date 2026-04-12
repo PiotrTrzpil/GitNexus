@@ -10,6 +10,7 @@ import v8 from 'v8';
 import cliProgress from 'cli-progress';
 import { runPipelineFromRepo } from '../core/ingestion/pipeline.js';
 import { initLbug, loadGraphToLbug, getLbugStats, executeQuery, executeWithReusedStatement, closeLbug, createFTSIndex, loadCachedEmbeddings } from '../core/lbug/lbug-adapter.js';
+import { tryAcquireLock, releaseLock } from '../util/lockfile.js';
 // Embedding imports are lazy (dynamic import) so onnxruntime-node is never
 // loaded when embeddings are not requested. This avoids crashes on Node
 // versions whose ABI is not yet supported by the native binary (#89).
@@ -186,13 +187,20 @@ export const analyzeCommand = async (
 
   bar.start(100, 0, { phase: 'Initializing...' });
 
+  // Rebuild lock path — set when we start LadybugDB phase, cleaned up on exit
+  let rebuildLockPath: string | null = null;
+
   // Graceful SIGINT handling — clean up resources and exit
   let aborted = false;
-  const sigintHandler = () => {
+  const sigintHandler = async () => {
     if (aborted) process.exit(1); // Second Ctrl-C: force exit
     aborted = true;
     bar.stop();
     console.log('\n  Interrupted — cleaning up...');
+    // Remove rebuild lock if we created it
+    if (rebuildLockPath) {
+      await releaseLock(rebuildLockPath);
+    }
     closeLbug().catch(() => {}).finally(() => process.exit(130));
   };
   process.on('SIGINT', sigintHandler);
@@ -272,8 +280,46 @@ export const analyzeCommand = async (
     updateBar(scaled, phaseLabel);
   });
 
+  // Sanity check: a parseable repo should produce code symbols, not just File nodes.
+  // If parsing silently dropped every symbol (e.g. native binding crash, language-group
+  // catch swallowed errors) we'd otherwise only notice via "FTS missing" errors much later.
+  let parseableFileCount = 0;
+  let symbolCount = 0;
+  const PARSEABLE_EXT = /\.(ts|tsx|js|jsx|mjs|cjs|py|java|c|h|cc|cpp|hpp|cs|go|rs|kt|kts|php|rb|swift)$/i;
+  const SYMBOL_LABELS = new Set([
+    'Function', 'Class', 'Interface', 'Method', 'Constructor', 'Property',
+    'Struct', 'Enum', 'Trait', 'Impl', 'TypeAlias', 'Module', 'Namespace',
+    'Macro', 'Typedef', 'Union', 'Const', 'Static', 'Record', 'Delegate', 'Annotation', 'Template',
+  ]);
+  pipelineResult.graph.forEachNode((n) => {
+    if (n.label === 'File' && PARSEABLE_EXT.test(n.properties?.filePath || '')) parseableFileCount++;
+    if (SYMBOL_LABELS.has(n.label as string)) symbolCount++;
+  });
+  if (parseableFileCount >= 10 && symbolCount === 0) {
+    throw new Error(
+      `Parsing extracted 0 symbols from ${parseableFileCount} parseable source file(s). ` +
+      `This indicates a parser failure (native binding, query compilation, or worker crash). ` +
+      `Run with NODE_OPTIONS='--stack-trace-limit=50' and check the warnings above.`
+    );
+  }
+
   // ── Phase 2: LadybugDB (60–85%) ──────────────────────────────────────
   updateBar(60, 'Loading into LadybugDB...');
+
+  // Create rebuild lock BEFORE closing/deleting — signals MCP server to close its connections.
+  // This prevents native crashes when MCP tries to use deleted file handles.
+  rebuildLockPath = `${lbugPath}.rebuild`;
+  const lockAcquired = await tryAcquireLock(rebuildLockPath, { staleMs: 60_000 });
+  if (!lockAcquired) {
+    // Another analyze is running — this shouldn't happen often
+    console.warn('  Warning: Another analyze process may be running. Proceeding anyway.');
+  }
+
+  // Give MCP server time to notice the lock and close connections.
+  // The MCP server runs a rebuild-lock watcher every 100ms that proactively
+  // closes all DB connections when it detects this lock. 500ms gives it
+  // 5 polling cycles — enough time to close connections and avoid native crash.
+  await new Promise(resolve => setTimeout(resolve, 500));
 
   await closeLbug();
   const lbugFiles = [lbugPath, `${lbugPath}.wal`, `${lbugPath}.lock`];
@@ -292,6 +338,23 @@ export const analyzeCommand = async (
   const lbugTime = ((Date.now() - t0Lbug) / 1000).toFixed(1);
   const lbugWarnings = lbugResult.warnings;
 
+  // Post-load sanity check: verify symbols actually made it into LadybugDB.
+  // The pre-load check (line ~298) validates the in-memory graph, but IGNORE_ERRORS=true
+  // in COPY can silently drop rows. This catches silent data loss.
+  if (symbolCount > 0) {
+    const postLoadStats = await getLbugStats();
+    // Expected: files + folders + symbols. Allow 10% tolerance for deduplication/edge cases.
+    const expectedNodes = parseableFileCount + symbolCount;
+    const minExpected = Math.floor(expectedNodes * 0.90);
+    if (postLoadStats.nodes < minExpected) {
+      throw new Error(
+        `LadybugDB data loss detected: parsed ${expectedNodes} nodes (${parseableFileCount} files + ${symbolCount} symbols) ` +
+        `but only ${postLoadStats.nodes} made it into the database. ` +
+        `This indicates silent COPY failures. Check CSV encoding or LadybugDB compatibility.`
+      );
+    }
+  }
+
   // Persist file hashes NOW — after LBUG loading succeeded. If saved earlier
   // (in the pipeline) and LBUG crashes, the next run skips parsing because it
   // thinks all files are unchanged.
@@ -308,15 +371,11 @@ export const analyzeCommand = async (
   updateBar(85, 'Creating search indexes...');
 
   const t0Fts = Date.now();
-  try {
-    await createFTSIndex('File', 'file_fts', ['name', 'content']);
-    await createFTSIndex('Function', 'function_fts', ['name', 'content']);
-    await createFTSIndex('Class', 'class_fts', ['name', 'content']);
-    await createFTSIndex('Method', 'method_fts', ['name', 'content']);
-    await createFTSIndex('Interface', 'interface_fts', ['name', 'content']);
-  } catch (e: any) {
-    // Non-fatal — FTS is best-effort
-  }
+  await createFTSIndex('File', 'file_fts', ['name', 'content']);
+  await createFTSIndex('Function', 'function_fts', ['name', 'content']);
+  await createFTSIndex('Class', 'class_fts', ['name', 'content']);
+  await createFTSIndex('Method', 'method_fts', ['name', 'content']);
+  await createFTSIndex('Interface', 'interface_fts', ['name', 'content']);
   const ftsTime = ((Date.now() - t0Fts) / 1000).toFixed(1);
 
   // Flush FTS indexes to the main DB file immediately. Without this,
@@ -433,6 +492,11 @@ export const analyzeCommand = async (
 
   await closeLbug();
 
+  // Remove rebuild lock — MCP server can now reopen connections
+  if (rebuildLockPath) {
+    await releaseLock(rebuildLockPath);
+  }
+
   // Remove any WAL file left after close. ONNX Runtime's native atexit hooks
   // can crash the process, and if a WAL exists at that point the crash corrupts
   // it — making the DB unopenable until the WAL is manually deleted.
@@ -480,7 +544,7 @@ export const analyzeCommand = async (
 
   // LadybugDB's native module holds open handles that prevent Node from exiting.
   // ONNX Runtime also registers native atexit hooks that crash via C++ mutex
-  // errors on macOS/Linux (#38, #40). Use _exit to skip atexit handlers entirely
-  // — all data is already checkpointed and the DB is closed.
-  (process as any)._exit(0);
+  // errors on macOS/Linux (#38, #40). All data is already checkpointed and the
+  // DB is closed, so forcefully terminate without waiting for cleanup.
+  process.exit(0);
 };

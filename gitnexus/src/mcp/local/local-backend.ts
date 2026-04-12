@@ -9,6 +9,7 @@
 import fs from 'fs/promises';
 import path from 'path';
 import { initLbug, executeQuery, executeParameterized, closeLbug, isLbugReady } from '../core/lbug-adapter.js';
+import { mcpLogger } from '../../util/logger.js';
 // Embedding imports are lazy (dynamic import) to avoid loading onnxruntime-node
 // at MCP server startup — crashes on unsupported Node ABI versions (#89)
 // git utilities available if needed
@@ -25,7 +26,7 @@ import { VERSION } from '../../config/version.js';
 import { diffFile } from '../../core/diff/semantic-differ.js';
 import { planCommits, type CouplingEdge, type FileChangeSummary } from '../../core/diff/commit-planner.js';
 import { readSourceWithContext } from '../source-reader.js';
-import { findSymbol } from './symbol-lookup.js';
+import { findSymbol, sortByKindPriority } from './symbol-lookup.js';
 
 /**
  * Quick test-file detection for filtering impact results.
@@ -42,6 +43,18 @@ export function isTestFilePath(filePath: string): boolean {
     p.endsWith('_spec.rb') || p.endsWith('_test.rb') || p.includes('/spec/') ||
     p.includes('/test_') || p.includes('/conftest.')
   );
+}
+
+/** Timeout for rename operations (1 minute) */
+const RENAME_TIMEOUT_MS = 60_000;
+
+/** Race a promise against a timeout */
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 /** Valid LadybugDB node labels for safe Cypher query construction */
@@ -116,8 +129,7 @@ function extractLabelFromQn(qn: string): string {
 
 /** Structured error logging for query failures — replaces empty catch blocks */
 function logQueryError(context: string, err: unknown): void {
-  const msg = err instanceof Error ? err.message : String(err);
-  console.error(`GitNexus [${context}]: ${msg}`);
+  mcpLogger.error({ err, queryContext: context }, 'Query failed');
 }
 
 export interface CodebaseContext {
@@ -194,7 +206,7 @@ export class LocalBackend {
       // If kuzu exists but lbug doesn't, warn so the user knows to re-analyze.
       const kuzu = await cleanupOldKuzuFiles(storagePath);
       if (kuzu.found && kuzu.needsReindex) {
-        console.error(`GitNexus: "${entry.name}" has a stale KuzuDB index. Run: gitnexus analyze ${entry.path}`);
+        mcpLogger.warn({ repo: entry.name, path: entry.path }, 'Stale KuzuDB index found — run gitnexus analyze');
       }
 
       const handle: RepoHandle = {
@@ -507,7 +519,7 @@ export class LocalBackend {
           }
         }
       } catch (err) {
-        console.warn(`[semanticDiff] git diff failed for ${repo.repoPath}: ${(err as Error).message}`);
+        mcpLogger.warn({ err, repo: repo.repoPath }, 'git diff failed');
         filePaths = [];
       }
     }
@@ -531,7 +543,7 @@ export class LocalBackend {
           fileSummaries.push({ path: fp, changes: fileChanges });
         }
       } catch (err) {
-        console.warn(`[semanticDiff] diffFile failed for ${fp}: ${(err as Error).message}`);
+        mcpLogger.warn({ err, file: fp }, 'diffFile failed');
       }
     }
 
@@ -955,7 +967,7 @@ export class LocalBackend {
               endLine: label !== 'File' ? (nodeRow.endLine ?? nodeRow[3]) : undefined,
             });
           }
-        } catch {}
+        } catch (e) { logQueryError('query:node-lookup', e); }
       }
       
       return { results, warnings: [] };
@@ -1145,12 +1157,13 @@ export class LocalBackend {
     let symFilePath: string;
     let symStartLine: number;
     let symEndLine: number;
+    let symStartColumn: number | undefined;
 
     if (uid) {
       // Direct UID lookup — bypass 4-tier resolver
       const rows = await executeParameterized(repo.id, `
         MATCH (n {id: $uid})
-        RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine
+        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine, n.startColumn AS startColumn
         LIMIT 1
       `, { uid });
       if (rows.length === 0) {
@@ -1159,41 +1172,62 @@ export class LocalBackend {
       const row = rows[0];
       symId = row.id || row[0];
       symName = row.name || row[1];
-      symKind = row.type || row[2];
-      symFilePath = row.filePath || row[3];
-      symStartLine = row.startLine || row[4];
-      symEndLine = row.endLine || row[5];
+      symKind = extractLabelFromQn(symId); // Extract label from ID, not labels(n)[0]
+      symFilePath = row.filePath || row[2];
+      symStartLine = row.startLine || row[3];
+      symEndLine = row.endLine || row[4];
+      symStartColumn = row.startColumn ?? row[5];
     } else if (file_path) {
       // file_path-scoped lookup — not covered by findSymbol's QN tiers
       const rows = await executeParameterized(repo.id, `
         MATCH (n)
         WHERE n.name = $symName AND n.filePath CONTAINS $filePath
-        RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine
+        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine, n.startColumn AS startColumn
         LIMIT 10
       `, { symName: name!, filePath: file_path });
       if (rows.length === 0) {
         return { error: `Symbol '${name}' not found` };
       }
-      if (rows.length > 1) {
+      // Normalize and sort by kind priority — prefer type definitions/properties over parameters
+      // Extract label from node ID since labels(n)[0] returns physical table name in LadybugDB
+      const normalizedRows = rows.map((r: any) => {
+        const id = r.id || r[0];
+        return {
+          id,
+          name: r.name || r[1],
+          label: extractLabelFromQn(id),
+          filePath: r.filePath || r[2],
+          startLine: r.startLine || r[3],
+          endLine: r.endLine || r[4],
+          startColumn: r.startColumn ?? r[5],
+        };
+      });
+      const sortedRows = sortByKindPriority(normalizedRows);
+      // If multiple results with different kinds, auto-select the highest priority (e.g., Property over Parameter)
+      // Only return ambiguous if multiple results have the SAME highest priority kind
+      const topKind = sortedRows[0].label;
+      const sameKindResults = sortedRows.filter(r => r.label === topKind);
+      if (sameKindResults.length > 1) {
         return {
           status: 'ambiguous',
-          message: `Found ${rows.length} symbols matching '${name}'. Use uid or a more specific file_path to disambiguate.`,
-          candidates: rows.map((s: any) => ({
-            uid: s.id || s[0],
-            name: s.name || s[1],
-            kind: s.type || s[2],
-            filePath: s.filePath || s[3],
-            line: s.startLine || s[4],
+          message: `Found ${sameKindResults.length} ${topKind} symbols matching '${name}'. Use uid to disambiguate.`,
+          candidates: sameKindResults.map(s => ({
+            uid: s.id,
+            name: s.name,
+            kind: s.label,
+            filePath: s.filePath,
+            line: s.startLine,
           })),
         };
       }
-      const row = rows[0];
-      symId = row.id || row[0];
-      symName = row.name || row[1];
-      symKind = row.type || row[2];
-      symFilePath = row.filePath || row[3];
-      symStartLine = row.startLine || row[4];
-      symEndLine = row.endLine || row[5];
+      const row = sortedRows[0];
+      symId = row.id;
+      symName = row.name;
+      symKind = row.label;
+      symFilePath = row.filePath;
+      symStartLine = row.startLine;
+      symEndLine = row.endLine;
+      symStartColumn = row.startColumn;
     } else {
       // Name-based lookup — use shared 4-tier resolver
       const found = await findSymbol(repo.id, name!);
@@ -1222,6 +1256,7 @@ export class LocalBackend {
       symFilePath = found.node.filePath;
       symStartLine = found.node.startLine;
       symEndLine = found.node.endLine;
+      symStartColumn = found.node.startColumn;
     }
 
     // Step 3: Class/Interface hint — redirect to methods
@@ -1321,6 +1356,7 @@ export class LocalBackend {
         filePath: symFilePath,
         startLine: symStartLine,
         endLine: symEndLine,
+        startColumn: symStartColumn,
         ...(include_content && symbolContent ? { content: symbolContent } : {}),
       },
       incoming: categorize(incomingRows),
@@ -1551,11 +1587,20 @@ export class LocalBackend {
     type?: 'symbol' | 'file' | 'directory';
     file_path?: string;
     dry_run?: boolean;
+    /**
+     * Engine selection for symbol renames:
+     * - 'auto' (default): ts_morph/rope → graph-only fallback (NO text_search)
+     * - 'semantic_only': ts_morph/rope only, fail if not resolved
+     * - 'graph_only': Skip ts_morph/rope, use graph edges only
+     * - 'with_text_search': ts_morph/rope → graph + text_search fallback (legacy behavior)
+     */
+    engine?: 'auto' | 'semantic_only' | 'graph_only' | 'with_text_search';
   }): Promise<any> {
     await this.ensureInitialized(repo.id);
 
     const { new_name, file_path } = params;
     const dry_run = params.dry_run ?? true;
+    const engine = params.engine ?? 'auto';
 
     /** Guard: ensure a file path resolves within the repo root (prevents path traversal) */
     const assertSafePath = (filePath: string): string => {
@@ -1581,12 +1626,16 @@ export class LocalBackend {
 
       try {
         const { fileRename } = await import('../../core/rename/file-rename.js');
-        const result = await fileRename({
-          repoPath: repo.repoPath,
-          oldFile,
-          newFile,
-          dryRun: dry_run,
-        });
+        const result = await withTimeout(
+          fileRename({
+            repoPath: repo.repoPath,
+            oldFile,
+            newFile,
+            dryRun: dry_run,
+          }),
+          RENAME_TIMEOUT_MS,
+          'file rename',
+        );
 
         const changes = new Map<string, { file_path: string; edits: any[] }>();
         for (const edit of result.edits) {
@@ -1617,6 +1666,7 @@ export class LocalBackend {
         };
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
+        mcpLogger.error({ err: e, oldFile, newFile, repo: repo.name }, 'File rename failed');
         return { error: `File rename failed: ${msg}` };
       }
     }
@@ -1636,12 +1686,16 @@ export class LocalBackend {
 
       try {
         const { directoryRename } = await import('../../core/rename/directory-rename.js');
-        const result = await directoryRename({
-          repoPath: repo.repoPath,
-          oldDir,
-          newDir,
-          dryRun: dry_run,
-        });
+        const result = await withTimeout(
+          directoryRename({
+            repoPath: repo.repoPath,
+            oldDir,
+            newDir,
+            dryRun: dry_run,
+          }),
+          RENAME_TIMEOUT_MS,
+          'directory rename',
+        );
 
         const changes = new Map<string, { file_path: string; edits: any[] }>();
         for (const edit of result.edits) {
@@ -1672,6 +1726,7 @@ export class LocalBackend {
         };
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
+        mcpLogger.error({ err: e, oldDir, newDir, repo: repo.name }, 'Directory rename failed');
         return { error: `Directory rename failed: ${msg}` };
       }
     }
@@ -1682,11 +1737,23 @@ export class LocalBackend {
     }
 
     // Step 1: Find the target symbol (reuse context's lookup for disambiguation)
-    const lookupResult = await this.context(repo, {
-      name: params.symbol_name,
-      uid: params.symbol_uid,
-      file_path,
-    });
+    // Wrap in timeout to prevent hangs during symbol lookup (multiple DB queries)
+    let lookupResult;
+    try {
+      lookupResult = await withTimeout(
+        this.context(repo, {
+          name: params.symbol_name,
+          uid: params.symbol_uid,
+          file_path,
+        }),
+        RENAME_TIMEOUT_MS,
+        'symbol lookup',
+      );
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      mcpLogger.error({ err: e, symbol_name: params.symbol_name, symbol_uid: params.symbol_uid, repo: repo.name }, 'Symbol lookup failed');
+      return { error: `Symbol lookup failed: ${msg}` };
+    }
 
     if (lookupResult.status !== 'found') {
       return lookupResult; // pass not_found / ambiguous / class_node through
@@ -1702,34 +1769,51 @@ export class LocalBackend {
       return { error: 'New name is the same as the current name.' };
     }
 
+    // Track why semantic engines (ts-morph/rope) couldn't resolve the symbol
+    let semanticFallbackReason: { engine: string; reason: string; details?: any } | undefined;
+
     // Step 2: For TS/JS files, try ts-morph (scope-aware rename via the TS language service)
-    if (sym.filePath && sym.startLine) {
+    // Skip if engine === 'graph_only' — user wants to bypass semantic analysis
+    if (engine !== 'graph_only' && sym.filePath && sym.startLine) {
       const { isTypeScriptFile, tsMorphRename } = await import('../../core/rename/ts-morph-rename.js');
       if (isTypeScriptFile(sym.filePath)) {
-        // tsMorphRename returns null when the symbol can't be resolved (clean fallthrough).
-        // It throws on infrastructure errors — we catch those and return them as errors
-        // rather than silently falling through to regex (which could double-apply on
-        // partial failure).
-        let tsMorphEdits;
+        // tsMorphRename returns a result object with status 'success' or 'not_found'.
+        // It throws on infrastructure errors — we catch those and return them as errors.
+        let tsMorphResult;
+        let tsMorphTimedOut = false;
         try {
-          tsMorphEdits = await tsMorphRename({
-            repoPath: repo.repoPath,
-            filePath: sym.filePath,
-            line: sym.startLine,
-            column: sym.startColumn,
-            oldName,
-            newName: new_name,
-            dryRun: dry_run,
-          });
+          tsMorphResult = await withTimeout(
+            tsMorphRename({
+              repoPath: repo.repoPath,
+              filePath: sym.filePath,
+              line: sym.startLine,
+              column: sym.startColumn,
+              oldName,
+              newName: new_name,
+              dryRun: dry_run,
+            }),
+            RENAME_TIMEOUT_MS,
+            'ts-morph rename',
+          );
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
-          return { error: `ts-morph rename failed: ${msg}` };
+          // On timeout, fall through to graph-based rename instead of failing (unless semantic_only)
+          if (msg.includes('timed out')) {
+            if (engine === 'semantic_only') {
+              return { error: `ts-morph rename timed out and engine=semantic_only prevents fallback` };
+            }
+            mcpLogger.warn({ oldName, newName: new_name, file: sym.filePath, repo: repo.name }, 'ts-morph rename timed out, falling back to graph rename');
+            tsMorphTimedOut = true;
+          } else {
+            mcpLogger.error({ err: e, oldName, newName: new_name, file: sym.filePath, line: sym.startLine, repo: repo.name }, 'ts-morph rename failed');
+            return { error: `ts-morph rename failed: ${msg}` };
+          }
         }
 
-        if (tsMorphEdits && tsMorphEdits.length > 0) {
+        if (tsMorphResult?.status === 'success' && tsMorphResult.edits.length > 0) {
           // Group edits by file for the response
           const fileEdits = new Map<string, { file_path: string; edits: any[] }>();
-          for (const edit of tsMorphEdits) {
+          for (const edit of tsMorphResult.edits) {
             if (!fileEdits.has(edit.filePath)) {
               fileEdits.set(edit.filePath, { file_path: edit.filePath, edits: [] });
             }
@@ -1747,13 +1831,41 @@ export class LocalBackend {
             new_name,
             engine: 'ts_morph',
             files_affected: changes.length,
-            total_edits: tsMorphEdits.length,
-            ts_morph_edits: tsMorphEdits.length,
+            total_edits: tsMorphResult.edits.length,
+            ts_morph_edits: tsMorphResult.edits.length,
             changes,
             applied: !dry_run,
           };
         }
-        // ts-morph returned null (symbol not resolved) — fall through to graph + text search
+
+        // ts-morph returned not_found — include diagnostic info
+        // If semantic_only, don't fall through — return error with diagnostics
+        if (engine === 'semantic_only' && !tsMorphTimedOut) {
+          const diagnostic = tsMorphResult?.status === 'not_found' ? tsMorphResult : null;
+          return {
+            error: `ts-morph could not resolve symbol '${oldName}' and engine=semantic_only prevents fallback`,
+            reason: diagnostic?.reason,
+            details: diagnostic?.details,
+            hint: 'Use engine=auto or engine=graph_only to allow fallback, or engine=with_text_search for aggressive matching',
+          };
+        }
+
+        // Store diagnostic info when falling back to graph rename
+        if (tsMorphResult?.status === 'not_found') {
+          semanticFallbackReason = {
+            engine: 'ts_morph',
+            reason: tsMorphResult.reason,
+            details: tsMorphResult.details,
+          };
+          mcpLogger.info({
+            oldName,
+            file: sym.filePath,
+            line: sym.startLine,
+            reason: tsMorphResult.reason,
+            details: tsMorphResult.details,
+            repo: repo.name,
+          }, 'ts-morph could not resolve symbol, falling back to graph rename');
+        }
       }
 
       // For Python files, try rope (scope-aware rename via the rope refactoring library)
@@ -1761,17 +1873,22 @@ export class LocalBackend {
       if (isPythonFile(sym.filePath)) {
         let ropeEdits;
         try {
-          ropeEdits = await ropeRename({
-            repoPath: repo.repoPath,
-            filePath: sym.filePath,
-            line: sym.startLine,
-            column: sym.startColumn,
-            oldName,
-            newName: new_name,
-            dryRun: dry_run,
-          });
+          ropeEdits = await withTimeout(
+            ropeRename({
+              repoPath: repo.repoPath,
+              filePath: sym.filePath,
+              line: sym.startLine,
+              column: sym.startColumn,
+              oldName,
+              newName: new_name,
+              dryRun: dry_run,
+            }),
+            RENAME_TIMEOUT_MS,
+            'rope rename',
+          );
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
+          mcpLogger.error({ err: e, oldName, newName: new_name, file: sym.filePath, line: sym.startLine, repo: repo.name }, 'rope rename failed');
           return { error: `rope rename failed: ${msg}` };
         }
 
@@ -1801,11 +1918,21 @@ export class LocalBackend {
             applied: !dry_run,
           };
         }
-        // rope returned null (symbol not resolved) — fall through to graph + text search
+
+        // rope returned null (symbol not resolved)
+        // If semantic_only, don't fall through — return error
+        if (engine === 'semantic_only') {
+          return {
+            error: `rope could not resolve symbol '${oldName}' and engine=semantic_only prevents fallback to graph/text_search`,
+            hint: 'Use engine=auto or engine=graph_only to allow fallback, or engine=with_text_search for aggressive matching',
+          };
+        }
       }
     }
 
-    // Step 3: Fallback — collect edits from graph + text search
+    // Step 3: Fallback — collect edits from graph (+ optional text search)
+    // text_search is ONLY included when explicitly requested via engine='with_text_search'
+    const includeTextSearch = engine === 'with_text_search';
     const allIncoming = [
       ...(lookupResult.incoming.calls || []),
       ...(lookupResult.incoming.imports || []),
@@ -1814,14 +1941,19 @@ export class LocalBackend {
     ];
 
     const { graphTextSearchRename } = await import('../../core/rename/graph-rename.js');
-    const fallbackResult = await graphTextSearchRename({
-      repoPath: repo.repoPath,
-      defFile: sym.filePath,
-      incomingRefs: allIncoming,
-      oldName,
-      newName: new_name,
-      dryRun: dry_run,
-    });
+    const fallbackResult = await withTimeout(
+      graphTextSearchRename({
+        repoPath: repo.repoPath,
+        defFile: sym.filePath,
+        incomingRefs: allIncoming,
+        oldName,
+        newName: new_name,
+        dryRun: dry_run,
+        includeTextSearch,
+      }),
+      RENAME_TIMEOUT_MS,
+      'graph rename',
+    );
 
     // Step 4: Format response
     const changes = new Map<string, { file_path: string; edits: any[] }>();
@@ -1839,20 +1971,33 @@ export class LocalBackend {
 
     const allChanges = Array.from(changes.values());
     const totalEdits = fallbackResult.edits.length;
-    const { graphEdits, textSearchEdits, warnings } = fallbackResult;
+    const { graphEdits, textSearchEdits, warnings: graphWarnings } = fallbackResult;
+
+    // Use descriptive engine name based on what actually ran
+    const engineName = includeTextSearch ? 'graph_text_search' : 'graph_only';
+
+    // Add warning if graph found 0 edits — likely stale index
+    const warnings = [...graphWarnings];
+    if (totalEdits === 0) {
+      warnings.push(
+        `No references found for '${oldName}'. The index may be stale — run 'gitnexus analyze' to refresh.`
+      );
+    }
 
     return {
       status: 'success',
       old_name: oldName,
       new_name,
-      engine: 'graph_text_search',
+      engine: engineName,
       files_affected: allChanges.length,
       total_edits: totalEdits,
       graph_edits: graphEdits,
-      text_search_edits: textSearchEdits,
+      ...(includeTextSearch ? { text_search_edits: textSearchEdits } : {}),
       changes: allChanges,
       applied: !dry_run,
       ...(warnings.length > 0 ? { warnings } : {}),
+      // Include diagnostic info about why semantic engine (ts-morph/rope) couldn't be used
+      ...(semanticFallbackReason ? { semantic_fallback_reason: semanticFallbackReason } : {}),
     };
   }
 
@@ -2281,7 +2426,7 @@ export class LocalBackend {
     const handle = [...this.repos.values()].find(h => h.repoPath === resolved);
     if (handle) {
       try { await closeLbug(handle.id); } catch (err) {
-        console.warn(`[reindexRepo] closeLbug pool warning for ${resolved}: ${(err as Error).message}`);
+        mcpLogger.warn({ err, repo: resolved }, 'closeLbug pool warning during reindex');
       }
       this.initializedRepos.delete(handle.id);
     }
@@ -2293,7 +2438,9 @@ export class LocalBackend {
     // Delete old db files first to avoid duplicate data (same as analyze CLI).
     await closeCoreLbug();
     for (const f of [lbugPath, `${lbugPath}.wal`, `${lbugPath}.lock`]) {
-      try { await fs.rm(f, { recursive: true, force: true }); } catch {}
+      try { await fs.rm(f, { recursive: true, force: true }); } catch (e) {
+        mcpLogger.debug({ err: e, file: f }, 'Failed to remove db file during reindex (may not exist)');
+      }
     }
     await initCoreLbug(lbugPath);
     await loadGraphToLbug(result.graph, resolved, storagePath);
@@ -2399,7 +2546,7 @@ export class LocalBackend {
       }
     } catch (err) {
       // CFG augmentation is best-effort; log but don't fail the query.
-      console.warn('[CFG augment] Failed to fetch block stats:', err instanceof Error ? err.message : String(err));
+      mcpLogger.warn({ err }, 'CFG augment failed to fetch block stats');
     }
   }
 
@@ -2606,7 +2753,7 @@ export class LocalBackend {
               `MATCH (cls)-[:CodeRelation {type: 'HAS_METHOD'}]->(ctor {id: $ctorId}) RETURN cls.id AS id LIMIT 1`,
               { ctorId });
             classId = classRows[0]?.id ?? classRows[0]?.[0] ?? '';
-          } catch {}
+          } catch (e) { logQueryError('quality:unused_injections:class-lookup', e); }
           if (!classId) continue;
 
           // Find all methods of this class (excluding the constructor)
@@ -2618,7 +2765,7 @@ export class LocalBackend {
                RETURN m.id AS id`,
               { classId });
             methodIds = methodRows.map((mr: any) => mr.id ?? mr[0] ?? '').filter(Boolean);
-          } catch {}
+          } catch (e) { logQueryError('quality:unused_injections:methods-lookup', e); }
           if (methodIds.length === 0) {
             // No sibling methods — the param is trivially unused by methods
             results.push({ paramName, filePath, classId });
@@ -2637,7 +2784,7 @@ export class LocalBackend {
                 { methodId, propName: paramName });
               const cnt = readRows[0]?.cnt ?? readRows[0]?.[0] ?? 0;
               if (cnt > 0) { used = true; break; }
-            } catch {}
+            } catch (e) { logQueryError('quality:unused_injections:reads-check', e); }
           }
           if (!used) {
             results.push({
@@ -2675,7 +2822,7 @@ export class LocalBackend {
               `MATCH (cls)-[:CodeRelation {type: 'HAS_METHOD'}]->(ctor {id: $ctorId}) RETURN cls.id AS id LIMIT 1`,
               { ctorId });
             classId = classRows[0]?.id ?? classRows[0]?.[0] ?? '';
-          } catch {}
+          } catch (e) { logQueryError('quality:overused_injections:class-lookup', e); }
           if (!classId) continue;
 
           let methodIds: string[] = [];
@@ -2686,7 +2833,7 @@ export class LocalBackend {
                RETURN m.id AS id`,
               { classId });
             methodIds = methodRows.map((mr: any) => mr.id ?? mr[0] ?? '').filter(Boolean);
-          } catch {}
+          } catch (e) { logQueryError('quality:overused_injections:methods-lookup', e); }
           if (methodIds.length === 0) continue;
 
           let usageCount = 0;
@@ -2699,7 +2846,7 @@ export class LocalBackend {
                 { methodId, propName: paramName });
               const cnt = readRows[0]?.cnt ?? readRows[0]?.[0] ?? 0;
               if (cnt > 0) usageCount += 1;
-            } catch {}
+            } catch (e) { logQueryError('quality:overused_injections:reads-check', e); }
           }
 
           const usageRatio = usageCount / methodIds.length;
@@ -2971,7 +3118,7 @@ export class LocalBackend {
                 bypassesGetter: true,
               });
             }
-          } catch {}
+          } catch (e) { logQueryError('quality:accessor_vs_direct:accessor-lookup', e); }
         }
         return violations;
       }
@@ -3043,7 +3190,7 @@ export class LocalBackend {
                 });
                 nextFrontier.push(targetId);
               }
-            } catch {}
+            } catch (e) { logQueryError('quality:hot_path:edge-traversal', e); }
           }
           frontier = nextFrontier;
           depth++;
@@ -3099,7 +3246,7 @@ export class LocalBackend {
                   filePath: er.targetFile ?? er[2] ?? '',
                 });
               }
-            } catch {}
+            } catch (e) { logQueryError('quality:guarded_paths:edge-traversal', e); }
           }
           frontier = nextFrontier;
           depth++;
@@ -3311,7 +3458,7 @@ export class LocalBackend {
                 inboundCalls: inDeg,
               });
             }
-          } catch {}
+          } catch (e) { logQueryError('quality:hotspots:meta-lookup', e); }
         }
         return results;
       }
@@ -3352,7 +3499,7 @@ export class LocalBackend {
                 outboundCalls: outDeg,
               });
             }
-          } catch {}
+          } catch (e) { logQueryError('quality:high_fan_out:meta-lookup', e); }
         }
         return results;
       }

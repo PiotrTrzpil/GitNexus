@@ -12,6 +12,7 @@ import {
   NodeTableName,
 } from './schema.js';
 import { streamAllCSVsToDisk } from './csv-generator.js';
+import { dbLogger } from '../../util/logger.js';
 
 let db: lbug.Database | null = null;
 let conn: lbug.Connection | null = null;
@@ -137,7 +138,7 @@ const doInitLbug = async (dbPath: string) => {
 
       if (lockError) {
         if (attempt < MAX_INIT_ATTEMPTS) {
-          console.warn(`⚠️ Database locked (attempt ${attempt}/${MAX_INIT_ATTEMPTS}), retrying in ${INIT_RETRY_DELAY_MS / 1000}s...`);
+          dbLogger.warn({ attempt, maxAttempts: MAX_INIT_ATTEMPTS, retryDelayMs: INIT_RETRY_DELAY_MS }, 'Database locked, retrying');
           try { if (conn) await conn.close(); } catch {}
           try { if (db) await db.close(); } catch {}
           conn = null;
@@ -154,7 +155,7 @@ const doInitLbug = async (dbPath: string) => {
       if (attempt === MAX_INIT_ATTEMPTS) throw err;
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes('Could not set lock') || msg.includes('lock')) {
-        console.warn(`⚠️ Database locked (attempt ${attempt}/${MAX_INIT_ATTEMPTS}), retrying...`);
+        dbLogger.warn({ attempt, maxAttempts: MAX_INIT_ATTEMPTS }, 'Database locked, retrying');
         await new Promise(resolve => setTimeout(resolve, INIT_RETRY_DELAY_MS * attempt));
         continue;
       }
@@ -467,7 +468,7 @@ export const insertNodeToLbug = async (
     return false;
   } catch (e: any) {
     // Node may already exist or other error
-    console.error(`Failed to insert ${label} node:`, e.message);
+    dbLogger.error({ err: e, label }, 'Failed to insert node');
     return false;
   }
 };
@@ -568,7 +569,7 @@ export const executeWithReusedStatement = async (
       }
     } catch (e) {
       // Log the error and continue with next batch
-      console.warn('Batch execution error:', e);
+      dbLogger.warn({ err: e, batchSize: subBatch.length }, 'Batch execution error');
     }
     // Note: LadybugDB PreparedStatement doesn't require explicit close()
   }
@@ -766,7 +767,7 @@ export const loadFTSExtension = async (): Promise<void> => {
     if (msg.includes('already loaded') || msg.includes('already installed') || msg.includes('already exists')) {
       ftsLoaded = true;
     } else {
-      console.error('GitNexus: FTS extension load failed:', msg);
+      dbLogger.error({ err }, 'FTS extension load failed');
     }
   }
 };
