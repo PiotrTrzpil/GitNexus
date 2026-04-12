@@ -87,6 +87,22 @@ To check whether embeddings exist, inspect `.gitnexus/meta.json` — the `stats.
 
 > Claude Code users: A PostToolUse hook handles this automatically after `git commit` and `git merge`.
 
+## Development
+
+**NEVER use `npx gitnexus` when testing changes.** Always run the local build:
+```bash
+pnpm build && node dist/cli/index.js <command>
+# OR from another repo:
+node /Users/subuser/Code/GitNexus/gitnexus/dist/cli/index.js <command>
+```
+Using `npx` runs the published package, NOT your local changes.
+
+## Troubleshooting
+
+**Log file location:** `~/.gitnexus/logs/gitnexus.log` (rotated at 5MB, 3 files kept)
+
+Set `GITNEXUS_LOG_LEVEL=debug` for verbose logging, or `GITNEXUS_LOG_PRETTY=1` for human-readable stderr output during development.
+
 ## CLI
 
 | Task | Read this skill file |
