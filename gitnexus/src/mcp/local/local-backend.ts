@@ -1775,26 +1775,25 @@ export class LocalBackend {
     // Step 2: For TS/JS files, try ts-morph (scope-aware rename via the TS language service)
     // Skip if engine === 'graph_only' — user wants to bypass semantic analysis
     if (engine !== 'graph_only' && sym.filePath && sym.startLine) {
-      const { isTypeScriptFile, tsMorphRename } = await import('../../core/rename/ts-morph-rename.js');
+      const { isTypeScriptFile } = await import('../../core/rename/ts-morph-rename.js');
       if (isTypeScriptFile(sym.filePath)) {
-        // tsMorphRename returns a result object with status 'success' or 'not_found'.
-        // It throws on infrastructure errors — we catch those and return them as errors.
+        // Use worker-based ts-morph rename for hard timeout enforcement.
+        // The worker can be terminated if it exceeds the timeout, which is the only
+        // way to interrupt synchronous TypeScript compiler operations.
+        const { tsMorphRenameInWorker } = await import('../../core/rename/ts-morph-worker-client.js');
         let tsMorphResult;
         let tsMorphTimedOut = false;
         try {
-          tsMorphResult = await withTimeout(
-            tsMorphRename({
-              repoPath: repo.repoPath,
-              filePath: sym.filePath,
-              line: sym.startLine,
-              column: sym.startColumn,
-              oldName,
-              newName: new_name,
-              dryRun: dry_run,
-            }),
-            RENAME_TIMEOUT_MS,
-            'ts-morph rename',
-          );
+          tsMorphResult = await tsMorphRenameInWorker({
+            repoPath: repo.repoPath,
+            filePath: sym.filePath,
+            line: sym.startLine,
+            column: sym.startColumn,
+            oldName,
+            newName: new_name,
+            dryRun: dry_run,
+            timeoutMs: RENAME_TIMEOUT_MS,
+          });
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
           // On timeout, fall through to graph-based rename instead of failing (unless semantic_only)

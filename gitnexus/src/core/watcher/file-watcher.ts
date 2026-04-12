@@ -16,6 +16,9 @@ import path from 'path';
 import { glob } from 'glob';
 import { createIgnoreFilter } from '../../config/ignore-service.js';
 import { tryAcquireLock, releaseLock } from '../../util/lockfile.js';
+import { logger } from '../../util/logger.js';
+
+const watcherLogger = logger.child({ context: 'watcher' });
 
 export interface WatcherOptions {
   onReindex: (repoPath: string) => Promise<void>;
@@ -132,21 +135,24 @@ async function pollRepo(
   options: WatcherOptions
 ): Promise<void> {
   const maxIntervalMs = options.maxIntervalMs ?? 60000;
+  const repoName = path.basename(repo.path);
 
   // Verify the root path still exists
   try {
     await fs.stat(repo.path);
   } catch {
-    console.warn(`[watcher] repo path gone: ${repo.path}`);
+    watcherLogger.warn({ repo: repoName }, 'Repo path gone, skipping poll');
     state.nextPollAt = Date.now() + maxIntervalMs;
     return;
   }
+
+  watcherLogger.debug({ repo: repoName }, 'Polling for changes');
 
   let snap: Map<string, FileSnapshot>;
   try {
     snap = await captureSnapshot(repo.path);
   } catch (err) {
-    console.warn(`[watcher] snapshot failed for ${repo.path}:`, err);
+    watcherLogger.warn({ err, repo: repoName }, 'Snapshot capture failed');
     const interval = computeInterval(repo.fileCount, maxIntervalMs);
     state.nextPollAt = Date.now() + interval;
     return;
@@ -157,24 +163,40 @@ async function pollRepo(
 
   if (state.snapshot === null) {
     // First poll — establish baseline, do not trigger reindex
+    watcherLogger.info({ repo: repoName, fileCount, intervalMs: interval }, 'Baseline snapshot established');
     state.snapshot = snap;
     state.nextPollAt = Date.now() + interval;
     return;
   }
 
   if (snapshotsEqual(state.snapshot, snap)) {
+    watcherLogger.debug({ repo: repoName, intervalMs: interval }, 'No changes detected');
     state.nextPollAt = Date.now() + interval;
     return;
   }
 
+  // Find what changed for logging
+  const changedFiles: string[] = [];
+  for (const [file, curr] of snap) {
+    const prev = state.snapshot.get(file);
+    if (!prev || prev.mtime !== curr.mtime || prev.size !== curr.size) {
+      changedFiles.push(file);
+      if (changedFiles.length >= 5) break; // Limit for logging
+    }
+  }
+
+  watcherLogger.info({ repo: repoName, changedFiles, totalChanges: changedFiles.length }, 'Changes detected');
+
   // Changes detected — skip if a reindex is already in flight (TryLock pattern)
   if (state.reindexing) {
+    watcherLogger.debug({ repo: repoName }, 'Reindex already in progress, skipping');
     state.nextPollAt = Date.now() + interval;
     return;
   }
 
   // Cross-process lock — another MCP instance may already be reindexing
   if (!(await tryAcquireReindexLock(repo.path))) {
+    watcherLogger.debug({ repo: repoName }, 'Another process is reindexing, skipping');
     // Another process holds the lock — skip this cycle, update snapshot
     // so we don't re-trigger on the same diff next cycle
     state.snapshot = snap;
@@ -182,14 +204,16 @@ async function pollRepo(
     return;
   }
 
+  watcherLogger.info({ repo: repoName }, 'Triggering reindex');
   state.reindexing = true;
   try {
     await options.onReindex(repo.path);
+    watcherLogger.info({ repo: repoName, fileCount: snap.size }, 'Reindex completed');
     // Successful reindex — update snapshot and recalculate interval
     state.snapshot = snap;
     state.nextPollAt = Date.now() + computeInterval(snap.size, maxIntervalMs);
   } catch (err) {
-    console.warn(`[watcher] reindex failed for ${repo.path}:`, err);
+    watcherLogger.error({ err, repo: repoName }, 'Reindex failed');
     // Keep old snapshot so we retry next cycle
     state.nextPollAt = Date.now() + interval;
   } finally {
@@ -212,6 +236,11 @@ export function startWatcher(
 ): () => void {
   const gracePeriodMs = options.gracePeriodMs ?? 5000;
   const maxIntervalMs = options.maxIntervalMs ?? 60000;
+
+  watcherLogger.info(
+    { repoCount: repos.length, repos: repos.map(r => path.basename(r.path)), gracePeriodMs, maxIntervalMs },
+    'Starting file watcher'
+  );
 
   // One state entry per repo, keyed by repo path
   const states = new Map<string, RepoState>();

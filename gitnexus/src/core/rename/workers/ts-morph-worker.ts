@@ -1,23 +1,27 @@
 /**
- * ts-morph-powered rename for TypeScript/JavaScript files.
- * Uses the TypeScript language service for scope-aware, semantically correct renames.
+ * Worker thread for ts-morph rename operations.
  *
- * Error contract:
- * - Returns `null` when the symbol cannot be located (clean signal to fall back).
- * - Throws on infrastructure errors (IO, parse, bad tsconfig) — caller must handle.
+ * ts-morph uses the TypeScript compiler which has synchronous, CPU-bound operations
+ * that block the event loop. Running in a worker thread allows the main thread to
+ * enforce hard timeouts via worker.terminate().
  */
 
-import * as path from 'path';
-import * as fs from 'fs/promises';
-import { renameLogger } from '../../util/logger.js';
+import { parentPort } from 'node:worker_threads';
+import * as path from 'node:path';
+import * as fs from 'node:fs/promises';
 
-const TS_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mts', '.cts', '.mjs', '.cjs']);
-
-export function isTypeScriptFile(filePath: string): boolean {
-  return TS_EXTENSIONS.has(path.extname(filePath));
+interface RenameRequest {
+  type: 'rename';
+  repoPath: string;
+  filePath: string;
+  line: number;
+  column?: number;
+  oldName: string;
+  newName: string;
+  dryRun: boolean;
 }
 
-export interface TsMorphEdit {
+interface RenameEdit {
   filePath: string;
   line: number;
   old_text: string;
@@ -25,15 +29,13 @@ export interface TsMorphEdit {
   confidence: 'ts_morph';
 }
 
-/** Result when ts-morph successfully finds rename locations */
-export interface TsMorphSuccess {
-  status: 'success';
-  edits: TsMorphEdit[];
+interface SuccessResult {
+  type: 'success';
+  edits: RenameEdit[];
 }
 
-/** Result when ts-morph cannot resolve the symbol — includes diagnostic reason */
-export interface TsMorphNotFound {
-  status: 'not_found';
+interface NotFoundResult {
+  type: 'not_found';
   reason: string;
   details?: {
     file?: string;
@@ -44,10 +46,15 @@ export interface TsMorphNotFound {
   };
 }
 
-export type TsMorphResult = TsMorphSuccess | TsMorphNotFound;
+interface ErrorResult {
+  type: 'error';
+  message: string;
+}
+
+type WorkerResult = SuccessResult | NotFoundResult | ErrorResult;
 
 /** Walk up from startPath to find the nearest tsconfig.json within repoPath. */
-export async function findTsConfig(repoPath: string, startPath: string): Promise<string | undefined> {
+async function findTsConfig(repoPath: string, startPath: string): Promise<string | undefined> {
   let dir = path.dirname(startPath);
   while (dir.startsWith(repoPath)) {
     const candidate = path.join(dir, 'tsconfig.json');
@@ -55,60 +62,42 @@ export async function findTsConfig(repoPath: string, startPath: string): Promise
       await fs.access(candidate);
       return candidate;
     } catch (err: unknown) {
-      // Only swallow "file not found" — rethrow permission errors, etc.
       if (err instanceof Error && 'code' in err && (err as NodeJS.ErrnoException).code === 'ENOENT') {
         const parent = path.dirname(dir);
         if (parent === dir) break;
         dir = parent;
         continue;
       }
-      renameLogger.error({ err, dir, candidate }, 'Error accessing tsconfig.json');
       throw err;
     }
   }
   return undefined;
 }
 
-/**
- * Find all rename locations for a symbol using ts-morph, and optionally apply them.
- *
- * @returns Result object with edits on success, or diagnostic info on failure.
- * @throws On IO errors, broken tsconfig, or ts-morph failures.
- */
-export async function tsMorphRename(opts: {
-  repoPath: string;
-  filePath: string;    // relative to repoPath
-  line: number;        // 1-based
-  column?: number;     // 0-based column of the name node; skip regex when provided and > 0
-  oldName: string;
-  newName: string;
-  dryRun: boolean;
-}): Promise<TsMorphResult> {
-  const { repoPath, filePath, line, column, oldName, newName, dryRun } = opts;
+async function handleRename(req: RenameRequest): Promise<WorkerResult> {
+  const { repoPath, filePath, line, column, oldName, newName, dryRun } = req;
   const absoluteFile = path.resolve(repoPath, filePath);
 
   // Validate inputs
-  if (line < 1) throw new Error(`Invalid line number: ${line} (must be >= 1)`);
-  if (!oldName) throw new Error('oldName is required');
-  if (!newName) throw new Error('newName is required');
+  if (line < 1) return { type: 'error', message: `Invalid line number: ${line} (must be >= 1)` };
+  if (!oldName) return { type: 'error', message: 'oldName is required' };
+  if (!newName) return { type: 'error', message: 'newName is required' };
 
-  // Check file existence before loading ts-morph (fast fail)
+  // Check file existence
   try {
     await fs.access(absoluteFile);
   } catch (err: unknown) {
     if (err instanceof Error && 'code' in err && (err as NodeJS.ErrnoException).code === 'ENOENT') {
-      renameLogger.debug({ file: absoluteFile, oldName }, 'File not found for ts-morph rename');
       return {
-        status: 'not_found',
+        type: 'not_found',
         reason: `File not found: ${filePath}`,
         details: { file: filePath, searchedFor: oldName },
       };
     }
-    renameLogger.error({ err, file: absoluteFile, oldName }, 'File access error in ts-morph rename');
-    throw err; // permission error or other — propagate
+    throw err;
   }
 
-  // Lazy import — ts-morph is heavy, only load when needed
+  // Import ts-morph (heavy, do it here in the worker)
   const { Project, Node, SyntaxKind } = await import('ts-morph');
 
   const tsConfigPath = await findTsConfig(repoPath, absoluteFile);
@@ -141,7 +130,7 @@ export async function tsMorphRename(opts: {
   const sourceFile = project.getSourceFile(absoluteFile);
   if (!sourceFile) {
     return {
-      status: 'not_found',
+      type: 'not_found',
       reason: `ts-morph could not load source file: ${filePath}`,
       details: { file: filePath, searchedFor: oldName },
     };
@@ -153,7 +142,7 @@ export async function tsMorphRename(opts: {
 
   if (line > lines.length) {
     return {
-      status: 'not_found',
+      type: 'not_found',
       reason: `Line ${line} is out of range (file has ${lines.length} lines) — index may be stale, run 'gitnexus analyze'`,
       details: { file: filePath, line, searchedFor: oldName },
     };
@@ -168,12 +157,10 @@ export async function tsMorphRename(opts: {
     lineStartPos += lines[i].length + 1; // +1 for newline
   }
 
-  // Locate the identifier: use the provided column for a direct position lookup,
-  // or fall back to iterating regex matches (the first may land in a comment/string).
+  // Locate the identifier
   let identifier: import('ts-morph').Identifier | undefined;
 
   if (column != null && column > 0) {
-    // Fast path: jump directly to the exact character position
     const pos = lineStartPos + column;
     const nodeAtPos = sourceFile.getDescendantAtPos(pos);
     if (nodeAtPos) {
@@ -185,7 +172,6 @@ export async function tsMorphRename(opts: {
       }
     }
   } else {
-    // Regex fallback: iterate matches on the line until an Identifier AST node is found
     let match: RegExpExecArray | null;
     while ((match = nameRegex.exec(targetLine)) !== null) {
       const pos = lineStartPos + match.index;
@@ -201,8 +187,8 @@ export async function tsMorphRename(opts: {
       }
     }
   }
+
   if (!identifier) {
-    // Check if the name appears on the line as a whole word (not as a substring of another identifier)
     const wordBoundaryRegex = new RegExp(`\\b${oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`);
     const nameOnLineAsWord = wordBoundaryRegex.test(targetLine);
     const nameAsSubstring = targetLine.includes(oldName) && !nameOnLineAsWord;
@@ -216,7 +202,7 @@ export async function tsMorphRename(opts: {
       reason = `Symbol '${oldName}' not found on line ${line} — index is stale, run 'gitnexus analyze'`;
     }
     return {
-      status: 'not_found',
+      type: 'not_found',
       reason,
       details: {
         file: filePath,
@@ -232,7 +218,7 @@ export async function tsMorphRename(opts: {
   const renameLocations = project.getLanguageService().findRenameLocations(identifier);
   if (!renameLocations || renameLocations.length === 0) {
     return {
-      status: 'not_found',
+      type: 'not_found',
       reason: `TypeScript language service found no rename locations for '${oldName}' — symbol may be in an unresolved module or have no references`,
       details: {
         file: filePath,
@@ -244,14 +230,7 @@ export async function tsMorphRename(opts: {
     };
   }
 
-  // --- Shorthand property expansion ---
-  // When renaming an interface/type property that's used in shorthand object literal syntax
-  // (e.g., `{ destBuilding }` which means `{ destBuilding: destBuilding }`), ts-morph's rename
-  // only changes the property key, resulting in `{ newName }` — but there's no variable `newName`
-  // in scope. We must expand these to explicit syntax BEFORE renaming:
-  // `{ destBuilding }` → `{ destBuilding: destBuilding }` → after rename → `{ newName: destBuilding }`
-  //
-  // We track shorthand positions for edit preview (dry-run) and expand them for actual rename.
+  // Handle shorthand property expansion
   interface ShorthandInfo {
     shorthand: import('ts-morph').ShorthandPropertyAssignment;
     filePath: string;
@@ -266,22 +245,15 @@ export async function tsMorphRename(opts: {
     const nodeAtPos = locSourceFile.getDescendantAtPos(start);
     if (!nodeAtPos) continue;
 
-    // Walk up to find if this identifier is inside a ShorthandPropertyAssignment
     const shorthand = nodeAtPos.getFirstAncestorByKind(SyntaxKind.ShorthandPropertyAssignment);
     if (!shorthand) continue;
 
-    // Check if the shorthand's name matches the identifier we're renaming
-    // and the variable it references is different from the property being renamed
     const shorthandName = shorthand.getNameNode();
     if (shorthandName.getText() !== oldName) continue;
 
-    // The shorthand references a local variable/parameter. If that variable is NOT part
-    // of the rename (i.e., it's a different symbol), we need to expand the shorthand.
-    // We detect this by checking if the shorthand's symbol differs from the identifier's symbol.
     const shorthandSymbol = shorthandName.getSymbol();
     const identifierSymbol = identifier.getSymbol();
 
-    // If symbols differ, the shorthand must be expanded
     if (shorthandSymbol !== identifierSymbol) {
       shorthandsToExpand.push({
         shorthand,
@@ -291,14 +263,12 @@ export async function tsMorphRename(opts: {
     }
   }
 
-  // Build a set of shorthand positions for quick lookup during edit generation
   const shorthandPositions = new Set(
     shorthandsToExpand.map((s) => `${s.filePath}:${s.start}`),
   );
 
-  // Build the edit list BEFORE any AST modifications (shorthand expansion)
-  // This ensures edit previews reflect the original state accurately
-  const edits: TsMorphEdit[] = [];
+  // Build the edit list
+  const edits: RenameEdit[] = [];
 
   for (const loc of renameLocations) {
     const locSourceFile = loc.getSourceFile();
@@ -307,7 +277,6 @@ export async function tsMorphRename(opts: {
     const span = loc.getTextSpan();
     const start = span.getStart();
 
-    // Find line number for this span
     let charCount = 0;
     let locLineNum = -1;
     for (let i = 0; i < locLines.length; i++) {
@@ -315,36 +284,29 @@ export async function tsMorphRename(opts: {
         locLineNum = i;
         break;
       }
-      charCount += locLines[i].length + 1; // +1 for newline
+      charCount += locLines[i].length + 1;
     }
 
     if (locLineNum === -1) {
-      const errMsg = `ts-morph rename: span start ${start} is beyond end of file ${locSourceFile.getFilePath()} (${locFullText.length} chars)`;
-      renameLogger.error({ start, file: locSourceFile.getFilePath(), fileLength: locFullText.length, oldName, newName }, 'Span beyond EOF');
-      throw new Error(errMsg);
+      return { type: 'error', message: `Span start ${start} is beyond end of file ${locSourceFile.getFilePath()}` };
     }
 
     const lineText = locLines[locLineNum];
     const colInLine = start - charCount;
 
     if (colInLine < 0 || colInLine + span.getLength() > lineText.length) {
-      const errMsg = `ts-morph rename: span [${colInLine}, ${colInLine + span.getLength()}] out of bounds for line ${locLineNum + 1} (length ${lineText.length}) in ${locSourceFile.getFilePath()}`;
-      renameLogger.error({ colInLine, spanLength: span.getLength(), line: locLineNum + 1, lineLength: lineText.length, file: locSourceFile.getFilePath(), oldName, newName }, 'Span out of bounds');
-      throw new Error(errMsg);
+      return { type: 'error', message: `Span out of bounds for line ${locLineNum + 1} in ${locSourceFile.getFilePath()}` };
     }
 
-    // Check if this is a shorthand property that needs expansion
     const isShorthand = shorthandPositions.has(`${locSourceFile.getFilePath()}:${start}`);
     let newLineText: string;
 
     if (isShorthand) {
-      // For shorthand properties, expand to explicit syntax: `prop` → `newName: prop`
       newLineText =
         lineText.substring(0, colInLine) +
         `${newName}: ${oldName}` +
         lineText.substring(colInLine + span.getLength());
     } else {
-      // Normal replacement
       newLineText =
         lineText.substring(0, colInLine) +
         newName +
@@ -362,19 +324,26 @@ export async function tsMorphRename(opts: {
 
   // Apply changes if not a dry run
   if (!dryRun) {
-    // Step 1: Expand shorthand properties BEFORE applying the rename
-    // This converts `{ foo }` to `{ foo: foo }` so ts-morph only renames the property key
     if (shorthandsToExpand.length > 0) {
       for (const { shorthand } of shorthandsToExpand) {
         const varName = shorthand.getName();
         shorthand.replaceWithText(`${varName}: ${varName}`);
       }
     }
-
-    // Step 2: Apply the rename — ts-morph handles the expanded properties correctly
     identifier.rename(newName);
     await project.save();
   }
 
-  return { status: 'success', edits };
+  return { type: 'success', edits };
 }
+
+// Worker message handler
+parentPort?.on('message', async (msg: RenameRequest) => {
+  try {
+    const result = await handleRename(msg);
+    parentPort?.postMessage(result);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    parentPort?.postMessage({ type: 'error', message } as ErrorResult);
+  }
+});

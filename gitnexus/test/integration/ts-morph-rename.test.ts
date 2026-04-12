@@ -75,19 +75,20 @@ async function renameAndAssert(
   project: TempProject,
   opts: { filePath: string; line: number; oldName: string; newName: string; dryRun?: boolean },
 ) {
-  const edits = await tsMorphRename({
+  const result = await tsMorphRename({
     repoPath: project.root,
     dryRun: opts.dryRun ?? false,
     ...opts,
   });
-  expect(edits).not.toBeNull();
-  expect(edits!.length).toBeGreaterThan(0);
-  for (const edit of edits!) {
+  expect(result.status).toBe('success');
+  if (result.status !== 'success') throw new Error('Expected success');
+  expect(result.edits.length).toBeGreaterThan(0);
+  for (const edit of result.edits) {
     expect(edit.confidence).toBe('ts_morph');
     expect(edit.line).toBeGreaterThan(0);
     expect(edit.filePath).toBeTruthy();
   }
-  return edits!;
+  return result.edits;
 }
 
 // ─── isTypeScriptFile ───────────────────────────────────────────────────
@@ -1091,8 +1092,8 @@ describe('tsMorphRename', () => {
 
     afterAll(async () => { await project.cleanup(); });
 
-    it('returns null when symbol is not on the specified line', async () => {
-      const edits = await tsMorphRename({
+    it('returns not_found when symbol is not on the specified line', async () => {
+      const result = await tsMorphRename({
         repoPath: project.root,
         filePath: 'src/exists.ts',
         line: 1,
@@ -1100,11 +1101,11 @@ describe('tsMorphRename', () => {
         newName: 'whatever',
         dryRun: true,
       });
-      expect(edits).toBeNull();
+      expect(result.status).toBe('not_found');
     });
 
-    it('returns null when line number exceeds file length', async () => {
-      const edits = await tsMorphRename({
+    it('returns not_found when line number exceeds file length', async () => {
+      const result = await tsMorphRename({
         repoPath: project.root,
         filePath: 'src/exists.ts',
         line: 999,
@@ -1112,11 +1113,11 @@ describe('tsMorphRename', () => {
         newName: 'y',
         dryRun: true,
       });
-      expect(edits).toBeNull();
+      expect(result.status).toBe('not_found');
     });
 
-    it('returns null for a non-existent file (ENOENT)', async () => {
-      const edits = await tsMorphRename({
+    it('returns not_found for a non-existent file (ENOENT)', async () => {
+      const result = await tsMorphRename({
         repoPath: project.root,
         filePath: 'src/missing.ts',
         line: 1,
@@ -1124,7 +1125,7 @@ describe('tsMorphRename', () => {
         newName: 'bar',
         dryRun: true,
       });
-      expect(edits).toBeNull();
+      expect(result.status).toBe('not_found');
     });
 
     it('throws on invalid line number (< 1)', async () => {
@@ -1427,7 +1428,7 @@ describe('tsMorphRename', () => {
       });
 
       try {
-        const edits = await tsMorphRename({
+        const result = await tsMorphRename({
           repoPath: dryRunProject.root,
           filePath: 'src/types.ts',
           line: 2,
@@ -1436,11 +1437,12 @@ describe('tsMorphRename', () => {
           dryRun: true,
         });
 
-        expect(edits).not.toBeNull();
-        expect(edits!.length).toBeGreaterThan(0);
+        expect(result.status).toBe('success');
+        if (result.status !== 'success') throw new Error('Expected success');
+        expect(result.edits.length).toBeGreaterThan(0);
 
         // Find the builder.ts edit
-        const builderEdit = edits!.find((e) => e.filePath === 'src/builder.ts');
+        const builderEdit = result.edits.find((e) => e.filePath === 'src/builder.ts');
         expect(builderEdit).toBeDefined();
 
         // Dry-run preview must show the expanded form

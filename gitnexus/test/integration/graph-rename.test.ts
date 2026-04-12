@@ -296,6 +296,7 @@ describe('graph-rename: text search fallback', () => {
         oldName: 'getData',
         newName: 'fetchData',
         dryRun: true,
+        includeTextSearch: true,
       });
 
       const byFile = editsByFile(result.edits);
