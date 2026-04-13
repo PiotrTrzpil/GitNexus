@@ -704,10 +704,14 @@ export const executeQuery = async (repoId: string, cypher: string): Promise<any[
   dbLogger.debug({ repoId, query: cypher.slice(0, 100) }, 'Executing query');
 
   const conn = await checkout(entry);
+  let result: any = null;
   try {
     const queryResult = await withTimeout(conn.query(cypher), QUERY_TIMEOUT_MS, 'Query');
-    const result = Array.isArray(queryResult) ? queryResult[0] : queryResult;
+    result = Array.isArray(queryResult) ? queryResult[0] : queryResult;
     const rows = await result.getAll();
+    // Explicitly close result to prevent GC destructor hang (LadybugDB bug)
+    try { result.close(); } catch {}
+    result = null;
     return rows;
   } catch (err: any) {
     const error = err instanceof Error ? err : new Error(String(err));
@@ -718,6 +722,8 @@ export const executeQuery = async (repoId: string, cypher: string): Promise<any[
     }
     throw error;
   } finally {
+    // Always close result to prevent GC destructor hang
+    if (result) { try { result.close(); } catch {} }
     checkin(entry, conn);
   }
 };
@@ -763,6 +769,7 @@ export const executeParameterized = async (
   dbLogger.debug({ repoId, query: cypher.slice(0, 100) }, 'Executing parameterized query');
 
   const conn = await checkout(entry);
+  let result: any = null;
   try {
     const stmt: any = await withTimeout(conn.prepare(cypher), QUERY_TIMEOUT_MS, 'Prepare');
     if (!stmt.isSuccess()) {
@@ -770,8 +777,11 @@ export const executeParameterized = async (
       throw new Error(`Prepare failed: ${errMsg}`);
     }
     const queryResult = await withTimeout(conn.execute(stmt, params), QUERY_TIMEOUT_MS, 'Execute');
-    const result = Array.isArray(queryResult) ? queryResult[0] : queryResult;
+    result = Array.isArray(queryResult) ? queryResult[0] : queryResult;
     const rows = await result.getAll();
+    // Explicitly close result to prevent GC destructor hang (LadybugDB bug)
+    try { result.close(); } catch {}
+    result = null;
     return rows;
   } catch (err: any) {
     const error = err instanceof Error ? err : new Error(String(err));
@@ -781,6 +791,8 @@ export const executeParameterized = async (
     }
     throw error;
   } finally {
+    // Always close result to prevent GC destructor hang
+    if (result) { try { result.close(); } catch {} }
     checkin(entry, conn);
   }
 };

@@ -49,7 +49,7 @@
   },
   "dependencies": {
     "@huggingface/transformers": "^3.0.0",
-    "@ladybugdb/core": "^0.15.1",
+    "@ladybugdb/core": "^0.15.3",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "cli-progress": "^3.12.0",
     "commander": "^12.0.0",
@@ -63,6 +63,8 @@
     "lru-cache": "^11.0.0",
     "mnemonist": "^0.39.0",
     "pandemonium": "^2.4.0",
+    "pino": "^9.6.0",
+    "pino-pretty": "^13.0.0",
     "tree-sitter": "0.22.4",
     "tree-sitter-c": "0.23.6",
     "tree-sitter-c-sharp": "0.23.1",
@@ -78,9 +80,7 @@
     "ts-morph": "^27.0.2",
     "uuid": "^13.0.0",
     "xxhash-wasm": "^1.1.0",
-    "yaml": "^2.8.2",
-    "pino": "^9.6.0",
-    "pino-pretty": "^13.0.0"
+    "yaml": "^2.8.2"
   },
   "optionalDependencies": {
     "@gitnexus/oxc-cfg": "file:native/oxc-cfg-napi",
@@ -118,7 +118,8 @@
       "tree-sitter-swift",
       "tree-sitter-typescript",
       "fsevents",
-      "@gitnexus/oxc-cfg"
+      "@gitnexus/oxc-cfg",
+      "@ladybugdb/core"
     ]
   }
 }

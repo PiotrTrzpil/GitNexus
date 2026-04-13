@@ -542,8 +542,13 @@ export const executeQuery = async (cypher: string): Promise<any[]> => {
   // LadybugDB uses getAll() instead of hasNext()/getNext()
   // Query returns QueryResult for single queries, QueryResult[] for multi-statement
   const result = Array.isArray(queryResult) ? queryResult[0] : queryResult;
-  const rows = await result.getAll();
-  return rows;
+  try {
+    const rows = await result.getAll();
+    return rows;
+  } finally {
+    // Explicitly close result to prevent GC destructor hang (LadybugDB bug)
+    try { result.close(); } catch {}
+  }
 };
 
 export const executeWithReusedStatement = async (
@@ -622,9 +627,10 @@ export const loadCachedEmbeddings = async (): Promise<{
 
   const embeddingNodeIds = new Set<string>();
   const embeddings: Array<{ nodeId: string; embedding: number[] }> = [];
+  let result: any = null;
   try {
     const rows = await conn.query(`MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN e.nodeId AS nodeId, e.embedding AS embedding`);
-    const result = Array.isArray(rows) ? rows[0] : rows;
+    result = Array.isArray(rows) ? rows[0] : rows;
     for (const row of await result.getAll()) {
       const nodeId = String(row.nodeId ?? row[0] ?? '');
       if (!nodeId) continue;
@@ -638,6 +644,10 @@ export const loadCachedEmbeddings = async (): Promise<{
       }
     }
   } catch { /* embedding table may not exist */ }
+  finally {
+    // Explicitly close result to prevent GC destructor hang (LadybugDB bug)
+    if (result) { try { result.close(); } catch {} }
+  }
 
   return { embeddingNodeIds, embeddings };
 };
@@ -700,14 +710,18 @@ export const deleteNodesForFile = async (filePath: string, dbPath?: string): Pro
       // Skip tables that don't have filePath (Community, Process)
       if (tableName === 'Community' || tableName === 'Process') continue;
 
+      let result: any = null;
       try {
         // First count how many we'll delete
         const tn = escapeTableName(tableName);
         const countResult = await targetConn!.query(
           `MATCH (n:${tn}) WHERE n.filePath = '${escapedPath}' RETURN count(n) AS cnt`
         );
-        const result = Array.isArray(countResult) ? countResult[0] : countResult;
+        result = Array.isArray(countResult) ? countResult[0] : countResult;
         const rows = await result.getAll();
+        // Close result immediately after reading
+        try { result.close(); } catch {}
+        result = null;
         const count = Number(rows[0]?.cnt ?? rows[0]?.[0] ?? 0);
 
         if (count > 0) {
@@ -719,6 +733,8 @@ export const deleteNodesForFile = async (filePath: string, dbPath?: string): Pro
         }
       } catch (e) {
         // Some tables may not support this query, skip
+      } finally {
+        if (result) { try { result.close(); } catch {} }
       }
     }
 
@@ -833,10 +849,14 @@ export const queryFTS = async (
     LIMIT ${limit}
   `;
 
+  let result: any = null;
   try {
     const queryResult = await conn.query(cypher);
-    const result = Array.isArray(queryResult) ? queryResult[0] : queryResult;
+    result = Array.isArray(queryResult) ? queryResult[0] : queryResult;
     const rows = await result.getAll();
+    // Close result immediately after reading
+    try { result.close(); } catch {}
+    result = null;
 
     return rows.map((row: any) => {
       const node = row.node || row[0] || {};
@@ -855,6 +875,8 @@ export const queryFTS = async (
       return [];
     }
     throw e;
+  } finally {
+    if (result) { try { result.close(); } catch {} }
   }
 };
 
