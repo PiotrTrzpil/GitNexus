@@ -10,14 +10,14 @@
 import fs from 'fs/promises';
 import nodePath from 'path';
 import {
-  shouldIgnorePath,
   isHardcodedIgnoredDirectory,
+  isHardcodedFileExclusion,
   loadIgnoreRules,
 } from '../config/ignore-service.js';
 
 type Verdict = {
   reason: string;
-  source: 'gitignore' | 'gitnexusignore' | 'default-list' | 'extension' | 'filename' | 'pattern' | 'hidden';
+  source: 'default-list';
 };
 
 async function findRepoRoot(start: string): Promise<string> {
@@ -33,7 +33,7 @@ async function findRepoRoot(start: string): Promise<string> {
   }
 }
 
-const explainHardcodedRule = (rel: string): Verdict | null => {
+const explainHardcodedDirectoryRule = (rel: string): Verdict | null => {
   const parts = rel.replace(/\\/g, '/').split('/');
   for (const part of parts) {
     if (isHardcodedIgnoredDirectory(part)) {
@@ -43,18 +43,7 @@ const explainHardcodedRule = (rel: string): Verdict | null => {
       };
     }
   }
-  if (!shouldIgnorePath(rel)) return null;
-
-  const fileName = parts[parts.length - 1];
-  const lower = fileName.toLowerCase();
-  const lastDot = lower.lastIndexOf('.');
-  if (lastDot !== -1) {
-    return {
-      reason: `extension "${lower.substring(lastDot)}" or compound extension is in IGNORED_EXTENSIONS`,
-      source: 'extension',
-    };
-  }
-  return { reason: 'matched IGNORED_FILES or pattern check', source: 'pattern' };
+  return null;
 };
 
 export async function whyIgnoredCommand(targetPath: string): Promise<void> {
@@ -75,7 +64,16 @@ export async function whyIgnoredCommand(targetPath: string): Promise<void> {
 
   process.stdout.write(`repo:   ${repoRoot}\npath:   ${rel}\n\n`);
 
-  // 1. User .gitignore / .gitnexusignore — explicit unignore wins over everything.
+  // 1. Binary/non-source file exclusions — apply BEFORE user override.
+  //    PNG, lock files, .min.js, etc. are never source, even if git tracks them.
+  if (isHardcodedFileExclusion(rel)) {
+    process.stdout.write(`  ignored: hardcoded file exclusion (binary type, lock file, or generated)\n`);
+    process.stdout.write(`  source:  extension/filename\n`);
+    process.stdout.write(`  note:    user negations in .gitignore/.gitnexusignore do NOT override this\n`);
+    return;
+  }
+
+  // 2. User .gitignore / .gitnexusignore — explicit unignore wins for dir-level rules.
   const ig = await loadIgnoreRules(repoRoot);
   if (ig) {
     const r = ig.test(rel);
@@ -90,15 +88,15 @@ export async function whyIgnoredCommand(targetPath: string): Promise<void> {
     }
   }
 
-  // 2. Hardcoded DEFAULT_IGNORE_LIST / extensions / filenames.
-  const hardcoded = explainHardcodedRule(rel);
+  // 3. Hardcoded DEFAULT_IGNORE_LIST (directories).
+  const hardcoded = explainHardcodedDirectoryRule(rel);
   if (hardcoded) {
     process.stdout.write(`  ignored: ${hardcoded.reason}\n`);
     process.stdout.write(`  source:  ${hardcoded.source}\n`);
     return;
   }
 
-  // 3. Hidden files (glob's `dot: false` strips these even without ignore rules).
+  // 4. Hidden files (glob's `dot: false` strips these even without ignore rules).
   const fileName = rel.split('/').pop() ?? '';
   if (fileName.startsWith('.')) {
     process.stdout.write(`  ignored: hidden file (filesystem walker uses dot:false)\n`);

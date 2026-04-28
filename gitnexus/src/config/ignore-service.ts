@@ -191,35 +191,28 @@ const IGNORED_FILES = new Set([
 
 
 
-// Negation patterns in .gitnexusignore (e.g. `!output/`) DO override the
-// hardcoded DEFAULT_IGNORE_LIST. The hardcoded list catches common build/cache
-// directories by default, but the user remains the source of truth for their
-// own repo: an explicit `!name/` re-includes anything the defaults would drop.
-export const shouldIgnorePath = (filePath: string): boolean => {
+/**
+ * Hardcoded file-name / extension exclusions that ALWAYS apply, even when the
+ * user has an explicit `!negation` in .gitignore / .gitnexusignore. These are
+ * binary types, lock files, minified bundles, etc. — never source code, no
+ * matter how git treats them. (Example: a repo may track `docs/assets/*.png`
+ * with `!docs/assets/*.png`, but PNGs still aren't source.)
+ */
+export const isHardcodedFileExclusion = (filePath: string): boolean => {
   const normalizedPath = filePath.replace(/\\/g, '/');
   const parts = normalizedPath.split('/');
   const fileName = parts[parts.length - 1];
   const fileNameLower = fileName.toLowerCase();
 
-  // Check if any path segment is in ignore list
-  for (const part of parts) {
-    if (DEFAULT_IGNORE_LIST.has(part)) {
-      return true;
-    }
-  }
-
-  // Check exact filename matches
   if (IGNORED_FILES.has(fileName) || IGNORED_FILES.has(fileNameLower)) {
     return true;
   }
 
-  // Check extension
   const lastDotIndex = fileNameLower.lastIndexOf('.');
   if (lastDotIndex !== -1) {
     const ext = fileNameLower.substring(lastDotIndex);
     if (IGNORED_EXTENSIONS.has(ext)) return true;
-    
-    // Handle compound extensions like .min.js, .bundle.js
+
     const secondLastDot = fileNameLower.lastIndexOf('.', lastDotIndex - 1);
     if (secondLastDot !== -1) {
       const compoundExt = fileNameLower.substring(secondLastDot);
@@ -227,23 +220,32 @@ export const shouldIgnorePath = (filePath: string): boolean => {
     }
   }
 
-  // Ignore hidden files (starting with .)
-  if (fileName.startsWith('.') && fileName !== '.') {
-    // But allow some important config files
-    const allowedDotFiles = ['.env', '.gitignore']; // Already in IGNORED_FILES, so this is redundant
-    // Actually, let's NOT ignore all dot files - many are important configs
-    // Just rely on the explicit lists above
-  }
-
-  // Ignore files that look like generated/bundled code
-  if (fileNameLower.includes('.bundle.') || 
+  if (fileNameLower.includes('.bundle.') ||
       fileNameLower.includes('.chunk.') ||
       fileNameLower.includes('.generated.') ||
-      fileNameLower.endsWith('.d.ts')) { // TypeScript declaration files
+      fileNameLower.endsWith('.d.ts')) {
     return true;
   }
 
   return false;
+};
+
+// Negation patterns in .gitnexusignore (e.g. `!output/`) DO override the
+// hardcoded DEFAULT_IGNORE_LIST. The hardcoded list catches common build/cache
+// directories by default, but the user remains the source of truth for their
+// own repo: an explicit `!name/` re-includes anything the defaults would drop.
+// Binary file types (see isHardcodedFileExclusion) are NOT overridable.
+export const shouldIgnorePath = (filePath: string): boolean => {
+  const normalizedPath = filePath.replace(/\\/g, '/');
+  const parts = normalizedPath.split('/');
+
+  for (const part of parts) {
+    if (DEFAULT_IGNORE_LIST.has(part)) {
+      return true;
+    }
+  }
+
+  return isHardcodedFileExclusion(filePath);
 }
 
 /** Check if a directory name is in the hardcoded ignore list */
@@ -349,8 +351,10 @@ export const createIgnoreFilter = async (
       // which is what the `ignore` package expects. No explicit normalization needed.
       const rel = p.relative();
       if (!rel) return false;
+      // Binary file types are non-source; user negations don't override.
+      if (isHardcodedFileExclusion(rel)) { stats.hardcodedFiles++; return true; }
       const verdict = userVerdict(rel);
-      if (verdict === 'unignored') return false;  // user override wins
+      if (verdict === 'unignored') return false;  // user override wins for dir-level rules
       if (verdict === 'ignored') { stats.userPatterns++; return true; }
       if (shouldIgnorePath(rel)) { stats.hardcodedFiles++; return true; }
       return false;

@@ -317,6 +317,28 @@ describe('createIgnoreFilter', () => {
 
       await fs.unlink(path.join(tmpDir, '.gitnexusignore'));
     });
+
+    it('binary file extensions are NOT overridable by user negation', async () => {
+      // dailydeck has `*.png` + `!docs/assets/*.png` — git tracks the assets
+      // but they're still binary, not source. Hardcoded extension wins.
+      await fs.writeFile(path.join(tmpDir, '.gitignore'), '*.png\n!docs/assets/*.png\n');
+      const filter = await createIgnoreFilter(tmpDir);
+
+      const pngPath = { name: 'logo.png', relative: () => 'docs/assets/logo.png' } as any;
+      expect(filter.ignored(pngPath)).toBe(true);
+
+      await fs.unlink(path.join(tmpDir, '.gitignore'));
+    });
+
+    it('lock files cannot be re-included via negation', async () => {
+      await fs.writeFile(path.join(tmpDir, '.gitnexusignore'), '!package-lock.json\n');
+      const filter = await createIgnoreFilter(tmpDir);
+
+      const lockPath = { name: 'package-lock.json', relative: () => 'package-lock.json' } as any;
+      expect(filter.ignored(lockPath)).toBe(true);
+
+      await fs.unlink(path.join(tmpDir, '.gitnexusignore'));
+    });
   });
 });
 
