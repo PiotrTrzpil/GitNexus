@@ -24,6 +24,10 @@ interface RepoStats {
   processes?: number;
 }
 
+// Symbol/edge/flow counts intentionally omitted from the rendered context —
+// they go stale every commit and add noise without telling the agent anything
+// it needs to act. The marker block carries instructions, not telemetry.
+
 const GITNEXUS_START_MARKER = '<!-- gitnexus:start -->';
 const GITNEXUS_END_MARKER = '<!-- gitnexus:end -->';
 
@@ -33,7 +37,7 @@ const GITNEXUS_END_MARKER = '<!-- gitnexus:end -->';
  * Keep it short: agents drop rules past ~150 lines, and the linked skill
  * files carry the detailed workflows. This block is a pointer + core rules.
  */
-function generateGitNexusContent(projectName: string, stats: RepoStats, generatedSkills?: GeneratedSkillInfo[]): string {
+function generateGitNexusContent(projectName: string, _stats: RepoStats, generatedSkills?: GeneratedSkillInfo[]): string {
   const generatedRows = (generatedSkills && generatedSkills.length > 0)
     ? '\n' + generatedSkills.map(s =>
         `| ${s.label} area (${s.symbolCount} symbols) | \`.claude/skills/generated/${s.name}/SKILL.md\` |`
@@ -43,7 +47,7 @@ function generateGitNexusContent(projectName: string, stats: RepoStats, generate
   return `${GITNEXUS_START_MARKER}
 # GitNexus — Code Intelligence
 
-Indexed as **${projectName}** (${stats.nodes || 0} symbols, ${stats.edges || 0} relationships, ${stats.processes || 0} execution flows). Prefer GitNexus MCP tools over grep/glob for structural questions. If a tool warns the index is stale, run \`gitnexus analyze\`.
+Indexed as **${projectName}**. Prefer GitNexus MCP tools over grep/glob for structural questions. If a tool warns the index is stale, run \`gitnexus analyze\`. Index stats live in \`.gitnexus/stats.md\`.
 
 ## Always
 
@@ -220,13 +224,37 @@ Use GitNexus tools to accomplish this task.
  */
 export async function generateAIContextFiles(
   repoPath: string,
-  _storagePath: string,
+  storagePath: string,
   projectName: string,
   stats: RepoStats,
   generatedSkills?: GeneratedSkillInfo[]
 ): Promise<{ files: string[] }> {
   const content = generateGitNexusContent(projectName, stats, generatedSkills);
   const createdFiles: string[] = [];
+
+  // Write human-readable index stats to .gitnexus/stats.md so CLAUDE.md / AGENTS.md
+  // don't churn on every commit. Agents that want counts can read this file;
+  // most agent prompts don't need them at all.
+  try {
+    await fs.mkdir(storagePath, { recursive: true });
+    const statsBody = [
+      `# GitNexus Index Stats — ${projectName}`,
+      ``,
+      `Generated: ${new Date().toISOString()}`,
+      ``,
+      `| Metric | Count |`,
+      `|--------|-------|`,
+      `| Files | ${stats.files ?? 0} |`,
+      `| Symbols (nodes) | ${stats.nodes ?? 0} |`,
+      `| Relationships (edges) | ${stats.edges ?? 0} |`,
+      `| Clusters | ${stats.clusters ?? stats.communities ?? 0} |`,
+      `| Execution flows | ${stats.processes ?? 0} |`,
+      ``,
+    ].join('\n');
+    await fs.writeFile(path.join(storagePath, 'stats.md'), statsBody, 'utf-8');
+  } catch {
+    // Non-fatal — stats file is informational.
+  }
 
   // Create AGENTS.md (standard for Cursor, Windsurf, OpenCode, Cline, etc.)
   const agentsPath = path.join(repoPath, 'AGENTS.md');

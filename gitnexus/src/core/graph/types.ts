@@ -104,6 +104,9 @@ export type NodeProperties = {
   isUnreachable?: boolean,
   /** JSON-encoded instruction array (compact storage). BasicBlock nodes only. */
   cfgInstructions?: string,
+  // ── File node properties (label: 'File') ──
+  /** True file size in bytes from stat(). File nodes only — content may be truncated. */
+  sizeBytes?: number,
 }
 
 export type RelationshipType =

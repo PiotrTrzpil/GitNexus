@@ -50,6 +50,7 @@ CREATE NODE TABLE File (
   name STRING,
   filePath STRING,
   content STRING,
+  sizeBytes INT64 DEFAULT 0,
   PRIMARY KEY (id)
 )`;
 

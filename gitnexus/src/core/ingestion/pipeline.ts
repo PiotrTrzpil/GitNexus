@@ -92,7 +92,7 @@ export const runPipelineFromRepo = async (
     });
 
     const allPaths = scannedFiles.map(f => f.path);
-    processStructure(graph, allPaths);
+    processStructure(graph, scannedFiles);
 
     onProgress({
       phase: 'structure',

@@ -29,7 +29,7 @@ describe('shouldIgnorePath', () => {
 
   describe('build output directories', () => {
     it.each([
-      'dist', 'build', 'out', 'output', 'bin', 'obj', 'target',
+      'dist', 'build', 'out', 'bin', 'obj', 'target',
       '.next', '.nuxt', '.vercel', '.parcel-cache', '.turbo',
     ])('ignores %s directory', (dir) => {
       expect(shouldIgnorePath(`${dir}/bundle.js`)).toBe(true);
@@ -277,6 +277,46 @@ describe('createIgnoreFilter', () => {
     expect(filter.ignored(tsPath)).toBe(false);
 
     await fs.unlink(path.join(tmpDir, '.gitignore'));
+  });
+
+  describe('.gitnexusignore overrides DEFAULT_IGNORE_LIST', () => {
+    it('childrenIgnored: !dirname/ re-includes a hardcoded-ignored directory', async () => {
+      // 'bin' is in DEFAULT_IGNORE_LIST. A user negation should win.
+      await fs.writeFile(path.join(tmpDir, '.gitnexusignore'), '!bin/\n');
+      const filter = await createIgnoreFilter(tmpDir);
+
+      const binPath = { name: 'bin', relative: () => 'src/bin' } as any;
+      expect(filter.childrenIgnored(binPath)).toBe(false);
+
+      // Other DEFAULT_IGNORE_LIST entries still ignored.
+      const nmPath = { name: 'node_modules', relative: () => 'node_modules' } as any;
+      expect(filter.childrenIgnored(nmPath)).toBe(true);
+
+      await fs.unlink(path.join(tmpDir, '.gitnexusignore'));
+    });
+
+    it('ignored: !path/ re-includes files inside a hardcoded-ignored directory', async () => {
+      await fs.writeFile(path.join(tmpDir, '.gitnexusignore'), '!src/bin/\n!src/bin/**\n');
+      const filter = await createIgnoreFilter(tmpDir);
+
+      const filePath = { name: 'foo.ts', relative: () => 'src/bin/foo.ts' } as any;
+      expect(filter.ignored(filePath)).toBe(false);
+
+      await fs.unlink(path.join(tmpDir, '.gitnexusignore'));
+    });
+
+    it('negation only applies to negated paths, not unrelated DEFAULT_IGNORE_LIST entries', async () => {
+      await fs.writeFile(path.join(tmpDir, '.gitnexusignore'), '!bin/\n');
+      const filter = await createIgnoreFilter(tmpDir);
+
+      const distPath = { name: 'dist', relative: () => 'dist' } as any;
+      expect(filter.childrenIgnored(distPath)).toBe(true);
+
+      const distFile = { name: 'bundle.js', relative: () => 'dist/bundle.js' } as any;
+      expect(filter.ignored(distFile)).toBe(true);
+
+      await fs.unlink(path.join(tmpDir, '.gitnexusignore'));
+    });
   });
 });
 

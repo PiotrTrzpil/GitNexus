@@ -9,11 +9,12 @@
  *   gitnexus context --name "validateUser"
  *   gitnexus impact --target "AuthService" --direction upstream
  *   gitnexus cypher "MATCH (n:Function) RETURN n.name LIMIT 10"
- * 
- * Note: Output goes to stderr because LadybugDB's native module captures stdout
- * at the OS level during init. This is consistent with augment.ts.
+ *
+ * Output: tool results go to stdout so they pipe (jq, awk, grep) cleanly.
+ * Diagnostics/errors go to stderr.
  */
 
+import fs from 'fs';
 import { LocalBackend } from '../mcp/local/local-backend.js';
 import { formatResult } from '../mcp/output-format.js';
 
@@ -32,8 +33,9 @@ async function getBackend(): Promise<LocalBackend> {
 
 function output(data: any): void {
   const text = formatResult(data);
-  // stderr because LadybugDB captures stdout at OS level
-  process.stderr.write(text + '\n');
+  // Write directly to fd 1 — LadybugDB's native init has historically interfered
+  // with process.stdout buffering on some platforms; fs.writeSync is unaffected.
+  fs.writeSync(1, text + '\n');
 }
 
 export async function queryCommand(queryText: string, options?: {

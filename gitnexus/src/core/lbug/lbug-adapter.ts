@@ -460,7 +460,7 @@ export const insertNodeToLbug = async (
     let query: string;
 
     if (label === 'File') {
-      query = `CREATE (n:File {id: ${escapeValue(properties.id)}, name: ${escapeValue(properties.name)}, filePath: ${escapeValue(properties.filePath)}, content: ${escapeValue(properties.content || '')}})`;
+      query = `CREATE (n:File {id: ${escapeValue(properties.id)}, name: ${escapeValue(properties.name)}, filePath: ${escapeValue(properties.filePath)}, content: ${escapeValue(properties.content || '')}, sizeBytes: ${properties.sizeBytes ?? 0}})`;
     } else if (label === 'Folder') {
       query = `CREATE (n:Folder {id: ${escapeValue(properties.id)}, name: ${escapeValue(properties.name)}, filePath: ${escapeValue(properties.filePath)}})`;
     } else if (TABLES_WITH_EXPORTED.has(label)) {
@@ -531,7 +531,7 @@ export const batchInsertNodesToLbug = async (
         // Use MERGE instead of CREATE for upsert behavior (handles duplicates gracefully)
         const t = escapeTableName(label);
         if (label === 'File') {
-          query = `MERGE (n:File {id: ${escapeValue(properties.id)}}) SET n.name = ${escapeValue(properties.name)}, n.filePath = ${escapeValue(properties.filePath)}, n.content = ${escapeValue(properties.content || '')}`;
+          query = `MERGE (n:File {id: ${escapeValue(properties.id)}}) SET n.name = ${escapeValue(properties.name)}, n.filePath = ${escapeValue(properties.filePath)}, n.content = ${escapeValue(properties.content || '')}, n.sizeBytes = ${properties.sizeBytes ?? 0}`;
         } else if (label === 'Folder') {
           query = `MERGE (n:Folder {id: ${escapeValue(properties.id)}}) SET n.name = ${escapeValue(properties.name)}, n.filePath = ${escapeValue(properties.filePath)}`;
         } else if (TABLES_WITH_EXPORTED.has(label)) {

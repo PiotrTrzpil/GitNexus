@@ -63,6 +63,11 @@ program
   .action(createLazyAction(() => import('./clean.js'), 'cleanCommand'));
 
 program
+  .command('why-ignored <path>')
+  .description('Explain why a path is being filtered out of indexing')
+  .action(createLazyAction(() => import('./why-ignored.js'), 'whyIgnoredCommand'));
+
+program
   .command('wiki [path]')
   .description('Generate repository wiki from knowledge graph')
   .option('-f, --force', 'Force full regeneration even if up to date')

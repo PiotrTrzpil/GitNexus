@@ -35,6 +35,40 @@ export const getGitRoot = (fromPath: string): string | null => {
   }
 };
 
+export interface WorkingTreeStatus {
+  /** Files with staged or unstaged modifications (M/A/D/R/C). */
+  changed: string[];
+  /** Files git doesn't track yet. */
+  untracked: string[];
+}
+
+/**
+ * Returns paths with uncommitted edits using `git status --porcelain=v1`.
+ * Untracked files are bucketed separately so callers can distinguish
+ * "edited but not committed" from "new file the user might still ignore".
+ */
+export const getWorkingTreeStatus = (repoPath: string): WorkingTreeStatus => {
+  try {
+    const out = execSync('git status --porcelain=v1', {
+      cwd: repoPath,
+      maxBuffer: 50 * 1024 * 1024,
+    }).toString();
+    const changed: string[] = [];
+    const untracked: string[] = [];
+    for (const line of out.split('\n')) {
+      if (!line) continue;
+      // Format: "XY path" — XY is two-char status, then space, then path.
+      const xy = line.slice(0, 2);
+      const filePath = line.slice(3);
+      if (xy === '??') untracked.push(filePath);
+      else changed.push(filePath);
+    }
+    return { changed, untracked };
+  } catch {
+    return { changed: [], untracked: [] };
+  }
+};
+
 /**
  * Retrieve the contents of a file at a specific git ref (e.g. HEAD, a commit hash)
  * Returns null if the ref or file does not exist.

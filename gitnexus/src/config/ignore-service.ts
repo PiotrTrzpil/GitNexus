@@ -191,10 +191,10 @@ const IGNORED_FILES = new Set([
 
 
 
-// NOTE: Negation patterns in .gitnexusignore (e.g. `!vendor/`) cannot override
-// entries in DEFAULT_IGNORE_LIST — this is intentional. The hardcoded list protects
-// against indexing directories that are almost never source code (node_modules, .git, etc.).
-// Users who need to include such directories should remove them from the hardcoded list.
+// Negation patterns in .gitnexusignore (e.g. `!output/`) DO override the
+// hardcoded DEFAULT_IGNORE_LIST. The hardcoded list catches common build/cache
+// directories by default, but the user remains the source of truth for their
+// own repo: an explicit `!name/` re-includes anything the defaults would drop.
 export const shouldIgnorePath = (filePath: string): boolean => {
   const normalizedPath = filePath.replace(/\\/g, '/');
   const parts = normalizedPath.split('/');
@@ -297,33 +297,75 @@ export const loadIgnoreRules = async (
  * Returns an IgnoreLike object for glob's `ignore` option,
  * enabling directory-level pruning during traversal.
  */
-export const createIgnoreFilter = async (repoPath: string, options?: IgnoreOptions) => {
+export interface IgnoreStats {
+  /** Files rejected by user .gitignore / .gitnexusignore patterns. */
+  userPatterns: number;
+  /** Directories pruned because they're in DEFAULT_IGNORE_LIST. */
+  hardcodedDirs: number;
+  /** Files rejected by IGNORED_EXTENSIONS / IGNORED_FILES / .d.ts / .min.js etc. */
+  hardcodedFiles: number;
+}
+
+export interface IgnoreFilter {
+  ignored(p: Path): boolean;
+  childrenIgnored(p: Path): boolean;
+  /** Per-source rejection counts. Mutated as the filter runs. */
+  readonly stats: IgnoreStats;
+}
+
+export const createIgnoreFilter = async (
+  repoPath: string,
+  options?: IgnoreOptions,
+): Promise<IgnoreFilter> => {
   const ig = await loadIgnoreRules(repoPath, options);
+  const stats: IgnoreStats = { userPatterns: 0, hardcodedDirs: 0, hardcodedFiles: 0 };
+
+  // Returns 'unignored' if the user has an explicit negation (`!pattern`) for
+  // this path. Such paths bypass the hardcoded list — user wins.
+  const userVerdict = (rel: string): 'unignored' | 'ignored' | 'unknown' => {
+    if (!ig || !rel) return 'unknown';
+    const r = ig.test(rel);
+    if (r.unignored) return 'unignored';
+    if (r.ignored) return 'ignored';
+    return 'unknown';
+  };
+
+  // Combine the file and dir-form verdicts so a directory-only negation like
+  // `!bin/` re-includes `src/bin` even when tested without a trailing slash.
+  // 'unignored' wins over 'ignored' so user overrides remain definitive.
+  const userVerdictForDir = (rel: string): 'unignored' | 'ignored' | 'unknown' => {
+    const a = userVerdict(rel);
+    if (a === 'unignored') return 'unignored';
+    const b = userVerdict(rel + '/');
+    if (b === 'unignored') return 'unignored';
+    if (a === 'ignored' || b === 'ignored') return 'ignored';
+    return 'unknown';
+  };
 
   return {
+    stats,
     ignored(p: Path): boolean {
       // path-scurry's Path.relative() returns POSIX paths on all platforms,
       // which is what the `ignore` package expects. No explicit normalization needed.
       const rel = p.relative();
       if (!rel) return false;
-      // Check .gitignore / .gitnexusignore patterns
-      if (ig && ig.ignores(rel)) return true;
-      // Fall back to hardcoded rules
-      return shouldIgnorePath(rel);
+      const verdict = userVerdict(rel);
+      if (verdict === 'unignored') return false;  // user override wins
+      if (verdict === 'ignored') { stats.userPatterns++; return true; }
+      if (shouldIgnorePath(rel)) { stats.hardcodedFiles++; return true; }
+      return false;
     },
     childrenIgnored(p: Path): boolean {
-      // Fast path: check directory name against hardcoded list.
-      // Note: dot-directories (.git, .vscode, etc.) are primarily excluded by
-      // glob's `dot: false` option in filesystem-walker.ts. This check is
-      // defense-in-depth — do not remove `dot: false` assuming this covers it.
-      if (DEFAULT_IGNORE_LIST.has(p.name)) return true;
-      // Check against .gitignore / .gitnexusignore patterns.
-      // Test both bare path and path with trailing slash to handle
-      // bare-name patterns (e.g. `local`) and dir-only patterns (e.g. `local/`).
-      if (ig) {
-        const rel = p.relative();
-        if (rel && (ig.ignores(rel) || ig.ignores(rel + '/'))) return true;
-      }
+      const rel = p.relative();
+      // User override wins over the hardcoded list.
+      const verdict = rel ? userVerdictForDir(rel) : 'unknown';
+      if (verdict === 'unignored') return false;
+      if (verdict === 'ignored') { stats.userPatterns++; return true; }
+      // Hardcoded directory-name match (defense-in-depth alongside `dot: false`
+      // in filesystem-walker.ts). Don't remove `dot: false` assuming this covers it.
+      if (DEFAULT_IGNORE_LIST.has(p.name)) { stats.hardcodedDirs++; return true; }
+      // Match dir-only `.gitignore` patterns like `local/`.
+      if (ig && rel && ig.ignores(rel + '/')) { stats.userPatterns++; return true; }
       return false;
     },
   };

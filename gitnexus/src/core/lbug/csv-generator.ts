@@ -226,7 +226,7 @@ export const streamAllCSVsToDisk = async (
   const contentCache = new FileContentCache(repoPath);
 
   // Create writers for every node type up-front
-  const fileWriter = new BufferedCSVWriter(path.join(csvDir, 'file.csv'), 'id,name,filePath,content');
+  const fileWriter = new BufferedCSVWriter(path.join(csvDir, 'file.csv'), 'id,name,filePath,content,sizeBytes');
   const folderWriter = new BufferedCSVWriter(path.join(csvDir, 'folder.csv'), 'id,name,filePath');
   const codeElementHeader = 'id,name,filePath,startLine,endLine,startColumn,endColumn,isExported,content,description';
   const functionHeader = 'id,name,filePath,startLine,endLine,startColumn,endColumn,isExported,content,description,complexity,sloc,parameterCount,visibility';
@@ -277,11 +277,13 @@ export const streamAllCSVsToDisk = async (
         if (seenFileIds.has(node.id)) break;
         seenFileIds.add(node.id);
         const content = await extractContent(node, contentCache);
+        const sizeBytes = typeof node.properties.sizeBytes === 'number' ? node.properties.sizeBytes : 0;
         await fileWriter.addRow([
           escapeCSVField(node.id),
           escapeCSVField(node.properties.name || ''),
           escapeCSVField(node.properties.filePath || ''),
           escapeCSVField(content),
+          String(sizeBytes),
         ].join(','));
         break;
       }

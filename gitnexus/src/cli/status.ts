@@ -5,7 +5,7 @@
  */
 
 import { findRepo, getStoragePaths, hasKuzuIndex } from '../storage/repo-manager.js';
-import { getCurrentCommit, isGitRepo, getGitRoot } from '../storage/git.js';
+import { getCurrentCommit, isGitRepo, getGitRoot, getWorkingTreeStatus } from '../storage/git.js';
 
 export const statusCommand = async () => {
   const cwd = process.cwd();
@@ -31,11 +31,25 @@ export const statusCommand = async () => {
   }
 
   const currentCommit = getCurrentCommit(repo.repoPath);
-  const isUpToDate = currentCommit === repo.meta.lastCommit;
+  const commitMatches = currentCommit === repo.meta.lastCommit;
+  const wt = getWorkingTreeStatus(repo.repoPath);
+  const dirty = wt.changed.length > 0 || wt.untracked.length > 0;
 
   console.log(`Repository: ${repo.repoPath}`);
   console.log(`Indexed: ${new Date(repo.meta.indexedAt).toLocaleString()}`);
   console.log(`Indexed commit: ${repo.meta.lastCommit?.slice(0, 7)}`);
   console.log(`Current commit: ${currentCommit?.slice(0, 7)}`);
-  console.log(`Status: ${isUpToDate ? '✅ up-to-date' : '⚠️ stale (re-run gitnexus analyze)'}`);
+  if (dirty) {
+    console.log(`Working tree: ${wt.changed.length} changed, ${wt.untracked.length} untracked`);
+  }
+
+  let statusLine: string;
+  if (!commitMatches) {
+    statusLine = '⚠️ stale (re-run gitnexus analyze)';
+  } else if (dirty) {
+    statusLine = '⚠️ stale: uncommitted edits since last index (re-run gitnexus analyze)';
+  } else {
+    statusLine = '✅ up-to-date';
+  }
+  console.log(`Status: ${statusLine}`);
 };

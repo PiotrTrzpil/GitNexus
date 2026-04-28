@@ -1,7 +1,11 @@
 import fs from 'fs/promises';
 import path from 'path';
 import { glob } from 'glob';
-import { createIgnoreFilter } from '../../config/ignore-service.js';
+import { createIgnoreFilter, type IgnoreStats } from '../../config/ignore-service.js';
+
+/** Last walk's ignore stats — surfaced to analyze for the post-run summary. */
+let lastIgnoreStats: IgnoreStats | null = null;
+export const getLastIgnoreStats = (): IgnoreStats | null => lastIgnoreStats;
 
 export interface FileEntry {
   path: string;
@@ -33,6 +37,7 @@ export const walkRepositoryPaths = async (
   onProgress?: (current: number, total: number, filePath: string) => void
 ): Promise<ScannedFile[]> => {
   const ignoreFilter = await createIgnoreFilter(repoPath);
+  lastIgnoreStats = ignoreFilter.stats;
 
   const filtered = await glob('**/*', {
     cwd: repoPath,

@@ -9,6 +9,7 @@ import { execFileSync } from 'child_process';
 import v8 from 'v8';
 import cliProgress from 'cli-progress';
 import { runPipelineFromRepo } from '../core/ingestion/pipeline.js';
+import { getLastIgnoreStats } from '../core/ingestion/filesystem-walker.js';
 import { initLbug, loadGraphToLbug, getLbugStats, executeQuery, executeWithReusedStatement, closeLbug, createFTSIndex, loadCachedEmbeddings } from '../core/lbug/lbug-adapter.js';
 import { tryAcquireLock, releaseLock } from '../util/lockfile.js';
 // Embedding imports are lazy (dynamic import) so onnxruntime-node is never
@@ -519,6 +520,13 @@ export const analyzeCommand = async (
   console.log(`\n  Repository indexed successfully (${totalTime}s)${embeddingsCached ? ` [${cachedEmbeddings.length} embeddings cached]` : ''}\n`);
   console.log(`  ${stats.nodes.toLocaleString()} nodes | ${stats.edges.toLocaleString()} edges | ${pipelineResult.communityResult?.stats.totalCommunities || 0} clusters | ${pipelineResult.processResult?.stats.totalProcesses || 0} flows`);
   console.log(`  LadybugDB ${lbugTime}s | FTS ${ftsTime}s | Embeddings ${embeddingSkipped ? embeddingSkipReason : embeddingTime + 's'}`);
+  const ignoreStats = getLastIgnoreStats();
+  if (ignoreStats) {
+    const total = ignoreStats.userPatterns + ignoreStats.hardcodedDirs + ignoreStats.hardcodedFiles;
+    if (total > 0) {
+      console.log(`  Ignored: ${total.toLocaleString()} (user: ${ignoreStats.userPatterns} | default dirs: ${ignoreStats.hardcodedDirs} | default files: ${ignoreStats.hardcodedFiles}) — use \`gitnexus why-ignored <path>\` to inspect`);
+    }
+  }
   console.log(`  ${repoPath}`);
 
   if (aiContext.files.length > 0) {
