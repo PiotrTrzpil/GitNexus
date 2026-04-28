@@ -45,7 +45,7 @@ const DEFAULT_IGNORE_LIST = new Set([
     'dist',
     'build',
     'out',
-    'output',
+    // 'output' removed — commonly used for source code (e.g. modules emitting formatted output)
     'bin',
     'obj',
     'target',           // Java/Rust
@@ -71,11 +71,11 @@ const DEFAULT_IGNORE_LIST = new Set([
     '.jest',
     
     // Logs & Temp
-    'logs',
+    // 'logs' removed — commonly used for source code (logging modules, log viewers)
     'log',
     'tmp',
     'temp',
-    'cache',
+    // 'cache' removed — commonly used for source code (cache implementations, cache layers)
     '.cache',
     '.tmp',
     '.temp',
@@ -96,7 +96,7 @@ const DEFAULT_IGNORE_LIST = new Set([
     '.github',          // GitHub config, not code
     '.circleci',
     '.gitlab',
-    'fixtures',         // Test fixtures
+    // 'fixtures' removed — commonly used for source code (data fixtures shipped with the app)
     'snapshots',        // Jest snapshots
     '__snapshots__',
 ]);
