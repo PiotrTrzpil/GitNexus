@@ -40,6 +40,30 @@ const runWithSessionLock = async <T>(operation: () => Promise<T>): Promise<T> =>
 
 const normalizeCopyPath = (filePath: string): string => filePath.replace(/\\/g, '/');
 
+/**
+ * Close every native QueryResult in a single value or array.
+ * Multi-statement cypher returns `QueryResult[]`; abandoning extras leaks them
+ * and the GC finalizer for `MaterializedQueryResult` recurses indefinitely
+ * (LadybugDB native bug), wedging the Node main thread.
+ */
+const closeAllResults = (qr: any): void => {
+  if (!qr) return;
+  const list = Array.isArray(qr) ? qr : [qr];
+  for (const r of list) {
+    try { r?.close?.(); } catch { /* ignore — best-effort cleanup */ }
+  }
+};
+
+/**
+ * Run a query for its side effect and close the QueryResult immediately.
+ * Use for DDL, COPY, CHECKPOINT, INSTALL/LOAD EXTENSION — anything where the
+ * result is unused. Plain `await conn.query(...)` leaks the QueryResult.
+ */
+const runDdl = async (conn: any, cypher: string): Promise<void> => {
+  const qr = await conn.query(cypher);
+  closeAllResults(qr);
+};
+
 export const initLbug = async (dbPath: string) => {
   return runWithSessionLock(() => ensureLbugInitialized(dbPath));
 };
@@ -123,7 +147,7 @@ const doInitLbug = async (dbPath: string) => {
       let lockError = false;
       for (const schemaQuery of SCHEMA_QUERIES) {
         try {
-          await conn.query(schemaQuery);
+          await runDdl(conn, schemaQuery);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           if (msg.includes('already exists')) continue;
@@ -206,11 +230,11 @@ export const loadGraphToLbug = async (
     const copyQuery = getCopyQuery(table, normalizedPath);
 
     try {
-      await conn.query(copyQuery);
+      await runDdl(conn, copyQuery);
     } catch (err) {
       try {
         const retryQuery = copyQuery.replace('auto_detect=false)', 'auto_detect=false, IGNORE_ERRORS=true)');
-        await conn.query(retryQuery);
+        await runDdl(conn, retryQuery);
       } catch (retryErr) {
         const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
         throw new Error(`COPY failed for ${table}: ${retryMsg.slice(0, 200)}`);
@@ -272,11 +296,11 @@ export const loadGraphToLbug = async (
       }
 
       try {
-        await conn.query(copyQuery);
+        await runDdl(conn, copyQuery);
       } catch (err) {
         try {
           const retryQuery = copyQuery.replace('auto_detect=false)', 'auto_detect=false, IGNORE_ERRORS=true)');
-          await conn.query(retryQuery);
+          await runDdl(conn, retryQuery);
         } catch (retryErr) {
           const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
           warnings.push(`${fromLabel}->${toLabel} (${lines.length} edges): ${retryMsg.slice(0, 80)}`);
@@ -352,7 +376,7 @@ const fallbackRelationshipInserts = async (
       const step = parseInt(stepStr) || 0;
 
       const esc = (s: string) => s.replace(/'/g, "''").replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/\r/g, '\\r');
-      await conn.query(`
+      await runDdl(conn, `
         MATCH (a:${escapeLabel(fromLabel)} {id: '${esc(fromId)}' }),
               (b:${escapeLabel(toLabel)} {id: '${esc(toId)}' })
         CREATE (a)-[:${REL_TABLE_NAME} {type: '${esc(relType)}', confidence: ${confidence}, reason: '${esc(reason)}', step: ${step}, cfgEdgeType: '${esc(cfgEdgeType)}', conditionText: '${esc(conditionText)}'}]->(b)
@@ -453,7 +477,7 @@ export const insertNodeToLbug = async (
       const tempDb = new lbug.Database(targetDbPath);
       const tempConn = new lbug.Connection(tempDb);
       try {
-        await tempConn.query(query);
+        await runDdl(tempConn, query);
         return true;
       } finally {
         try { await tempConn.close(); } catch {}
@@ -461,7 +485,7 @@ export const insertNodeToLbug = async (
       }
     } else if (conn) {
       // Use existing persistent connection (when called from analyze)
-      await conn.query(query);
+      await runDdl(conn, query);
       return true;
     }
 
@@ -518,7 +542,7 @@ export const batchInsertNodesToLbug = async (
           query = `MERGE (n:${t} {id: ${escapeValue(properties.id)}}) SET n.name = ${escapeValue(properties.name)}, n.filePath = ${escapeValue(properties.filePath)}, n.startLine = ${properties.startLine || 0}, n.endLine = ${properties.endLine || 0}, n.content = ${escapeValue(properties.content || '')}${descPart}`;
         }
 
-        await tempConn.query(query);
+        await runDdl(tempConn, query);
         inserted++;
       } catch (e: any) {
         // Don't console.error here - it corrupts MCP JSON-RPC on stderr
@@ -538,16 +562,15 @@ export const executeQuery = async (cypher: string): Promise<any[]> => {
     throw new Error('LadybugDB not initialized. Call initLbug first.');
   }
 
-  const queryResult = await conn.query(cypher);
-  // LadybugDB uses getAll() instead of hasNext()/getNext()
-  // Query returns QueryResult for single queries, QueryResult[] for multi-statement
-  const result = Array.isArray(queryResult) ? queryResult[0] : queryResult;
+  let queryResult: any = null;
   try {
-    const rows = await result.getAll();
-    return rows;
+    queryResult = await conn.query(cypher);
+    // Query returns QueryResult for single queries, QueryResult[] for multi-statement.
+    // We only consume the first; closeAllResults below cleans up any extras.
+    const first = Array.isArray(queryResult) ? queryResult[0] : queryResult;
+    return await first.getAll();
   } finally {
-    // Explicitly close result to prevent GC destructor hang (LadybugDB bug)
-    try { result.close(); } catch {}
+    closeAllResults(queryResult);
   }
 };
 
@@ -585,28 +608,34 @@ export const getLbugStats = async (): Promise<{ nodes: number; edges: number }> 
 
   let totalNodes = 0;
   for (const tableName of NODE_TABLES) {
+    let queryResult: any = null;
     try {
-      const queryResult = await conn.query(`MATCH (n:${escapeTableName(tableName)}) RETURN count(n) AS cnt`);
-      const nodeResult = Array.isArray(queryResult) ? queryResult[0] : queryResult;
-      const nodeRows = await nodeResult.getAll();
+      queryResult = await conn.query(`MATCH (n:${escapeTableName(tableName)}) RETURN count(n) AS cnt`);
+      const first = Array.isArray(queryResult) ? queryResult[0] : queryResult;
+      const nodeRows = await first.getAll();
       if (nodeRows.length > 0) {
         totalNodes += Number(nodeRows[0]?.cnt ?? nodeRows[0]?.[0] ?? 0);
       }
     } catch {
       // ignore
+    } finally {
+      closeAllResults(queryResult);
     }
   }
 
   let totalEdges = 0;
+  let edgeQueryResult: any = null;
   try {
-    const queryResult = await conn.query(`MATCH ()-[r:${REL_TABLE_NAME}]->() RETURN count(r) AS cnt`);
-    const edgeResult = Array.isArray(queryResult) ? queryResult[0] : queryResult;
-    const edgeRows = await edgeResult.getAll();
+    edgeQueryResult = await conn.query(`MATCH ()-[r:${REL_TABLE_NAME}]->() RETURN count(r) AS cnt`);
+    const first = Array.isArray(edgeQueryResult) ? edgeQueryResult[0] : edgeQueryResult;
+    const edgeRows = await first.getAll();
     if (edgeRows.length > 0) {
       totalEdges = Number(edgeRows[0]?.cnt ?? edgeRows[0]?.[0] ?? 0);
     }
   } catch {
     // ignore
+  } finally {
+    closeAllResults(edgeQueryResult);
   }
 
   return { nodes: totalNodes, edges: totalEdges };
@@ -627,11 +656,11 @@ export const loadCachedEmbeddings = async (): Promise<{
 
   const embeddingNodeIds = new Set<string>();
   const embeddings: Array<{ nodeId: string; embedding: number[] }> = [];
-  let result: any = null;
+  let queryResult: any = null;
   try {
-    const rows = await conn.query(`MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN e.nodeId AS nodeId, e.embedding AS embedding`);
-    result = Array.isArray(rows) ? rows[0] : rows;
-    for (const row of await result.getAll()) {
+    queryResult = await conn.query(`MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN e.nodeId AS nodeId, e.embedding AS embedding`);
+    const first = Array.isArray(queryResult) ? queryResult[0] : queryResult;
+    for (const row of await first.getAll()) {
       const nodeId = String(row.nodeId ?? row[0] ?? '');
       if (!nodeId) continue;
       embeddingNodeIds.add(nodeId);
@@ -645,8 +674,7 @@ export const loadCachedEmbeddings = async (): Promise<{
     }
   } catch { /* embedding table may not exist */ }
   finally {
-    // Explicitly close result to prevent GC destructor hang (LadybugDB bug)
-    if (result) { try { result.close(); } catch {} }
+    closeAllResults(queryResult);
   }
 
   return { embeddingNodeIds, embeddings };
@@ -658,7 +686,7 @@ export const closeLbug = async (): Promise<void> => {
     // to the main DB file. Without this, read-only connections (MCP server)
     // cannot see WAL-only entries like FTS indexes.
     try {
-      await conn.query('CHECKPOINT');
+      await runDdl(conn, 'CHECKPOINT');
     } catch {}
     try {
       await conn.close();
@@ -710,23 +738,21 @@ export const deleteNodesForFile = async (filePath: string, dbPath?: string): Pro
       // Skip tables that don't have filePath (Community, Process)
       if (tableName === 'Community' || tableName === 'Process') continue;
 
-      let result: any = null;
+      let countQueryResult: any = null;
       try {
         // First count how many we'll delete
         const tn = escapeTableName(tableName);
-        const countResult = await targetConn!.query(
+        countQueryResult = await targetConn!.query(
           `MATCH (n:${tn}) WHERE n.filePath = '${escapedPath}' RETURN count(n) AS cnt`
         );
-        result = Array.isArray(countResult) ? countResult[0] : countResult;
-        const rows = await result.getAll();
-        // Close result immediately after reading
-        try { result.close(); } catch {}
-        result = null;
+        const first = Array.isArray(countQueryResult) ? countQueryResult[0] : countQueryResult;
+        const rows = await first.getAll();
         const count = Number(rows[0]?.cnt ?? rows[0]?.[0] ?? 0);
 
         if (count > 0) {
           // Delete nodes (and implicitly their relationships via DETACH)
-          await targetConn!.query(
+          await runDdl(
+            targetConn!,
             `MATCH (n:${tn}) WHERE n.filePath = '${escapedPath}' DETACH DELETE n`
           );
           deletedNodes += count;
@@ -734,13 +760,14 @@ export const deleteNodesForFile = async (filePath: string, dbPath?: string): Pro
       } catch (e) {
         // Some tables may not support this query, skip
       } finally {
-        if (result) { try { result.close(); } catch {} }
+        closeAllResults(countQueryResult);
       }
     }
 
     // Also delete any embeddings for nodes in this file
     try {
-      await targetConn!.query(
+      await runDdl(
+        targetConn!,
         `MATCH (e:${EMBEDDING_TABLE_NAME}) WHERE e.nodeId STARTS WITH '${escapedPath}' DELETE e`
       );
     } catch {
@@ -775,8 +802,8 @@ export const loadFTSExtension = async (): Promise<void> => {
     throw new Error('LadybugDB not initialized. Call initLbug first.');
   }
   try {
-    await conn.query('INSTALL fts');
-    await conn.query('LOAD EXTENSION fts');
+    await runDdl(conn, 'INSTALL fts');
+    await runDdl(conn, 'LOAD EXTENSION fts');
     ftsLoaded = true;
   } catch (err: any) {
     const msg = err?.message || '';
@@ -811,7 +838,7 @@ export const createFTSIndex = async (
   const query = `CALL CREATE_FTS_INDEX('${tableName}', '${indexName}', [${propList}], stemmer := '${stemmer}')`;
 
   try {
-    await conn.query(query);
+    await runDdl(conn, query);
   } catch (e: any) {
     if (!e.message?.includes('already exists')) {
       throw e;
@@ -849,14 +876,11 @@ export const queryFTS = async (
     LIMIT ${limit}
   `;
 
-  let result: any = null;
+  let queryResult: any = null;
   try {
-    const queryResult = await conn.query(cypher);
-    result = Array.isArray(queryResult) ? queryResult[0] : queryResult;
-    const rows = await result.getAll();
-    // Close result immediately after reading
-    try { result.close(); } catch {}
-    result = null;
+    queryResult = await conn.query(cypher);
+    const first = Array.isArray(queryResult) ? queryResult[0] : queryResult;
+    const rows = await first.getAll();
 
     return rows.map((row: any) => {
       const node = row.node || row[0] || {};
@@ -876,7 +900,7 @@ export const queryFTS = async (
     }
     throw e;
   } finally {
-    if (result) { try { result.close(); } catch {} }
+    closeAllResults(queryResult);
   }
 };
 
@@ -889,7 +913,7 @@ export const dropFTSIndex = async (tableName: string, indexName: string): Promis
   }
 
   try {
-    await conn.query(`CALL DROP_FTS_INDEX('${tableName}', '${indexName}')`);
+    await runDdl(conn, `CALL DROP_FTS_INDEX('${tableName}', '${indexName}')`);
   } catch {
     // Index may not exist
   }

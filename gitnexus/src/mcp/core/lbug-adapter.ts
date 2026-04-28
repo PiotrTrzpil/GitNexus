@@ -594,6 +594,21 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 }
 
 /**
+ * Close every native QueryResult in a single value or array.
+ * `conn.query()` returns `QueryResult` for single statements but `QueryResult[]`
+ * for multi-statement cypher; abandoning extras leaks them and the GC finalizer
+ * for `MaterializedQueryResult` recurses indefinitely (LadybugDB native bug),
+ * wedging the Node main thread.
+ */
+function closeAllResults(qr: any): void {
+  if (!qr) return;
+  const list = Array.isArray(qr) ? qr : [qr];
+  for (const r of list) {
+    try { r?.close?.(); } catch { /* ignore — best-effort cleanup */ }
+  }
+}
+
+/**
  * Detect database corruption/staleness and auto-recover by deleting the corrupt WAL
  * file, evicting the stale pool entry, and re-initializing the database.
  * Returns true if recovery succeeded and the caller should retry.
@@ -704,15 +719,11 @@ export const executeQuery = async (repoId: string, cypher: string): Promise<any[
   dbLogger.debug({ repoId, query: cypher.slice(0, 100) }, 'Executing query');
 
   const conn = await checkout(entry);
-  let result: any = null;
+  let queryResult: any = null;
   try {
-    const queryResult = await withTimeout(conn.query(cypher), QUERY_TIMEOUT_MS, 'Query');
-    result = Array.isArray(queryResult) ? queryResult[0] : queryResult;
-    const rows = await result.getAll();
-    // Explicitly close result to prevent GC destructor hang (LadybugDB bug)
-    try { result.close(); } catch {}
-    result = null;
-    return rows;
+    queryResult = await withTimeout(conn.query(cypher), QUERY_TIMEOUT_MS, 'Query');
+    const first = Array.isArray(queryResult) ? queryResult[0] : queryResult;
+    return await first.getAll();
   } catch (err: any) {
     const error = err instanceof Error ? err : new Error(String(err));
     dbLogger.warn({ err: error, repoId }, 'Query failed');
@@ -722,8 +733,7 @@ export const executeQuery = async (repoId: string, cypher: string): Promise<any[
     }
     throw error;
   } finally {
-    // Always close result to prevent GC destructor hang
-    if (result) { try { result.close(); } catch {} }
+    closeAllResults(queryResult);
     checkin(entry, conn);
   }
 };
@@ -769,20 +779,16 @@ export const executeParameterized = async (
   dbLogger.debug({ repoId, query: cypher.slice(0, 100) }, 'Executing parameterized query');
 
   const conn = await checkout(entry);
-  let result: any = null;
+  let queryResult: any = null;
   try {
     const stmt: any = await withTimeout(conn.prepare(cypher), QUERY_TIMEOUT_MS, 'Prepare');
     if (!stmt.isSuccess()) {
       const errMsg = await stmt.getErrorMessage();
       throw new Error(`Prepare failed: ${errMsg}`);
     }
-    const queryResult = await withTimeout(conn.execute(stmt, params), QUERY_TIMEOUT_MS, 'Execute');
-    result = Array.isArray(queryResult) ? queryResult[0] : queryResult;
-    const rows = await result.getAll();
-    // Explicitly close result to prevent GC destructor hang (LadybugDB bug)
-    try { result.close(); } catch {}
-    result = null;
-    return rows;
+    queryResult = await withTimeout(conn.execute(stmt, params), QUERY_TIMEOUT_MS, 'Execute');
+    const first = Array.isArray(queryResult) ? queryResult[0] : queryResult;
+    return await first.getAll();
   } catch (err: any) {
     const error = err instanceof Error ? err : new Error(String(err));
     dbLogger.warn({ err: error, repoId }, 'Parameterized query failed');
@@ -791,8 +797,7 @@ export const executeParameterized = async (
     }
     throw error;
   } finally {
-    // Always close result to prevent GC destructor hang
-    if (result) { try { result.close(); } catch {} }
+    closeAllResults(queryResult);
     checkin(entry, conn);
   }
 };

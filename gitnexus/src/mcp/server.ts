@@ -23,11 +23,33 @@ import {
   GetPromptRequestSchema,
   RootsListChangedNotificationSchema,
 } from '@modelcontextprotocol/sdk/types.js';
+import os from 'os';
+import path from 'path';
 import { GITNEXUS_TOOLS } from './tools.js';
 import type { LocalBackend } from './local/local-backend.js';
 import { getResourceDefinitions, getResourceTemplates, readResource } from './resources.js';
 import { startWatcher } from '../core/watcher/file-watcher.js';
+import { tryAcquireLock, releaseLock, getLockInfo } from '../util/lockfile.js';
+import { mcpLogger } from '../util/logger.js';
 import { VERSION } from '../config/version.js';
+
+/**
+ * Path to the global watcher-leader lockfile.
+ *
+ * Only one MCP server per machine runs the file watcher. With multiple
+ * concurrent Claude Code sessions, each spawns its own MCP — without this
+ * lock, every MCP would walk every indexed repo's filesystem on its own
+ * polling cadence, multiplying FS load N-fold and producing the racing-
+ * reindex pattern observed in logs.
+ */
+const WATCHER_LEADER_LOCK = path.join(os.homedir(), '.gitnexus', 'watcher.leader.lock');
+
+/**
+ * How often a follower MCP retries acquiring the watcher-leader lock.
+ * Short enough that a follower takes over quickly when the leader exits;
+ * long enough that idle followers stay quiet.
+ */
+const FOLLOWER_RETRY_MS = 15_000;
 
 
 /**
@@ -308,29 +330,82 @@ export async function startMCPServer(backend: LocalBackend): Promise<void> {
   const transport = new CompatibleStdioServerTransport();
   await server.connect(transport);
 
-  // ── File watcher ──────────────────────────────────────────────────
+  // ── File watcher (leader-only) ────────────────────────────────────
   // Start adaptive polling loop after backend is initialized.
   // onReindex triggers a pipeline re-run for the changed repo.
+  //
+  // Leader election: only one MCP per machine actually polls. Followers
+  // periodically retry the lock so they take over if the leader exits or
+  // dies. The lockfile uses PID-based stale detection, so a SIGKILLed
+  // leader is reclaimed automatically on the next follower retry.
   let stopWatcher: (() => void) | undefined;
-  try {
-    const repos = await backend.getWatchableRepos();
-    if (repos.length > 0) {
+  let leaderRetryTimer: NodeJS.Timeout | undefined;
+  let isLeader = false;
+
+  const tryStartWatcher = async (): Promise<boolean> => {
+    if (isLeader) return true;
+    if (!(await tryAcquireLock(WATCHER_LEADER_LOCK))) return false;
+    try {
+      const repos = await backend.getWatchableRepos();
+      if (repos.length === 0) {
+        await releaseLock(WATCHER_LEADER_LOCK);
+        return false;
+      }
       stopWatcher = startWatcher(repos, {
         onReindex: (repoPath: string) => backend.reindexRepo(repoPath),
       });
+      isLeader = true;
+      mcpLogger.info({ pid: process.pid, lockPath: WATCHER_LEADER_LOCK }, 'Watcher leader acquired');
+      return true;
+    } catch (err) {
+      // If watcher setup fails, drop the lock so another MCP can try.
+      await releaseLock(WATCHER_LEADER_LOCK);
+      mcpLogger.warn({ err }, 'Watcher start failed after lock acquired — releasing');
+      return false;
     }
-  } catch {
-    // Watcher is optional — non-fatal if it fails to start
+  };
+
+  if (!(await tryStartWatcher())) {
+    const info = await getLockInfo(WATCHER_LEADER_LOCK);
+    mcpLogger.info(
+      { leaderPid: info?.pid, retryMs: FOLLOWER_RETRY_MS },
+      'Watcher leader already running — this MCP will run as follower'
+    );
+    leaderRetryTimer = setInterval(() => {
+      tryStartWatcher().catch(() => { /* keep retrying */ });
+    }, FOLLOWER_RETRY_MS);
+    leaderRetryTimer.unref();
   }
 
-  // Graceful shutdown helper
+  // Graceful shutdown helper.
+  //
+  // The LadybugDB native binding (lbugjs.node) has a destructor bug:
+  // `MaterializedQueryResult::~MaterializedQueryResult()` can recurse and never
+  // return. If a leaked QueryResult is finalized during disconnect, the main
+  // thread wedges and `process.exit(0)` is never reached — leaving a zombie
+  // process whose file watcher keeps polling and racing with the next session's
+  // MCP. We force-exit after a hard deadline so cleanup never blocks termination.
+  const FORCE_EXIT_MS = 3000;
   let shuttingDown = false;
   const shutdown = async () => {
     if (shuttingDown) return;
     shuttingDown = true;
+
+    const forceExit = setTimeout(() => {
+      try { require('fs').writeSync(2, `[MCP] Shutdown exceeded ${FORCE_EXIT_MS}ms — forcing exit\n`); } catch {}
+      process.exit(0);
+    }, FORCE_EXIT_MS);
+    forceExit.unref();
+
+    try { if (leaderRetryTimer) clearInterval(leaderRetryTimer); } catch {}
     try { stopWatcher?.(); } catch {}
+    if (isLeader) {
+      try { await releaseLock(WATCHER_LEADER_LOCK); } catch {}
+    }
     try { await backend.disconnect(); } catch {}
     try { await server.close(); } catch {}
+
+    clearTimeout(forceExit);
     process.exit(0);
   };
 
