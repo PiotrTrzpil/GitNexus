@@ -102,6 +102,9 @@
     "node": ">=18.0.0"
   },
   "pnpm": {
+    "overrides": {
+      "@ladybugdb/core": "link:../../ladybug-nodejs"
+    },
     "onlyBuiltDependencies": [
       "tree-sitter",
       "tree-sitter-c",

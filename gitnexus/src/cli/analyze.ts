@@ -146,13 +146,22 @@ export const analyzeCommand = async (
         const lbugMod = await import('@ladybugdb/core');
         const testDb = new lbugMod.default.Database(lbugPath, 0, false, true);
         const testConn = new lbugMod.default.Connection(testDb);
+        // Both QueryResults must be closed — abandoning them triggers the
+        // GC-finalizer recursion bug in lbugjs's MaterializedQueryResult dtor.
+        let loadQr: any = null;
+        let probeQr: any = null;
         try {
-          await testConn.query('LOAD EXTENSION fts');
-          await testConn.query(
+          loadQr = await testConn.query('LOAD EXTENSION fts');
+          probeQr = await testConn.query(
             `CALL QUERY_FTS_INDEX('File', 'file_fts', 'test', conjunctive := false) RETURN node LIMIT 1`,
           );
           ftsIntact = true;
         } finally {
+          for (const qr of [loadQr, probeQr]) {
+            if (!qr) continue;
+            const list = Array.isArray(qr) ? qr : [qr];
+            for (const r of list) { try { r?.close?.(); } catch {} }
+          }
           try { await testConn.close(); } catch {}
           try { await testDb.close(); } catch {}
         }

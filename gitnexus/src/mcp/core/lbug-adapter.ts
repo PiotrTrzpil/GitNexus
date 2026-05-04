@@ -470,10 +470,14 @@ const doInitLbug = async (repoId: string, dbPath: string): Promise<void> => {
   pool.set(repoId, { db, available, checkedOut: 0, waiters: [], lastUsed: Date.now(), dbPath, openedAtMtime: currentMtime });
   ensureIdleTimer();
 
-  // Load FTS extension once per shared Database
+  // Load FTS extension once per shared Database.
+  // Must close the QueryResult — abandoning it triggers the GC-finalizer
+  // recursion bug in `MaterializedQueryResult::~MaterializedQueryResult`
+  // (see closeAllResults below).
   if (!shared.ftsLoaded) {
+    let ftsQr: any = null;
     try {
-      await available[0].query('LOAD EXTENSION fts');
+      ftsQr = await available[0].query('LOAD EXTENSION fts');
       shared.ftsLoaded = true;
     } catch (err: any) {
       const errMsg = err instanceof Error ? err.message : String(err);
@@ -496,6 +500,8 @@ const doInitLbug = async (repoId: string, dbPath: string): Promise<void> => {
       }
       // Extension may not be installed — FTS queries will fail gracefully
       dbLogger.warn({ err, dbPath }, 'FTS extension not loaded (full-text search unavailable)');
+    } finally {
+      closeAllResults(ftsQr);
     }
   }
 };

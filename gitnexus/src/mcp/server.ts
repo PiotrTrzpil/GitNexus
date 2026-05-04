@@ -25,6 +25,8 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import os from 'os';
 import path from 'path';
+import { Worker } from 'worker_threads';
+import { spawn } from 'child_process';
 import { GITNEXUS_TOOLS } from './tools.js';
 import type { LocalBackend } from './local/local-backend.js';
 import { getResourceDefinitions, getResourceTemplates, readResource } from './resources.js';
@@ -384,20 +386,44 @@ export async function startMCPServer(backend: LocalBackend): Promise<void> {
   // return. If a leaked QueryResult is finalized during disconnect, the main
   // thread wedges and `process.exit(0)` is never reached — leaving a zombie
   // process whose file watcher keeps polling and racing with the next session's
-  // MCP. We force-exit after a hard deadline so cleanup never blocks termination.
+  // MCP.
+  //
+  // A `setTimeout`-based watchdog cannot rescue this: when the main thread is
+  // blocked synchronously inside the C++ destructor, libuv cannot fire timers
+  // and JS signal handlers do not run (queued signals pile up in `_sigtramp`).
+  // Instead we arm a Worker thread whose own event loop is independent of the
+  // wedged main thread; after the deadline it sends SIGKILL to the host PID,
+  // which the kernel enforces unconditionally.
   const FORCE_EXIT_MS = 3000;
   let shuttingDown = false;
+
+  const armSigkillWatchdog = (ms: number): void => {
+    try {
+      // Inline worker source — no separate file needed for one-line logic.
+      const src = `setTimeout(() => { try { process.kill(${process.pid}, 'SIGKILL'); } catch {} }, ${ms});`;
+      const w = new Worker(src, { eval: true });
+      w.unref();
+    } catch {
+      // Last-resort fallback: detached child that survives even if Worker
+      // construction fails for some reason. Same kernel-enforced SIGKILL.
+      try {
+        const child = spawn('sh', ['-c', `sleep ${Math.ceil(ms / 1000)}; kill -9 ${process.pid}`], {
+          detached: true,
+          stdio: 'ignore',
+        });
+        child.unref();
+      } catch {}
+    }
+  };
+
   const shutdown = async () => {
     if (shuttingDown) return;
     shuttingDown = true;
 
-    const forceExit = setTimeout(() => {
-      try { require('fs').writeSync(2, `[MCP] Shutdown exceeded ${FORCE_EXIT_MS}ms — forcing exit\n`); } catch {}
-      process.exit(0);
-    }, FORCE_EXIT_MS);
-    forceExit.unref();
+    armSigkillWatchdog(FORCE_EXIT_MS);
 
     try { if (leaderRetryTimer) clearInterval(leaderRetryTimer); } catch {}
+    try { if (ppidPoll) clearInterval(ppidPoll); } catch {}
     try { stopWatcher?.(); } catch {}
     if (isLeader) {
       try { await releaseLock(WATCHER_LEADER_LOCK); } catch {}
@@ -405,7 +431,6 @@ export async function startMCPServer(backend: LocalBackend): Promise<void> {
     try { await backend.disconnect(); } catch {}
     try { await server.close(); } catch {}
 
-    clearTimeout(forceExit);
     process.exit(0);
   };
 
@@ -417,4 +442,19 @@ export async function startMCPServer(backend: LocalBackend): Promise<void> {
   process.stdin.on('end', shutdown);
   process.stdin.on('error', () => shutdown());
   process.stdout.on('error', () => shutdown());
+
+  // Proactive orphan detection. macOS has no PR_SET_PDEATHSIG equivalent and
+  // some MCP-client crashes don't cleanly close stdin, so the `stdin.on('end')`
+  // hook above is not sufficient. Polling `process.ppid` catches both
+  // orphan-on-startup (PPID already 1) and mid-life reparenting to launchd.
+  let ppidPoll: NodeJS.Timeout | undefined;
+  const checkOrphaned = () => {
+    if (process.ppid === 1) {
+      mcpLogger.info({ pid: process.pid }, 'Parent process gone (PPID=1) — shutting down');
+      shutdown();
+    }
+  };
+  checkOrphaned();
+  ppidPoll = setInterval(checkOrphaned, 5_000);
+  ppidPoll.unref();
 }
