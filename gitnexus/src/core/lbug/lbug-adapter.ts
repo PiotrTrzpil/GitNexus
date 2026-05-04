@@ -393,7 +393,7 @@ const TABLES_WITH_EXPORTED = new Set<string>(['Class', 'Interface', 'CodeElement
 const getCopyQuery = (table: NodeTableName, filePath: string): string => {
   const t = escapeTableName(table);
   if (table === 'File') {
-    return `COPY ${t}(id, name, filePath, content) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+    return `COPY ${t}(id, name, filePath, content, sizeBytes) FROM "${filePath}" ${COPY_CSV_OPTS}`;
   }
   if (table === 'Folder') {
     return `COPY ${t}(id, name, filePath) FROM "${filePath}" ${COPY_CSV_OPTS}`;

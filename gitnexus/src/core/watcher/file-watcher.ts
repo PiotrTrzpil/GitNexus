@@ -40,6 +40,7 @@ interface RepoState {
   snapshot: Map<string, FileSnapshot> | null;
   reindexing: boolean;
   nextPollAt: number;
+  consecutiveFailures: number;
 }
 
 /**
@@ -209,13 +210,21 @@ async function pollRepo(
   try {
     await options.onReindex(repo.path);
     watcherLogger.info({ repo: repoName, fileCount: snap.size }, 'Reindex completed');
-    // Successful reindex — update snapshot and recalculate interval
+    // Successful reindex — update snapshot, reset failure backoff, recalculate interval
     state.snapshot = snap;
+    state.consecutiveFailures = 0;
     state.nextPollAt = Date.now() + computeInterval(snap.size, maxIntervalMs);
   } catch (err) {
-    watcherLogger.error({ err, repo: repoName }, 'Reindex failed');
-    // Keep old snapshot so we retry next cycle
-    state.nextPollAt = Date.now() + interval;
+    state.consecutiveFailures++;
+    // Exponential backoff capped at maxIntervalMs so a persistent failure
+    // (e.g. schema bug) cannot pin a CPU at the polling rate.
+    const backoff = Math.min(interval * 2 ** (state.consecutiveFailures - 1), maxIntervalMs);
+    watcherLogger.error(
+      { err, repo: repoName, consecutiveFailures: state.consecutiveFailures, backoffMs: backoff },
+      'Reindex failed'
+    );
+    // Keep old snapshot so we retry — but on a backoff schedule, not every poll.
+    state.nextPollAt = Date.now() + backoff;
   } finally {
     await releaseReindexLock(repo.path);
     state.reindexing = false;
@@ -249,6 +258,7 @@ export function startWatcher(
       snapshot: null,
       reindexing: false,
       nextPollAt: 0,  // will be set after grace period
+      consecutiveFailures: 0,
     });
   }
 
