@@ -45,8 +45,16 @@ export function isTestFilePath(filePath: string): boolean {
   );
 }
 
-/** Timeout for rename operations (1 minute) */
+/** Timeout for symbol rename operations (1 minute) */
 const RENAME_TIMEOUT_MS = 60_000;
+
+/**
+ * Timeout for file/directory moves. Python rope moves scan the project and may
+ * need longer on large monorepos. dry-run for Python is sandbox-isolated so a
+ * timeout cannot leave partial applies in the real tree.
+ */
+// Slightly above rope-move's internal 180s kill so the child surfaces a clean error first
+const FILE_DIR_RENAME_TIMEOUT_MS = 200_000;
 
 /** Race a promise against a timeout */
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
@@ -1633,7 +1641,7 @@ export class LocalBackend {
             newFile,
             dryRun: dry_run,
           }),
-          RENAME_TIMEOUT_MS,
+          FILE_DIR_RENAME_TIMEOUT_MS,
           'file rename',
         );
 
@@ -1650,16 +1658,25 @@ export class LocalBackend {
           });
         }
 
+        const tsMorphEdits = result.edits.filter(e => e.confidence === 'ts_morph').length;
+        const ropeEdits = result.edits.filter(e => e.confidence === 'rope').length;
+        const engine = ropeEdits > 0 && tsMorphEdits === 0
+          ? 'rope'
+          : ropeEdits > 0
+            ? 'ts_morph+rope'
+            : 'ts_morph';
+
         return {
           status: 'success',
           old_name: oldFile,
           new_name: newFile,
           type: 'file',
-          engine: 'ts_morph',
+          engine,
           files_moved: result.files_moved.length,
           files_affected: changes.size,
           total_edits: result.edits.length,
-          ts_morph_edits: result.edits.length,
+          ts_morph_edits: tsMorphEdits,
+          rope_edits: ropeEdits,
           moves: result.files_moved,
           changes: Array.from(changes.values()),
           applied: !dry_run,
@@ -1693,7 +1710,7 @@ export class LocalBackend {
             newDir,
             dryRun: dry_run,
           }),
-          RENAME_TIMEOUT_MS,
+          FILE_DIR_RENAME_TIMEOUT_MS,
           'directory rename',
         );
 
@@ -1710,16 +1727,25 @@ export class LocalBackend {
           });
         }
 
+        const tsMorphEdits = result.edits.filter(e => e.confidence === 'ts_morph').length;
+        const ropeEdits = result.edits.filter(e => e.confidence === 'rope').length;
+        const engine = ropeEdits > 0 && tsMorphEdits === 0
+          ? 'rope'
+          : ropeEdits > 0
+            ? 'ts_morph+rope'
+            : 'ts_morph';
+
         return {
           status: 'success',
           old_name: oldDir,
           new_name: newDir,
           type: 'directory',
-          engine: 'ts_morph',
+          engine,
           files_moved: result.files_moved.length,
           files_affected: changes.size,
           total_edits: result.edits.length,
-          ts_morph_edits: result.edits.length,
+          ts_morph_edits: tsMorphEdits,
+          rope_edits: ropeEdits,
           moves: result.files_moved,
           changes: Array.from(changes.values()),
           applied: !dry_run,

@@ -174,13 +174,15 @@ For symbol renames (default):
   Falls back to graph-only (no text_search) for other languages or if the semantic engine cannot resolve the symbol.
 
 For file moves (type: "file"):
-  Moves a single file to a new location and updates all import/export paths across the codebase
-  using ts-morph's SourceFile.move() API. Non-TS files are moved via filesystem (no import rewriting).
+  Moves a single file to a new location and updates all import/export paths across the codebase.
+  TypeScript/JavaScript uses ts-morph's SourceFile.move() API. Python uses rope (MoveModule/Rename)
+  to rewrite imports. Other languages are moved via filesystem (no import rewriting).
   Usage: rename(symbol_name: "src/utils/helpers.ts", new_name: "src/lib/helpers.ts", type: "file")
 
 For directory renames (type: "directory"):
-  Moves all files from old directory to new directory, and updates all import/export paths
-  across the codebase using ts-morph's SourceFile.move() API. Non-TS files are moved via filesystem.
+  Moves all files from old directory to new directory, and updates import/export paths.
+  TypeScript/JavaScript uses ts-morph. Python packages use rope package move. Mixed trees use
+  both engines; non-code assets are moved via filesystem.
   Usage: rename(symbol_name: "src/canvas", new_name: "src/view", type: "directory")
 
 Engine selection (for symbol renames):

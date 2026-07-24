@@ -1,17 +1,19 @@
 /**
- * Directory rename for TypeScript/JavaScript projects.
+ * Directory rename / package move.
  *
- * Uses ts-morph's SourceFile.move() to relocate every file in a directory
- * and automatically update all import/export paths across the project.
- * Non-TS files in the directory are moved via the filesystem.
+ * - TypeScript/JavaScript: ts-morph SourceFile.move() rewrites import/export paths.
+ * - Python (no TS in the tree): rope package move rewrites imports for the whole tree.
+ * - Mixed TS + Python: TS via ts-morph; each Python module via rope; other files via fs.
+ * - Other non-code files: filesystem move only.
  *
  * Error contract (matches ts-morph-rename.ts):
- * - Throws on infrastructure errors (IO, parse, bad tsconfig).
+ * - Throws on infrastructure errors (IO, parse, bad tsconfig, rope failures).
  */
 
 import * as path from 'path';
 import * as fs from 'fs/promises';
 import { findTsConfig, isTypeScriptFile } from './ts-morph-rename.js';
+import { isPythonFile, ropeMove } from './rope-rename.js';
 import { renameLogger } from '../../util/logger.js';
 
 export interface DirectoryRenameEdit {
@@ -19,7 +21,7 @@ export interface DirectoryRenameEdit {
   line: number;
   old_text: string;
   new_text: string;
-  confidence: 'ts_morph';
+  confidence: 'ts_morph' | 'rope';
 }
 
 export interface DirectoryRenameResult {
@@ -84,7 +86,8 @@ export async function directoryRename(opts: {
   // Collect all files before any modifications
   const allFiles = await collectFiles(absoluteOldDir);
   const tsFiles = allFiles.filter(f => isTypeScriptFile(f));
-  const nonTsFiles = allFiles.filter(f => !isTypeScriptFile(f));
+  const pyFiles = allFiles.filter(f => isPythonFile(f));
+  const otherFiles = allFiles.filter(f => !isTypeScriptFile(f) && !isPythonFile(f));
 
   // Build the move map (old absolute → new absolute) for all files
   const moveMap = new Map<string, string>();
@@ -95,6 +98,66 @@ export async function directoryRename(opts: {
 
   const edits: DirectoryRenameEdit[] = [];
   const filesMoved: { from: string; to: string }[] = [];
+
+  // --- Python-only tree (may include assets): single rope package move ---
+  // Rope moves the whole directory and rewrites Python imports. Prefer this when
+  // there is no TS/JS so we get correct package-level import updates.
+  if (pyFiles.length > 0 && tsFiles.length === 0) {
+    const result = await ropeMove({
+      repoPath,
+      oldPath: oldDir.replace(/\\/g, '/'),
+      newPath: newDir.replace(/\\/g, '/'),
+      dryRun,
+    });
+
+    edits.push(
+      ...result.edits.map((e) => ({
+        filePath: e.filePath,
+        line: e.line,
+        old_text: e.old_text,
+        new_text: e.new_text,
+        confidence: 'rope' as const,
+      })),
+    );
+
+    if (result.files_moved.length > 0) {
+      filesMoved.push(...result.files_moved);
+    } else {
+      for (const absFile of allFiles) {
+        const newPath = moveMap.get(absFile)!;
+        filesMoved.push({
+          from: path.relative(repoPath, absFile),
+          to: path.relative(repoPath, newPath),
+        });
+      }
+    }
+
+    // If rope only reported Python moves, still move leftover non-py assets via fs
+    // (package-level rope move usually relocates the whole tree already).
+    if (!dryRun) {
+      for (const absFile of otherFiles) {
+        const newPath = moveMap.get(absFile)!;
+        const alreadyMoved = filesMoved.some(
+          (m) => path.resolve(repoPath, m.from) === path.resolve(absFile),
+        );
+        if (alreadyMoved) continue;
+        try {
+          await fs.access(absFile);
+        } catch {
+          continue; // already gone with the package move
+        }
+        await fs.mkdir(path.dirname(newPath), { recursive: true });
+        await fs.rename(absFile, newPath);
+        filesMoved.push({
+          from: path.relative(repoPath, absFile),
+          to: path.relative(repoPath, newPath),
+        });
+      }
+      await removeEmptyDirs(absoluteOldDir);
+    }
+
+    return { edits, files_moved: filesMoved };
+  }
 
   // --- TypeScript files: use ts-morph to move + update imports ---
   if (tsFiles.length > 0) {
@@ -209,8 +272,116 @@ export async function directoryRename(opts: {
     }
   }
 
-  // --- Non-TS files: move via filesystem ---
-  for (const absFile of nonTsFiles) {
+  // --- Python files in a mixed tree: move each module via rope ---
+  // Package-level move would also relocate TS files that ts-morph already handled,
+  // so fall back to per-module rope moves.
+  //
+  // Important: never rope-move `__init__.py` first. Rope treats package __init__
+  // as the package itself and can relocate sibling modules to unexpected paths
+  // (e.g. pkg/shared/mixed/...). Move regular modules with rope, then place
+  // __init__.py files via filesystem.
+  const pyModules = pyFiles.filter((f) => path.basename(f) !== '__init__.py');
+  const pyInits = pyFiles.filter((f) => path.basename(f) === '__init__.py');
+
+  for (const absFile of pyModules) {
+    const newPath = moveMap.get(absFile)!;
+    const relOld = path.relative(repoPath, absFile).replace(/\\/g, '/');
+    const relNew = path.relative(repoPath, newPath).replace(/\\/g, '/');
+
+    // Skip if a prior rope operation already relocated this file
+    if (!dryRun) {
+      try {
+        await fs.access(absFile);
+      } catch {
+        const alreadyAtDest = await fs.access(newPath).then(() => true).catch(() => false);
+        if (alreadyAtDest) {
+          filesMoved.push({ from: relOld, to: relNew });
+          continue;
+        }
+      }
+    }
+
+    try {
+      const result = await ropeMove({
+        repoPath,
+        oldPath: relOld,
+        newPath: relNew,
+        dryRun,
+      });
+      edits.push(
+        ...result.edits.map((e) => ({
+          filePath: e.filePath,
+          line: e.line,
+          old_text: e.old_text,
+          new_text: e.new_text,
+          confidence: 'rope' as const,
+        })),
+      );
+      if (result.files_moved.length > 0) {
+        // Only record moves that match this module (rope can report extras)
+        const primary = result.files_moved.filter(
+          (m) => m.from === relOld || m.to === relNew,
+        );
+        filesMoved.push(...(primary.length > 0 ? primary : result.files_moved));
+      } else {
+        filesMoved.push({ from: relOld, to: relNew });
+      }
+    } catch (e) {
+      // If rope cannot refactor this module (e.g. broken package layout), fall back
+      // to a plain filesystem move so the directory rename still completes.
+      // Rope may have already relocated the file before failing — don't double-move.
+      renameLogger.warn(
+        { err: e, from: relOld, to: relNew },
+        'rope move failed for Python file during directory rename; falling back to filesystem move',
+      );
+      filesMoved.push({ from: relOld, to: relNew });
+      if (!dryRun) {
+        let sourceExists = false;
+        let destExists = false;
+        try {
+          await fs.access(absFile);
+          sourceExists = true;
+        } catch { /* already gone */ }
+        try {
+          await fs.access(newPath);
+          destExists = true;
+        } catch { /* not at dest yet */ }
+
+        if (sourceExists && !destExists) {
+          await fs.mkdir(path.dirname(newPath), { recursive: true });
+          await fs.rename(absFile, newPath);
+        } else if (!sourceExists && !destExists) {
+          // Neither location has the file — rethrow so the caller sees a real failure
+          throw e;
+        }
+        // else: already at dest (rope moved it) or both exist — leave as-is
+      }
+    }
+  }
+
+  // Place __init__.py files last via filesystem (content-only; package path already
+  // rewritten by the module moves above when consumers import submodules).
+  for (const absFile of pyInits) {
+    const newPath = moveMap.get(absFile)!;
+    const relOld = path.relative(repoPath, absFile).replace(/\\/g, '/');
+    const relNew = path.relative(repoPath, newPath).replace(/\\/g, '/');
+    filesMoved.push({ from: relOld, to: relNew });
+
+    if (!dryRun) {
+      try {
+        await fs.access(absFile);
+      } catch {
+        continue; // already relocated with a prior package-level rope op
+      }
+      const destExists = await fs.access(newPath).then(() => true).catch(() => false);
+      if (destExists) continue;
+      await fs.mkdir(path.dirname(newPath), { recursive: true });
+      await fs.rename(absFile, newPath);
+    }
+  }
+
+  // --- Other non-TS/non-Python files: move via filesystem ---
+  for (const absFile of otherFiles) {
     const newPath = moveMap.get(absFile)!;
     filesMoved.push({
       from: path.relative(repoPath, absFile),

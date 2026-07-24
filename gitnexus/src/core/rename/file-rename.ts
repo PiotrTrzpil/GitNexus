@@ -1,17 +1,18 @@
 /**
- * Single-file rename/move for TypeScript/JavaScript projects.
+ * Single-file rename/move.
  *
- * Uses ts-morph's SourceFile.move() to relocate a single file
- * and automatically update all import/export paths across the project.
- * Non-TS files are moved via the filesystem (no import rewriting).
+ * - TypeScript/JavaScript: ts-morph SourceFile.move() rewrites import/export paths.
+ * - Python: rope MoveModule / Rename rewrites import paths.
+ * - Other files: filesystem move only (no import rewriting).
  *
  * Error contract (matches directory-rename.ts):
- * - Throws on infrastructure errors (IO, parse, bad tsconfig).
+ * - Throws on infrastructure errors (IO, parse, bad tsconfig, rope failures).
  */
 
 import * as path from 'path';
 import * as fs from 'fs/promises';
 import { findTsConfig, isTypeScriptFile } from './ts-morph-rename.js';
+import { isPythonFile, ropeMove } from './rope-rename.js';
 import { renameLogger } from '../../util/logger.js';
 
 export interface FileRenameEdit {
@@ -19,7 +20,7 @@ export interface FileRenameEdit {
   line: number;
   old_text: string;
   new_text: string;
-  confidence: 'ts_morph';
+  confidence: 'ts_morph' | 'rope';
 }
 
 export interface FileRenameResult {
@@ -71,6 +72,28 @@ export async function fileRename(opts: {
   const filesMoved: { from: string; to: string }[] = [
     { from: oldFile, to: newFile },
   ];
+
+  // --- Python file: use rope to move + update imports ---
+  if (isPythonFile(absoluteOldFile)) {
+    const result = await ropeMove({
+      repoPath,
+      oldPath: oldFile.replace(/\\/g, '/'),
+      newPath: newFile.replace(/\\/g, '/'),
+      dryRun,
+    });
+    return {
+      edits: result.edits.map((e) => ({
+        filePath: e.filePath,
+        line: e.line,
+        old_text: e.old_text,
+        new_text: e.new_text,
+        confidence: 'rope' as const,
+      })),
+      files_moved: result.files_moved.length > 0
+        ? result.files_moved
+        : [{ from: oldFile, to: newFile }],
+    };
+  }
 
   // --- TS/JS file: use ts-morph to move + update imports ---
   if (isTypeScriptFile(absoluteOldFile)) {

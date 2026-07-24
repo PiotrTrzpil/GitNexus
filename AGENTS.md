@@ -44,3 +44,46 @@ The rename tool has an `engine` parameter that controls matching strictness. Def
 | Tools and schema reference | `.claude/skills/gitnexus/gitnexus-guide/SKILL.md` |
 | CLI (analyze, embeddings, wiki) | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
 <!-- gitnexus:end -->
+
+# Package tests (`gitnexus/`)
+
+Package scripts live in `gitnexus/package.json`. Use **pnpm** (not npm).
+
+| Script | What it runs |
+|--------|----------------|
+| `pnpm test` | All unit tests (`test/unit`) |
+| `pnpm test:integration` | **Entire** integration suite (`test/integration`) — slow |
+| `pnpm test:all` | Unit + integration |
+| `pnpm test:watch` | Vitest watch mode |
+
+## Running a subset of tests (correct)
+
+`pnpm test` / `pnpm test:integration` already pass a directory to vitest. Extra path args after `--` do **not** narrow the run — you still get the whole suite.
+
+**Wrong** (runs everything under `test/integration`, can take minutes):
+
+```bash
+cd gitnexus
+pnpm test:integration -- test/integration/python-file-move.test.ts
+# expands to: vitest run test/integration -- test/integration/python-file-move.test.ts
+```
+
+**Right** — invoke vitest with only the files or globs you want:
+
+```bash
+cd gitnexus
+
+# One file
+pnpm exec vitest run test/integration/python-file-move.test.ts
+
+# Several files
+pnpm exec vitest run test/integration/file-rename.test.ts test/integration/directory-rename.test.ts
+
+# Name filter within a path
+pnpm exec vitest run test/integration -t "rope"
+
+# Unit only, one file
+pnpm exec vitest run test/unit/graph.test.ts
+```
+
+Prefer partial runs while iterating; use full `pnpm test` / `pnpm test:integration` before commit or when validating broad changes.

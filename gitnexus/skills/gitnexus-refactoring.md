@@ -50,7 +50,7 @@ Each returned edit is tagged with how it was found:
 | `graph`        | GitNexus knowledge graph relationships   | High — safe to accept                           |
 | `text_search`  | Regex fallback via ripgrep               | Lower — **only with `engine: "with_text_search"`, review carefully** |
 
-Symbol renames try ts-morph (TS/JS) or rope (Python) first, then fall back to graph-only (no text_search) for other languages or unresolvable symbols. File and directory moves use ts-morph's `SourceFile.move()` API for TS/JS; non-TS files are moved on the filesystem without import rewriting.
+Symbol renames try ts-morph (TS/JS) or rope (Python) first, then fall back to graph-only (no text_search) for other languages or unresolvable symbols. File and directory moves use ts-morph's `SourceFile.move()` API for TS/JS and rope (MoveModule/Rename) for Python — both rewrite imports. Other languages are moved on the filesystem without import rewriting.
 
 ## Workflow
 
