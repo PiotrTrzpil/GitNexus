@@ -3,17 +3,26 @@
  *
  * Provides atomic locking with stale lock detection.
  * Uses PID-based lockfiles with timestamps for stale detection.
+ *
+ * Stale takeover is atomic (unlink + O_EXCL create) so two waiters cannot
+ * both "win" a dead lock and both believe they hold it.
  */
 
 import fs from 'fs/promises';
 
 export interface LockOptions {
-  /** Stale timeout in ms (default: 5 minutes) */
+  /** Stale timeout in ms (default: 5 minutes). Used when stealFromLive is true. */
   staleMs?: number;
   /** Poll interval when waiting for lock (default: 500ms) */
   pollIntervalMs?: number;
   /** Max wait time in ms (default: 30 seconds) */
   maxWaitMs?: number;
+  /**
+   * When true (default), a lock held by a *live* process older than staleMs
+   * may be stolen. Set false for long-lived leaders (e.g. watcher leader)
+   * that only refresh timestamps via refreshLock — steal only if the PID is dead.
+   */
+  stealFromLive?: boolean;
 }
 
 const DEFAULT_STALE_MS = 5 * 60 * 1000;
@@ -23,7 +32,7 @@ const DEFAULT_MAX_WAIT_MS = 30 * 1000;
 /**
  * Check if a process with the given PID is alive.
  */
-function isProcessAlive(pid: number): boolean {
+export function isProcessAlive(pid: number): boolean {
   try {
     process.kill(pid, 0); // Signal 0 = existence check
     return true;
@@ -32,41 +41,86 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
+function lockPayload(): string {
+  return JSON.stringify({ pid: process.pid, ts: Date.now() });
+}
+
+/**
+ * Exclusive-create a lock file. Returns true on success.
+ */
+async function exclusiveCreate(lockPath: string): Promise<boolean> {
+  try {
+    const fd = await fs.open(lockPath, 'wx');
+    try {
+      await fd.writeFile(lockPayload());
+    } finally {
+      await fd.close();
+    }
+    return true;
+  } catch (err: any) {
+    if (err?.code === 'EEXIST') return false;
+    return false;
+  }
+}
+
 /**
  * Try to acquire a lock. Returns true if lock acquired, false if held by another process.
- * Automatically removes stale locks (process dead or timeout exceeded).
+ * Automatically removes stale locks (dead process, or timed-out live holder when
+ * stealFromLive is true).
  */
 export async function tryAcquireLock(
   lockPath: string,
   options: LockOptions = {}
 ): Promise<boolean> {
   const staleMs = options.staleMs ?? DEFAULT_STALE_MS;
+  const stealFromLive = options.stealFromLive !== false;
 
+  if (await exclusiveCreate(lockPath)) return true;
+
+  // Lock exists — check if we may reclaim it
   try {
-    // Atomic create — O_WRONLY | O_CREAT | O_EXCL
-    const fd = await fs.open(lockPath, 'wx');
-    await fd.writeFile(JSON.stringify({ pid: process.pid, ts: Date.now() }));
-    await fd.close();
-    return true;
-  } catch (err: any) {
-    if (err?.code !== 'EEXIST') return false;
+    const content = await fs.readFile(lockPath, 'utf-8');
+    const { pid, ts } = JSON.parse(content);
+    const age = Date.now() - (typeof ts === 'number' ? ts : 0);
+    const alive = typeof pid === 'number' && isProcessAlive(pid);
 
-    // Lock exists — check if stale
+    const reclaim =
+      !alive || // dead holder
+      (stealFromLive && age > staleMs); // hung live holder (reindex, analyze)
+
+    if (!reclaim) return false;
+
+    // Atomic reclaim: only one waiter wins the exclusive re-create.
     try {
-      const content = await fs.readFile(lockPath, 'utf-8');
-      const { pid, ts } = JSON.parse(content);
-      const age = Date.now() - ts;
-
-      if (age > staleMs || !isProcessAlive(pid)) {
-        // Stale lock — take it over
-        await fs.writeFile(lockPath, JSON.stringify({ pid: process.pid, ts: Date.now() }));
-        return true;
-      }
-
-      return false; // Lock held by active process
+      await fs.unlink(lockPath);
     } catch {
-      return false; // Can't read/parse lock — leave it alone
+      // Already gone — fall through to exclusive create
     }
+    return exclusiveCreate(lockPath);
+  } catch {
+    // Unreadable/corrupt lock — try reclaim once
+    try {
+      await fs.unlink(lockPath);
+    } catch {
+      /* ignore */
+    }
+    return exclusiveCreate(lockPath);
+  }
+}
+
+/**
+ * Refresh the timestamp on a lock we own (leader heartbeat).
+ * Returns false if the lock is missing or owned by another PID.
+ */
+export async function refreshLock(lockPath: string): Promise<boolean> {
+  try {
+    const content = await fs.readFile(lockPath, 'utf-8');
+    const { pid } = JSON.parse(content);
+    if (pid !== process.pid) return false;
+    await fs.writeFile(lockPath, lockPayload());
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -81,21 +135,25 @@ export async function waitForLockRelease(
   const staleMs = options.staleMs ?? DEFAULT_STALE_MS;
   const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
   const maxWaitMs = options.maxWaitMs ?? DEFAULT_MAX_WAIT_MS;
+  const stealFromLive = options.stealFromLive !== false;
   const deadline = Date.now() + maxWaitMs;
 
   while (Date.now() < deadline) {
     try {
       const content = await fs.readFile(lockPath, 'utf-8');
       const { pid, ts } = JSON.parse(content);
-      const age = Date.now() - ts;
+      const age = Date.now() - (typeof ts === 'number' ? ts : 0);
+      const alive = typeof pid === 'number' && isProcessAlive(pid);
 
-      // Lock is stale — remove it and return
-      if (age > staleMs || !isProcessAlive(pid)) {
-        try { await fs.unlink(lockPath); } catch {}
+      if (!alive || (stealFromLive && age > staleMs)) {
+        try {
+          await fs.unlink(lockPath);
+        } catch {
+          /* ignore */
+        }
         return true;
       }
 
-      // Lock is held — wait
       await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
     } catch {
       // Lock file doesn't exist or can't be read — consider released
@@ -107,9 +165,17 @@ export async function waitForLockRelease(
 }
 
 /**
- * Release a lock. Safe to call even if lock doesn't exist.
+ * Release a lock we own. No-ops if the lock is missing or held by another PID
+ * (so a demoted leader cannot wipe a newer leader's lock).
  */
 export async function releaseLock(lockPath: string): Promise<void> {
+  try {
+    const content = await fs.readFile(lockPath, 'utf-8');
+    const { pid } = JSON.parse(content);
+    if (pid !== process.pid) return;
+  } catch {
+    // Missing/unreadable — still try unlink below (best-effort for our empty files)
+  }
   try {
     await fs.unlink(lockPath);
   } catch {
@@ -125,21 +191,26 @@ export async function isLocked(
   options: LockOptions = {}
 ): Promise<boolean> {
   const staleMs = options.staleMs ?? DEFAULT_STALE_MS;
+  const stealFromLive = options.stealFromLive !== false;
 
   try {
     const content = await fs.readFile(lockPath, 'utf-8');
     const { pid, ts } = JSON.parse(content);
-    const age = Date.now() - ts;
+    const age = Date.now() - (typeof ts === 'number' ? ts : 0);
+    const alive = typeof pid === 'number' && isProcessAlive(pid);
 
-    if (age > staleMs || !isProcessAlive(pid)) {
-      // Stale lock — remove it
-      try { await fs.unlink(lockPath); } catch {}
+    if (!alive || (stealFromLive && age > staleMs)) {
+      try {
+        await fs.unlink(lockPath);
+      } catch {
+        /* ignore */
+      }
       return false;
     }
 
-    return true; // Lock held by active process
+    return true;
   } catch {
-    return false; // Lock doesn't exist
+    return false;
   }
 }
 
@@ -155,8 +226,8 @@ export async function getLockInfo(
     return {
       pid,
       ts,
-      age: Date.now() - ts,
-      alive: isProcessAlive(pid),
+      age: Date.now() - (typeof ts === 'number' ? ts : 0),
+      alive: typeof pid === 'number' && isProcessAlive(pid),
     };
   } catch {
     return null;

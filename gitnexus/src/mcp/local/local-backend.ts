@@ -2433,6 +2433,12 @@ export class LocalBackend {
   /**
    * Re-run the analysis pipeline for a repo and reload the LadybugDB connection.
    * Called by the file watcher when changes are detected.
+   *
+   * Critical: must take the `.rebuild` lock and give other MCP processes time to
+   * close open Ladybug handles *before* deleting DB files. Without this, concurrent
+   * MCP servers (or mid-flight Database.init) hit deleted/truncated files and
+   * SIGSEGV inside native recover/WAL replay — the hang that left pid 23822 at
+   * 100% CPU for days. Mirrors `gitnexus analyze` Phase 2.
    */
   async reindexRepo(repoPath: string): Promise<void> {
     const { runPipelineFromRepo } = await import('../../core/ingestion/pipeline.js');
@@ -2443,9 +2449,11 @@ export class LocalBackend {
     } = await import('../../core/lbug/lbug-adapter.js');
     const { getStoragePaths, saveMeta, registerRepo } = await import('../../storage/repo-manager.js');
     const { getCurrentCommit } = await import('../../storage/git.js');
+    const { tryAcquireLock, releaseLock } = await import('../../util/lockfile.js');
 
     const resolved = path.resolve(repoPath);
     const { storagePath, lbugPath } = getStoragePaths(resolved);
+    const rebuildLockPath = `${lbugPath}.rebuild`;
 
     // Close the MCP pool's read-only connection so we can write without lock conflicts
     const handle = [...this.repos.values()].find(h => h.repoPath === resolved);
@@ -2456,41 +2464,60 @@ export class LocalBackend {
       this.initializedRepos.delete(handle.id);
     }
 
-    // Re-run pipeline (no UI progress needed)
+    // Re-run pipeline (no UI progress needed) — safe while other readers still hold
+    // the old DB open; we only touch files after the rebuild lock + grace period.
     const result = await runPipelineFromRepo(resolved, () => {});
 
-    // Persist to LadybugDB using the core singleton adapter (write-capable).
-    // Delete old db files first to avoid duplicate data (same as analyze CLI).
-    await closeCoreLbug();
-    for (const f of [lbugPath, `${lbugPath}.wal`, `${lbugPath}.lock`]) {
-      try { await fs.rm(f, { recursive: true, force: true }); } catch (e) {
-        mcpLogger.debug({ err: e, file: f }, 'Failed to remove db file during reindex (may not exist)');
+    // Signal every MCP rebuild-watcher (200ms poll) to drop open handles before
+    // we delete the database files. Without this lock, readers segfault in native code.
+    const lockAcquired = await tryAcquireLock(rebuildLockPath, { staleMs: 60_000 });
+    if (!lockAcquired) {
+      mcpLogger.warn(
+        { repo: resolved, rebuildLockPath },
+        'Could not acquire rebuild lock for reindex — another rebuild may be in progress'
+      );
+    }
+    // 500ms ≈ 2–3 watcher poll cycles; matches analyze CLI.
+    await new Promise(resolve => setTimeout(resolve, 500));
+
+    try {
+      // Persist to LadybugDB using the core singleton adapter (write-capable).
+      // Delete old db files first to avoid duplicate data (same as analyze CLI).
+      await closeCoreLbug();
+      for (const f of [lbugPath, `${lbugPath}.wal`, `${lbugPath}.lock`]) {
+        try { await fs.rm(f, { recursive: true, force: true }); } catch (e) {
+          mcpLogger.debug({ err: e, file: f }, 'Failed to remove db file during reindex (may not exist)');
+        }
+      }
+      await initCoreLbug(lbugPath);
+      await loadGraphToLbug(result.graph, resolved, storagePath);
+
+      // Get accurate stats from the database before closing
+      const { getLbugStats } = await import('../../core/lbug/lbug-adapter.js');
+      const dbStats = await getLbugStats();
+      await closeCoreLbug();
+
+      // Update meta with complete stats (matching analyze CLI output)
+      const meta = {
+        repoPath: resolved,
+        lastCommit: getCurrentCommit(resolved),
+        indexedAt: new Date().toISOString(),
+        version: VERSION,
+        stats: {
+          files: result.totalFileCount,
+          nodes: dbStats.nodes,
+          edges: dbStats.edges,
+          communities: result.communityResult?.stats?.totalCommunities,
+          processes: result.processResult?.stats?.totalProcesses,
+        },
+      };
+      await saveMeta(storagePath, meta);
+      await registerRepo(resolved, meta);
+    } finally {
+      if (lockAcquired) {
+        await releaseLock(rebuildLockPath);
       }
     }
-    await initCoreLbug(lbugPath);
-    await loadGraphToLbug(result.graph, resolved, storagePath);
-
-    // Get accurate stats from the database before closing
-    const { getLbugStats } = await import('../../core/lbug/lbug-adapter.js');
-    const dbStats = await getLbugStats();
-    await closeCoreLbug();
-
-    // Update meta with complete stats (matching analyze CLI output)
-    const meta = {
-      repoPath: resolved,
-      lastCommit: getCurrentCommit(resolved),
-      indexedAt: new Date().toISOString(),
-      version: VERSION,
-      stats: {
-        files: result.totalFileCount,
-        nodes: dbStats.nodes,
-        edges: dbStats.edges,
-        communities: result.communityResult?.stats?.totalCommunities,
-        processes: result.processResult?.stats?.totalProcesses,
-      },
-    };
-    await saveMeta(storagePath, meta);
-    await registerRepo(resolved, meta);
   }
 
   // ─── quality_query ───────────────────────────────────────────────

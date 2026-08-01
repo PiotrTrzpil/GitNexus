@@ -25,13 +25,16 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import os from 'os';
 import path from 'path';
-import { Worker } from 'worker_threads';
-import { spawn } from 'child_process';
 import { GITNEXUS_TOOLS } from './tools.js';
 import type { LocalBackend } from './local/local-backend.js';
 import { getResourceDefinitions, getResourceTemplates, readResource } from './resources.js';
 import { startWatcher } from '../core/watcher/file-watcher.js';
-import { tryAcquireLock, releaseLock, getLockInfo } from '../util/lockfile.js';
+import { tryAcquireLock, releaseLock, getLockInfo, refreshLock } from '../util/lockfile.js';
+import {
+  armSigkillWatchdog,
+  DEFAULT_FORCE_EXIT_MS,
+  exitWithWatchdog,
+} from '../util/process-lifecycle.js';
 import { mcpLogger } from '../util/logger.js';
 import { VERSION } from '../config/version.js';
 
@@ -52,6 +55,15 @@ const WATCHER_LEADER_LOCK = path.join(os.homedir(), '.gitnexus', 'watcher.leader
  * long enough that idle followers stay quiet.
  */
 const FOLLOWER_RETRY_MS = 15_000;
+
+/**
+ * Leader heartbeat interval. The previous lock implementation treated any lock
+ * older than 5 minutes as stale *even if the leader PID was still alive*, so
+ * after 5 minutes every follower stole the lock and started its own watcher —
+ * 12 concurrent reindexers on one repo, DB files deleted under open handles,
+ * SIGSEGV. stealFromLive:false stops that; the heartbeat keeps diagnostics accurate.
+ */
+const LEADER_HEARTBEAT_MS = 60_000;
 
 
 /**
@@ -342,11 +354,39 @@ export async function startMCPServer(backend: LocalBackend): Promise<void> {
   // leader is reclaimed automatically on the next follower retry.
   let stopWatcher: (() => void) | undefined;
   let leaderRetryTimer: NodeJS.Timeout | undefined;
+  let leaderHeartbeatTimer: NodeJS.Timeout | undefined;
   let isLeader = false;
+
+  const stopLeaderHeartbeat = () => {
+    if (leaderHeartbeatTimer) {
+      clearInterval(leaderHeartbeatTimer);
+      leaderHeartbeatTimer = undefined;
+    }
+  };
+
+  const startLeaderHeartbeat = () => {
+    stopLeaderHeartbeat();
+    leaderHeartbeatTimer = setInterval(() => {
+      void refreshLock(WATCHER_LEADER_LOCK).then((ok) => {
+        if (!ok) {
+          // Another process took leadership (shouldn't happen with stealFromLive:false
+          // unless we were SIGKILL'd mid-refresh). Stop watching to avoid dual leaders.
+          mcpLogger.warn({ pid: process.pid }, 'Lost watcher leader lock — stopping watcher');
+          try { stopWatcher?.(); } catch {}
+          stopWatcher = undefined;
+          isLeader = false;
+          stopLeaderHeartbeat();
+        }
+      });
+    }, LEADER_HEARTBEAT_MS);
+    leaderHeartbeatTimer.unref();
+  };
 
   const tryStartWatcher = async (): Promise<boolean> => {
     if (isLeader) return true;
-    if (!(await tryAcquireLock(WATCHER_LEADER_LOCK))) return false;
+    // Only reclaim if the previous leader PID is dead — never steal from a live leader
+    // just because the lock timestamp aged past 5 minutes (that caused multi-watcher storms).
+    if (!(await tryAcquireLock(WATCHER_LEADER_LOCK, { stealFromLive: false }))) return false;
     try {
       const repos = await backend.getWatchableRepos();
       if (repos.length === 0) {
@@ -357,10 +397,12 @@ export async function startMCPServer(backend: LocalBackend): Promise<void> {
         onReindex: (repoPath: string) => backend.reindexRepo(repoPath),
       });
       isLeader = true;
+      startLeaderHeartbeat();
       mcpLogger.info({ pid: process.pid, lockPath: WATCHER_LEADER_LOCK }, 'Watcher leader acquired');
       return true;
     } catch (err) {
       // If watcher setup fails, drop the lock so another MCP can try.
+      stopLeaderHeartbeat();
       await releaseLock(WATCHER_LEADER_LOCK);
       mcpLogger.warn({ err }, 'Watcher start failed after lock acquired — releasing');
       return false;
@@ -388,41 +430,21 @@ export async function startMCPServer(backend: LocalBackend): Promise<void> {
   // process whose file watcher keeps polling and racing with the next session's
   // MCP.
   //
-  // A `setTimeout`-based watchdog cannot rescue this: when the main thread is
-  // blocked synchronously inside the C++ destructor, libuv cannot fire timers
-  // and JS signal handlers do not run (queued signals pile up in `_sigtramp`).
-  // Instead we arm a Worker thread whose own event loop is independent of the
-  // wedged main thread; after the deadline it sends SIGKILL to the host PID,
-  // which the kernel enforces unconditionally.
-  const FORCE_EXIT_MS = 3000;
+  // Soft exit always goes through exitWithWatchdog / armSigkillWatchdog so a
+  // wedged main thread is SIGKILL'd by an independent Worker (see
+  // util/process-lifecycle.ts). Fatal signals (SIGSEGV, …) are handled in
+  // cli/mcp.ts with immediate hardKillSelf — never process.exit.
   let shuttingDown = false;
-
-  const armSigkillWatchdog = (ms: number): void => {
-    try {
-      // Inline worker source — no separate file needed for one-line logic.
-      const src = `setTimeout(() => { try { process.kill(${process.pid}, 'SIGKILL'); } catch {} }, ${ms});`;
-      const w = new Worker(src, { eval: true });
-      w.unref();
-    } catch {
-      // Last-resort fallback: detached child that survives even if Worker
-      // construction fails for some reason. Same kernel-enforced SIGKILL.
-      try {
-        const child = spawn('sh', ['-c', `sleep ${Math.ceil(ms / 1000)}; kill -9 ${process.pid}`], {
-          detached: true,
-          stdio: 'ignore',
-        });
-        child.unref();
-      } catch {}
-    }
-  };
 
   const shutdown = async () => {
     if (shuttingDown) return;
     shuttingDown = true;
 
-    armSigkillWatchdog(FORCE_EXIT_MS);
+    // Arm first — cleanup below may never return.
+    armSigkillWatchdog(DEFAULT_FORCE_EXIT_MS);
 
     try { if (leaderRetryTimer) clearInterval(leaderRetryTimer); } catch {}
+    try { stopLeaderHeartbeat(); } catch {}
     try { if (ppidPoll) clearInterval(ppidPoll); } catch {}
     try { stopWatcher?.(); } catch {}
     if (isLeader) {
@@ -431,17 +453,18 @@ export async function startMCPServer(backend: LocalBackend): Promise<void> {
     try { await backend.disconnect(); } catch {}
     try { await server.close(); } catch {}
 
-    process.exit(0);
+    exitWithWatchdog(0, DEFAULT_FORCE_EXIT_MS);
   };
 
-  // Handle graceful shutdown
-  process.once('SIGINT', shutdown);
-  process.once('SIGTERM', shutdown);
+  // Handle graceful shutdown (fatal signals are installed in cli/mcp.ts)
+  process.once('SIGINT', () => { void shutdown(); });
+  process.once('SIGTERM', () => { void shutdown(); });
+  process.once('SIGHUP', () => { void shutdown(); });
 
   // Handle stdio errors — stdin close means the parent process is gone
-  process.stdin.on('end', shutdown);
-  process.stdin.on('error', () => shutdown());
-  process.stdout.on('error', () => shutdown());
+  process.stdin.on('end', () => { void shutdown(); });
+  process.stdin.on('error', () => { void shutdown(); });
+  process.stdout.on('error', () => { void shutdown(); });
 
   // Proactive orphan detection. macOS has no PR_SET_PDEATHSIG equivalent and
   // some MCP-client crashes don't cleanly close stdin, so the `stdin.on('end')`
@@ -451,7 +474,7 @@ export async function startMCPServer(backend: LocalBackend): Promise<void> {
   const checkOrphaned = () => {
     if (process.ppid === 1) {
       mcpLogger.info({ pid: process.pid }, 'Parent process gone (PPID=1) — shutting down');
-      shutdown();
+      void shutdown();
     }
   };
   checkOrphaned();

@@ -1,6 +1,6 @@
 /**
  * MCP Command
- * 
+ *
  * Starts the MCP server in standalone mode.
  * Loads all indexed repos from the global registry.
  * No longer depends on cwd — works from any directory.
@@ -8,6 +8,10 @@
 
 import { startMCPServer } from '../mcp/server.js';
 import { LocalBackend } from '../mcp/local/local-backend.js';
+import {
+  exitWithWatchdog,
+  installFatalSignalHandlers,
+} from '../util/process-lifecycle.js';
 
 export const mcpCommand = async () => {
   // Import logger for crash diagnostics
@@ -16,13 +20,16 @@ export const mcpCommand = async () => {
   // Log startup
   mcpLogger.info('MCP server starting');
 
-  // Prevent unhandled errors from crashing the MCP server process.
-  // LadybugDB lock conflicts and transient errors should degrade gracefully.
+  // Prevent unhandled errors from crashing the MCP server process into an
+  // undefined state without a kill deadline. LadybugDB lock conflicts should
+  // ideally be caught closer to the call site; if they escape, we still must
+  // not hang forever inside process.exit / threadpool join.
   process.on('uncaughtException', (err) => {
     mcpLogger.fatal({ err }, 'Uncaught exception — exiting');
     console.error(`GitNexus MCP: uncaught exception — ${err.message}\n${err.stack}`);
-    // Process is in an undefined state after uncaughtException — exit after flushing
-    setTimeout(() => process.exit(1), 100);
+    // Process is in an undefined state after uncaughtException — exit with a
+    // hard deadline so a stuck native destructor cannot orphan us.
+    exitWithWatchdog(1, 1000);
   });
   process.on('unhandledRejection', (reason) => {
     const err = reason instanceof Error ? reason : new Error(String(reason));
@@ -30,21 +37,28 @@ export const mcpCommand = async () => {
     console.error(`GitNexus MCP: unhandled rejection — ${err.message}`);
   });
 
-  // Log ALL signals for crash tracking
-  const signals = ['SIGTERM', 'SIGINT', 'SIGHUP', 'SIGABRT', 'SIGSEGV', 'SIGBUS', 'SIGILL', 'SIGFPE'];
-  for (const sig of signals) {
-    process.on(sig, () => {
-      // Sync write to stderr - logger may not flush
-      try { require('fs').writeSync(2, `\n[MCP CRASH] Received ${sig}\n`); } catch {}
-      mcpLogger.fatal(`Received ${sig}, shutting down`);
+  // Fatal hardware / abort signals: NEVER call process.exit().
+  // Observed in production (pid 23822, 2026-07-22): SIGSEGV handler logged
+  // "shutting down", then process.exit hung in uv_thread_join while a
+  // DatabaseInit worker spun in LadybugDB RelTable construction — 100% CPU
+  // for 4.7 days under launchd (PPID=1).
+  // Graceful signals (SIGINT/SIGTERM/SIGHUP) are owned by startMCPServer,
+  // which arms the same SIGKILL watchdog after cleanup.
+  installFatalSignalHandlers((sig) => {
+    try {
+      mcpLogger.fatal(`Received ${sig}, force-killing`);
       mcpLogger.flush();
-      process.exit(128 + (signals.indexOf(sig) + 1));
-    });
-  }
+    } catch {
+      // Logger may be unusable after a segfault.
+    }
+  });
 
   // Log process exit
   process.on('exit', (code) => {
-    try { require('fs').writeSync(2, `[MCP] Process exiting with code ${code}\n`); } catch {}
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      require('fs').writeSync(2, `[MCP] Process exiting with code ${code}\n`);
+    } catch {}
   });
 
   // Initialize multi-repo backend from registry.

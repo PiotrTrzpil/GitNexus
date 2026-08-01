@@ -280,6 +280,14 @@ function createConnection(db: lbug.Database): lbug.Connection {
 const QUERY_TIMEOUT_MS = 30_000;
 /** Waiter queue timeout in milliseconds */
 const WAITER_TIMEOUT_MS = 15_000;
+/**
+ * Native Database.init (WAL recover / checkpoint read) must not run unbounded.
+ * Observed hang: RelTable construction during recover spun at 100% for days after
+ * concurrent reindex deleted the DB under an in-flight open. Soft timeout lets
+ * the JS side fail; a wedged native worker is then reaped via process-lifecycle
+ * SIGKILL on fatal signals / forced exit.
+ */
+const DB_INIT_TIMEOUT_MS = 60_000;
 
 const LOCK_RETRY_ATTEMPTS = 3;
 const LOCK_RETRY_DELAY_MS = 2000;
@@ -412,15 +420,32 @@ const doInitLbug = async (repoId: string, dbPath: string): Promise<void> => {
     // Open in read-only mode — MCP server never writes to the database.
     // This allows multiple MCP server instances to read concurrently, and
     // avoids lock conflicts when `gitnexus analyze` is writing.
+    //
+    // Always await init() with a timeout: the constructor is lazy and native
+    // WAL recovery runs on a libuv worker. Without an explicit deadline, a
+    // corrupt/half-deleted DB can pin that worker forever (and process.exit
+    // then deadlocks on uv_thread_join).
     let lastError: Error | null = null;
     for (let attempt = 1; attempt <= LOCK_RETRY_ATTEMPTS; attempt++) {
+      // Re-check rebuild lock each attempt — reindex may have started while we waited
+      if (await isLocked(rebuildLockPath)) {
+        dbLogger.info({ repoId, dbPath }, 'Rebuild started during open — aborting init');
+        throw new Error(`LadybugDB rebuild in progress for ${repoId}. Retry later.`);
+      }
+
       silenceStdout();
+      let db: lbug.Database | null = null;
       try {
-        const db = new lbug.Database(
+        db = new lbug.Database(
           dbPath,
           0,     // bufferManagerSize (default)
           false, // enableCompression (default)
           true,  // readOnly
+        );
+        await withTimeout(
+          db.init(),
+          DB_INIT_TIMEOUT_MS,
+          `LadybugDB init (${repoId})`,
         );
         restoreStdout();
         shared = { db, refCount: 0, ftsLoaded: false, openedAtMtime: currentMtime };
@@ -429,6 +454,9 @@ const doInitLbug = async (repoId: string, dbPath: string): Promise<void> => {
       } catch (err: any) {
         restoreStdout();
         lastError = err instanceof Error ? err : new Error(String(err));
+        if (db) {
+          try { await db.close(); } catch { /* ignore partial open */ }
+        }
 
         // WAL corruption: delete the .wal file and retry once.
         // The DB itself is intact — only uncommitted WAL entries are lost.
@@ -437,10 +465,19 @@ const doInitLbug = async (repoId: string, dbPath: string): Promise<void> => {
           || lastError.message.includes('Reading past the end of the file');
         if (isWalCorrupt) {
           dbLogger.warn({ err: lastError, dbPath }, 'WAL corruption detected, deleting WAL file');
-          try { await fs.unlink(`${dbPath}.wal`); } catch (err) {
-            dbLogger.warn({ err, dbPath }, 'Failed to delete corrupt WAL file');
+          try { await fs.unlink(`${dbPath}.wal`); } catch (unlinkErr) {
+            dbLogger.warn({ err: unlinkErr, dbPath }, 'Failed to delete corrupt WAL file');
           }
           continue; // retry with the .wal file removed
+        }
+
+        const isTimeout = lastError.message.includes('timed out');
+        if (isTimeout) {
+          dbLogger.error(
+            { err: lastError, repoId, dbPath, attempt },
+            'LadybugDB init timed out — likely concurrent rebuild or corrupt DB',
+          );
+          break; // do not spin retries on a wedged native open
         }
 
         const isLockError = lastError.message.includes('Could not set lock')
