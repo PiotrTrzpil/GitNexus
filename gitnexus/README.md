@@ -888,15 +888,15 @@ This is path-based protection, not secret-content scanning. List only directorie
 
 ### Process detection reports missing flows
 
-On a large repository, `analyze` may warn that `[processes] … whole flows are MISSING`. That means ranked entry points or completed flows were sampled away by the analyze-time detection budget — not that the code path is absent, and not the query-time `IMPACT_MAX_CHUNKS` cap.
+On a large repository, `analyze` may warn that `[processes] … whole flows are MISSING`. That means entry points were left out of the ranked pool (only when `--max-entry-point-candidates` is set explicitly) or more deduplicated flows exist than `maxProcesses` keeps, so completed flows were sampled away by the analyze-time detection budget — not that the code path is absent, and not the query-time `IMPACT_MAX_CHUNKS` cap.
 
-Defaults stay in place when nothing is set: dynamic `maxProcesses = max(20, round(non-File symbols / 10))`, branching `4`, trace depth `10`, entry-point candidate pool `200`. Raise a knob only when the warning names it:
+Defaults stay in place when nothing is set: dynamic `maxProcesses = max(20, round(non-File symbols / 10))`, branching `4`, trace depth `10`, entry-point candidate pool scaling with the repository (at least `200`, and every ranked entry point is traced). Raise a knob only when the warning names it:
 
 ```bash
 # Usual first move when entryPointCandidatesDropped is the loud counter
 npx gitnexus analyze --max-entry-point-candidates 400
 
-# When ranked entry points were never traced, or flows were dropped at maxProcesses
+# When flows were dropped at maxProcesses
 npx gitnexus analyze --max-processes 80
 ```
 

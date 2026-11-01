@@ -173,44 +173,43 @@ describe('processDetectionBudgetMismatch (KTD4)', () => {
 });
 
 describe('warning copy and banner', () => {
-  it('maps loud counters to the matching knobs and names the pre-entry trace gate', () => {
+  it('maps loud counters to the matching knobs and names how many flows did not fit', () => {
     const limits = processDetectionEffectiveLimits(20, resolveProcessDetectionBudget({}, {}));
-    expect(limits.maxProcessTraces).toBe(40);
     expect(
       formatWholeFlowsMissingRemedies(
-        { entryPointCandidatesDropped: 210, entryPointsUnexplored: 0, processesDropped: 0 },
+        { entryPointCandidatesDropped: 210, processesDropped: 0 },
         limits,
         410,
       ),
     ).toContain('--max-entry-point-candidates');
     expect(
       formatWholeFlowsMissingRemedies(
-        { entryPointCandidatesDropped: 210, entryPointsUnexplored: 0, processesDropped: 0 },
+        { entryPointCandidatesDropped: 210, processesDropped: 0 },
         limits,
         410,
       ),
     ).not.toContain('--max-process-branching');
     expect(
       formatWholeFlowsMissingRemedies(
-        { entryPointCandidatesDropped: 0, entryPointsUnexplored: 3, processesDropped: 1 },
+        { entryPointCandidatesDropped: 0, processesDropped: 1 },
         limits,
         10,
       ),
     ).toContain('--max-processes');
     expect(
       formatWholeFlowsMissingRemedies(
-        { entryPointCandidatesDropped: 0, entryPointsUnexplored: 3, processesDropped: 1 },
+        { entryPointCandidatesDropped: 0, processesDropped: 1 },
         limits,
         10,
       ),
-    ).toContain('40');
+    ).toContain('used 20');
     expect(
       formatWholeFlowsMissingRemedies(
-        { entryPointCandidatesDropped: 0, entryPointsUnexplored: 3, processesDropped: 1 },
+        { entryPointCandidatesDropped: 0, processesDropped: 1 },
         limits,
         10,
       ),
-    ).toContain('next entry is skipped');
+    ).toContain('1 deduplicated flow(s) did not fit');
   });
 
   it('prints a banner only when an override is active', () => {

@@ -1110,7 +1110,6 @@ describe('truncation is reported, not swallowed (W2-3)', () => {
     expect(result.processes.length).toBeGreaterThan(0);
     expect(result.stats.truncation.truncated).toBe(false);
     expect(result.stats.truncation).toMatchObject({
-      entryPointsUnexplored: 0,
       walksCutByBudget: 0,
       tracesDepthCapped: 0,
       calleesDropped: 0,
@@ -1118,20 +1117,17 @@ describe('truncation is reported, not swallowed (W2-3)', () => {
     });
   });
 
-  it('counts entry points that were never traced at all', async () => {
-    // The trace loop stops on the TRACE quota (maxProcesses * 2), so the
-    // remaining entry points are not "no flows found" — nothing looked at them.
+  it('traces every ranked entry point even when maxProcesses is tiny', async () => {
+    // Eight independent three-step chains = eight entry points that each own
+    // exactly one flow. With maxProcesses 1 the old loop stopped after two
+    // entries (trace quota 2), so only 2 of 8 flows were ever candidates and
+    // `processesDropped` read 1. Now all 8 are traced and ranked, and 7 do
+    // not fit.
     const graph = createKnowledgeGraph();
     for (let e = 0; e < 8; e++) addChain(graph, `e${e}_`, 3);
     const result = await processProcesses(graph, [], undefined, { maxProcesses: 1 });
-    const { entryPointsFound } = result.stats;
-    const { entryPointsUnexplored } = result.stats.truncation;
-    expect(entryPointsFound).toBeGreaterThan(0);
-    // Strictly between: some WERE traced, so this is a real early exit rather
-    // than "the loop never ran", and strictly less than the total, so the
-    // counter is not just echoing `entryPointsFound` back.
-    expect(entryPointsUnexplored).toBeGreaterThan(0);
-    expect(entryPointsUnexplored).toBeLessThan(entryPointsFound);
+    expect(result.processes).toHaveLength(1);
+    expect(result.stats.truncation.processesDropped).toBe(7);
     expect(result.stats.truncation.truncated).toBe(true);
   });
 
@@ -1270,7 +1266,6 @@ describe('the entry-point candidate cap is disclosed too', () => {
     expect(result.stats.truncation).toEqual({
       truncated: true,
       entryPointCandidatesDropped: 210,
-      entryPointsUnexplored: 0,
       walksCutByBudget: 0,
       tracesDepthCapped: 0,
       calleesDropped: 0,
@@ -1506,5 +1501,54 @@ describe('trace subsumption matches whole steps only (#2894)', () => {
       noSink,
     );
     expect(kept.map((t) => t.join('->'))).toEqual(['A->B->C']);
+  });
+
+  it('discards a sub-path from the MIDDLE of a longer trace', () => {
+    const kept = deduplicateTraces(
+      [
+        ['A', 'B', 'C', 'D'],
+        ['B', 'C'],
+      ],
+      noSink,
+    );
+    expect(kept.map((t) => t.join('->'))).toEqual(['A->B->C->D']);
+  });
+
+  it('keeps a trace whose ids merely share a suffix with a kept step', () => {
+    const kept = deduplicateTraces(
+      [
+        ['pkg/XA', 'pkg/XB', 'pkg/XC'],
+        ['A', 'B'],
+        ['XA', 'pkg/XB'],
+      ],
+      noSink,
+    );
+    expect(kept).toHaveLength(3);
+  });
+
+  it('keeps a sink-terminated prefix that a longer trace contains', () => {
+    const isSink = (id: string): boolean => id === 'B';
+    const kept = deduplicateTraces(
+      [
+        ['A', 'B', 'C'],
+        ['A', 'B'],
+      ],
+      isSink,
+    );
+    expect(kept.map((t) => t.join('->'))).toEqual(['A->B->C', 'A->B']);
+  });
+
+  it('is deterministic under input permutation', () => {
+    const corpus = [
+      ['a', 'b', 'c'],
+      ['x', 'y', 'z'],
+      ['b', 'c'],
+      ['q', 'y', 'z'],
+      ['y', 'z'],
+    ];
+    const forward = deduplicateTraces(corpus, noSink);
+    const backward = deduplicateTraces([...corpus].reverse(), noSink);
+    expect(backward).toEqual(forward);
+    expect(forward.map((t) => t.join('->'))).toEqual(['a->b->c', 'q->y->z', 'x->y->z']);
   });
 });
