@@ -115,9 +115,12 @@ export function getNextStepHint(
       if (readOnly) {
         return `\n\n---\n**Next:** This is a preview; MCP read-only mode cannot apply it. To apply, request and review a fresh preview from a server that permits writes, then use that server's plan_token.`;
       }
-      const target = args?.symbol_uid
-        ? `symbol_uid: ${JSON.stringify(args.symbol_uid)}`
-        : `symbol_name: ${JSON.stringify(args?.symbol_name ?? '<symbol_name>')}`;
+      const target =
+        args?.type === 'file' || args?.type === 'directory'
+          ? `type: ${JSON.stringify(args.type)}, path: ${JSON.stringify(args?.path ?? '<path>')}`
+          : args?.symbol_uid
+            ? `symbol_uid: ${JSON.stringify(args.symbol_uid)}`
+            : `symbol_name: ${JSON.stringify(args?.symbol_name ?? '<symbol_name>')}`;
       return `\n\n---\n**Next:** Preview only; no files were changed. If status is "success", review semantic_edits and coverage, then apply with rename({${target}, new_name: ${JSON.stringify(args?.new_name ?? '<new_name>')}, dry_run: false, plan_token: "<plan_token from this preview>"${repoParam}}). If it failed closed, act on its code and error rather than retrying unchanged.`;
     }
 

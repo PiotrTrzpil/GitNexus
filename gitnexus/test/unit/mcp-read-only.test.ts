@@ -145,6 +145,36 @@ describe('MCP read-only mode', () => {
     }
   });
 
+  it('refuses to apply a file or directory move in read-only mode before dispatch', async () => {
+    enableReadOnly();
+    const session = await connect();
+    try {
+      for (const type of ['file', 'directory']) {
+        const response = await session.client.callTool({
+          name: 'rename',
+          arguments: {
+            type,
+            path: 'src/a.ts',
+            new_name: 'src/b.ts',
+            dry_run: false,
+            plan_token: 'whatever',
+          },
+        });
+        expect(response.isError).toBe(true);
+        expect((response.content[0] as { text: string }).text).toMatch(
+          /dry_run.*omitted or true.*read-only mode/i,
+        );
+      }
+      expect(session.backend.callTool).not.toHaveBeenCalled();
+      const { tools } = await session.client.listTools();
+      expect(tools.find((tool) => tool.name === 'rename')?.description).toMatch(
+        /file\/directory move|"file" or "directory"/,
+      );
+    } finally {
+      await session.close();
+    }
+  });
+
   it('keeps branch pins and group routing out of a read-only rename', async () => {
     enableReadOnly();
     const session = await connect();

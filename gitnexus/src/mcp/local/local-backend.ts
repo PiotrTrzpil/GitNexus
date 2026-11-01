@@ -162,6 +162,7 @@ import {
   READ_FILE_DEFAULT_MAX_LINES,
 } from '../tools.js';
 import { renameSymbol } from './rename/rename-plan.js';
+import { moveRename } from './rename/move/file-move.js';
 import { foldNumericToolArgumentAliases } from '../tool-arguments.js';
 import { findImportCycles, IMPORT_CYCLE_LIMIT } from '../../core/graph/import-cycles.js';
 import { decodeTaintPath } from '../../core/ingestion/taint/path-codec.js';
@@ -7314,11 +7315,27 @@ export class LocalBackend {
       symbol_uid?: string;
       new_name: string;
       file_path?: string;
+      type?: string;
+      path?: string;
       dry_run?: boolean;
       plan_token?: string;
     },
   ): Promise<any> {
     await this.ensureInitialized(repo);
+    if (params.type !== undefined && !['symbol', 'file', 'directory'].includes(params.type)) {
+      return { error: 'Parameter "type" must be "symbol", "file" or "directory".' };
+    }
+    if (params.type === 'file' || params.type === 'directory') {
+      // Moves are path-based: `path` is the source, `new_name` the destination path.
+      return moveRename({
+        repoPath: repo.repoPath,
+        kind: params.type,
+        from: params.path,
+        to: params.new_name,
+        dryRun: params.dry_run === false ? false : true,
+        planToken: params.plan_token,
+      });
+    }
     if (params.dry_run === false && (typeof params.plan_token !== 'string' || !params.plan_token)) {
       return blockedRenameResult(
         {

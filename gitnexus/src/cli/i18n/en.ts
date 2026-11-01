@@ -399,6 +399,13 @@ export const en = {
   'help.option.trace.fromFile': 'Source file path to disambiguate common names',
   'help.option.trace.toUid': 'Target symbol UID (zero-ambiguity lookup)',
   'help.option.trace.toFile': 'Target file path to disambiguate common names',
+  'help.command.rename.description':
+    'Rename a symbol, or move a file or directory and rewrite its imports (previews unless --apply)',
+  'help.option.rename.uid': 'Direct symbol UID (zero-ambiguity lookup; --type symbol)',
+  'help.option.rename.file': 'File path to disambiguate common symbol names (--type symbol)',
+  'help.option.rename.type': 'What to rename: symbol (default), file, or directory',
+  'help.option.rename.apply':
+    'Apply the change after previewing it (default is preview only; nothing is written)',
   'help.option.trace.depth': 'Max path length in hops (default: 10)',
   'help.option.trace.includeTests': 'Traverse through test-file symbols (default: false)',
   'help.option.detectChanges.scope': 'What to analyze: unstaged, staged, all, or compare',
