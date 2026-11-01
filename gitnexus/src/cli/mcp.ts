@@ -106,11 +106,6 @@ export const mcpCommand = async (options?: {
   // also the first chance any code in this process has to write to stdout.
   installGlobalStdoutSentinel();
 
-  // Crash signals hard-kill the process (see utils/process-lifecycle.ts).
-  // Dynamic import keeps the entry's static-import closure leaf-only.
-  const { installFatalSignalHandlers } = await import('../utils/process-lifecycle.js');
-  installFatalSignalHandlers();
-
   // uncaughtException/unhandledRejection handlers are owned by
   // startMCPServer (gitnexus/src/mcp/server.ts) so the server's shutdown
   // path runs cleanly with full stack traces. Registering duplicates here

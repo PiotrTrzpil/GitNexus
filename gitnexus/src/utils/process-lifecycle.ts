@@ -5,16 +5,18 @@
  * the Node main thread inside a synchronous C++ destructor. While that
  * happens no JS timer on the main thread can fire, so a
  * `setTimeout(process.exit, ...)` safety net is useless and the process
- * can spin at 100% CPU forever as an orphan. Two helpers cover this:
+ * can spin at 100% CPU forever as an orphan. `armSigkillWatchdog` runs the
+ * deadline on a worker thread with its own event loop, which keeps ticking
+ * while the main thread is blocked.
  *
- * - `armSigkillWatchdog` runs the deadline on a worker thread with its own
- *   event loop, which keeps ticking while the main thread is blocked.
- * - `installFatalSignalHandlers` makes a crash signal end the process
- *   immediately instead of leaving it in an undefined state.
+ * Deliberately NO listeners for SIGSEGV/SIGBUS/SIGILL/SIGFPE: for a genuine
+ * fault, a JS listener replaces the kernel's default termination, the
+ * handler returns, the faulting instruction re-executes, and the process can
+ * loop forever (Node docs: "might cause the process to stop responding").
+ * The default action — terminate — is the behaviour we want.
  */
 
 import { Worker } from 'node:worker_threads';
-import { writeSync } from 'node:fs';
 
 /**
  * Grace period between the start of shutdown and the SIGKILL. Longer than the
@@ -23,10 +25,6 @@ import { writeSync } from 'node:fs';
  */
 export const DEFAULT_WATCHDOG_MS = 8_000;
 
-/** Signals after which the process state is undefined; cleanup is unsafe. */
-export const FATAL_SIGNALS = ['SIGSEGV', 'SIGBUS', 'SIGILL', 'SIGFPE', 'SIGABRT'] as const;
-
-export type FatalSignal = (typeof FATAL_SIGNALS)[number];
 
 // The worker's own timer is what fires; the main thread only supplies pid/ms.
 const WATCHDOG_WORKER_SOURCE = `
@@ -59,27 +57,3 @@ export function armSigkillWatchdog(ms: number = DEFAULT_WATCHDOG_MS): () => void
   }
 }
 
-/**
- * On a fatal signal, write one line to stderr and SIGKILL ourselves. Never
- * calls `process.exit` and never runs async cleanup: both can hang or touch
- * corrupted state.
- *
- * Best effort only: a real SIGSEGV/SIGBUS raised by faulting native code is
- * delivered to the faulting thread, and Node only runs a JS listener if that
- * is the main thread and the V8 state is still sound. These handlers reliably
- * catch signals sent from outside (`kill -SEGV`, `abort()` raising SIGABRT
- * on a path Node reports), but may never run for a genuine memory fault, in
- * which case the kernel default (core dump / termination) applies.
- */
-export function installFatalSignalHandlers(): void {
-  for (const signal of FATAL_SIGNALS) {
-    process.on(signal, () => {
-      try {
-        writeSync(2, `GitNexus MCP fatal signal ${signal}; killing process\n`);
-      } catch {
-        // stderr may be closed; the kill below is what matters.
-      }
-      process.kill(process.pid, 'SIGKILL');
-    });
-  }
-}

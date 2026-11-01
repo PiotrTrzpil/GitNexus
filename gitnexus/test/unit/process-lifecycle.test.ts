@@ -7,7 +7,6 @@ import { describe, it, expect } from 'vitest';
 import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import path from 'node:path';
-import { FATAL_SIGNALS } from '../../src/utils/process-lifecycle.js';
 
 const MODULE_URL = pathToFileURL(
   path.resolve(__dirname, '../../src/utils/process-lifecycle.ts'),
@@ -43,12 +42,6 @@ function runChild(body: string, timeoutMs = 15_000): Promise<ChildResult> {
 }
 
 describe('process-lifecycle', () => {
-  it('FATAL_SIGNALS lists the crash signals and none of the graceful ones', () => {
-    expect([...FATAL_SIGNALS].sort()).toEqual(
-      ['SIGABRT', 'SIGBUS', 'SIGFPE', 'SIGILL', 'SIGSEGV'].sort(),
-    );
-  });
-
   it('armSigkillWatchdog SIGKILLs a process whose main thread is blocked', async () => {
     // Busy-loop for far longer than the 500 ms grace. A main-thread timer
     // could never fire here; only the worker thread can.
@@ -78,16 +71,4 @@ describe('process-lifecycle', () => {
     expect(result.code).toBe(0);
   });
 
-  it('installFatalSignalHandlers writes one stderr line and SIGKILLs on SIGSEGV', async () => {
-    // A pending exit handler proves no soft-exit cleanup runs; the timer
-    // keeps the process alive until the signal arrives.
-    const result = await runChild(`
-      lc.installFatalSignalHandlers();
-      process.on('exit', () => process.stderr.write('EXIT-HANDLER-RAN\\n'));
-      setTimeout(() => process.exit(3), 10000);
-      process.kill(process.pid, 'SIGSEGV');
-    `);
-    expect(result.signal).toBe('SIGKILL');
-    expect(result.stderr).toBe('GitNexus MCP fatal signal SIGSEGV; killing process\n');
-  });
 });
