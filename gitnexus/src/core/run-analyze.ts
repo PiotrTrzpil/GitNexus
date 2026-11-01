@@ -88,6 +88,7 @@ import {
   deleteAllCallSummaries,
   deleteAllInjects,
   deleteAllAdvisedBy,
+  deleteAllCoChanges,
   deleteAllDestinations,
   deleteSpringAopEvidenceNodes,
   deleteSpringAutoConfigurationDeclarations,
@@ -4283,6 +4284,8 @@ async function runFullAnalysisInner(
         // a third-file change can invalidate an edge between unchanged files.
         // Rebuild the complete ADVISED_BY set on every incremental writeback.
         await deleteAllAdvisedBy();
+        // Co-change edges come from git history and are recomputed whole each run.
+        await deleteAllCoChanges();
         await deleteSpringAopEvidenceNodes();
         // 2b-bis. Drop the whole async messaging overlay. A RESOLVED
         //     Destination deliberately stores no filePath (so the per-file

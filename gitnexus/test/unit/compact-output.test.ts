@@ -108,6 +108,21 @@ describe('compactImpact', () => {
     );
   });
 
+  it('lists co-changed files after the routes line', () => {
+    const result: any = {
+      ...impactResult(),
+      co_changed: [
+        { file: 'web/client.ts', strength: 0.8, count: 8 },
+        { file: 'docs/auth.md', strength: 0.5, count: 4 },
+      ],
+    };
+    const lines = compactImpact(result)!.split('\n');
+    expect(lines.slice(-2)).toEqual([
+      'routes (1): POST /login',
+      'usually changes with: web/client.ts (0.8), docs/auth.md (0.5)',
+    ]);
+  });
+
   it('shows processCount from a trimmed item and the pagination state', () => {
     const result: any = {
       ...impactResult(),

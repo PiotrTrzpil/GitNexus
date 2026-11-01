@@ -105,6 +105,7 @@ const IMPACT_HANDLED: ReadonlySet<string> = new Set([
   'affected_processes',
   'affected_modules',
   'affected_routes',
+  'co_changed',
   'pagination',
 ]);
 
@@ -187,6 +188,13 @@ export function compactImpact(result: unknown): string | null {
   if (routes.length > 0) {
     lines.push(
       `routes (${routes.length}): ${capped(routes.map((r) => (r.method ? `${r.method} ${r.url}` : r.url)))}`,
+    );
+  }
+
+  const coChanged: Rec[] = Array.isArray(result.co_changed) ? result.co_changed : [];
+  if (coChanged.length > 0) {
+    lines.push(
+      `usually changes with: ${capped(coChanged.map((c) => `${c.file} (${c.strength})`))}`,
     );
   }
 

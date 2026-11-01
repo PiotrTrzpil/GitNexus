@@ -127,6 +127,10 @@ const isGraphWideRelationship = (relationship: GraphRelationship): boolean =>
   // can alter annotation-name visibility or the set matched by a wildcard,
   // even when neither endpoint file changed.
   relationship.type === 'ADVISED_BY' ||
+  // Git co-change pairs come from repository history, not per-file content; the
+  // orchestrator delete-alls them (`deleteAllCoChanges`) and the `coChange` phase
+  // recomputes the whole set every run.
+  relationship.type === 'CO_CHANGES_WITH' ||
   isSpringAutoConfigurationDeclaration(relationship);
 
 /**

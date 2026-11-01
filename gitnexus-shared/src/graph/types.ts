@@ -165,6 +165,9 @@ export type RelationshipType =
   | 'MEMBER_OF'
   | 'STEP_IN_PROCESS'
   | 'HANDLES_ROUTE'
+  /** File→File: the files often change in the same commit. `confidence` = strength
+   *  (co-changes / the less-active file's changes), `step` = co-change count. */
+  | 'CO_CHANGES_WITH'
   /** Outbound async messaging. Source = the callable that performs the publish
    *  (or its File); target = the `Destination` it publishes to. Emitted by
    *  `pipeline-phases/spring-destinations.ts` from Spring messaging-template

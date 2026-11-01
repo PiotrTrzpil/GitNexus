@@ -79,6 +79,7 @@ const FULL_ORDER = [
   'springAop',
   'springDestinations',
   'pruneLocalSymbols',
+  'coChange',
   'mro',
   'springAopInheritance',
   'di',
@@ -88,6 +89,7 @@ const FULL_ORDER = [
 
 const WITHOUT_GRAPH_PHASES = FULL_ORDER.filter(
   (n) =>
+    n !== 'coChange' &&
     n !== 'mro' &&
     n !== 'springAopInheritance' &&
     n !== 'di' &&
