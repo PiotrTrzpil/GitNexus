@@ -96,8 +96,34 @@ async function findRepoForCwd(cwd: string): Promise<{
 }
 
 /**
+ * First `n` items plus a count of the rest. This text is attached to every grep
+ * the agent runs, so it stays a hint ("there are 19 callers"); the agent asks
+ * `context` / `impact` for the full lists when it needs them.
+ */
+function withMore(shown: string[], total: number): string {
+  const rest = total - shown.length;
+  return rest > 0 ? `${shown.join(', ')} (+${rest} more)` : shown.join(', ');
+}
+
+/** Node tables that hold named code symbols (multi-label match = any of them). */
+const SYMBOL_LABELS = 'Function:Method:Constructor:Class:Interface:Struct:Enum:Trait:TypeAlias';
+
+/**
+ * Longest identifier-like run in a search pattern, ignoring regex escapes:
+ * `read_json\(` -> `read_json`, `def\s+load_settings` -> `load_settings`.
+ * Null when nothing is 3+ chars.
+ */
+export function longestIdentifier(pattern: string): string | null {
+  const ids = pattern.replace(/\\[a-zA-Z]/g, ' ').match(/[A-Za-z_$][A-Za-z0-9_$]{2,}/g) ?? [];
+  let longest: string | null = null;
+  for (const id of ids) if (!longest || id.length > longest.length) longest = id;
+  return longest;
+}
+
+/**
  * Augment a search pattern with knowledge graph context.
  *
+ * 0. Exact symbol-name lookup on the longest identifier in the pattern
  * 1. BM25 search for the pattern
  * 2. For top matches, fetch callers/callees/processes
  * 3. Rank by internal cluster cohesion (not exposed)
@@ -128,10 +154,6 @@ export async function augment(pattern: string, cwd?: string): Promise<string> {
       await initLbug(repoId, repo.lbugPath);
     }
 
-    // Step 1: BM25 search (fast, no embeddings)
-    const { results: bm25Results } = await searchFTSFromLbug(pattern, 10, repoId);
-
-    // Step 2: Map BM25 file results to symbols
     const symbolMatches: Array<{
       nodeId: string;
       name: string;
@@ -140,6 +162,36 @@ export async function augment(pattern: string, cwd?: string): Promise<string> {
       score: number;
     }> = [];
 
+    // Step 0: exact symbol-name match. Grep patterns are usually identifiers
+    // (`read_json\(`, `useIsMobile`), and the definition may sit in a file BM25
+    // never ranks. Needs no FTS extension either.
+    const identifier = longestIdentifier(pattern);
+    if (identifier) {
+      const exactRows = await executeQuery(
+        repoId,
+        `
+        MATCH (n:${SYMBOL_LABELS}) WHERE n.name = '${escapeCypherString(identifier)}'
+        RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath
+        ORDER BY id
+        LIMIT 5
+      `,
+      ).catch(() => []);
+      for (const sym of exactRows) {
+        symbolMatches.push({
+          nodeId: sym.id || sym[0],
+          name: sym.name || sym[1],
+          type: sym.type || sym[2],
+          filePath: sym.filePath || sym[3],
+          score: 1.0,
+        });
+      }
+    }
+
+    // Step 1: no exact symbol, so BM25 search (fast, no embeddings)
+    const bm25Results =
+      symbolMatches.length === 0 ? (await searchFTSFromLbug(pattern, 10, repoId)).results : [];
+
+    // Step 2: Map BM25 file results to symbols
     for (const result of bm25Results.slice(0, 5)) {
       const escaped = escapeCypherString(result.filePath);
       try {
@@ -243,6 +295,28 @@ export async function augment(pattern: string, cwd?: string): Promise<string> {
       return names;
     };
 
+    // True totals for the "(+N more)" hint: one batched count query per
+    // direction rather than one per symbol. Failure just drops the hint.
+    const neighbourCounts = async (incoming: boolean): Promise<Map<string, number>> => {
+      const edge = incoming
+        ? `(other)-[:CodeRelation {type: 'CALLS'}]->(n)`
+        : `(n)-[:CodeRelation {type: 'CALLS'}]->(other)`;
+      const counts = new Map<string, number>();
+      const rows = await executeQuery(
+        repoId,
+        `
+        MATCH ${edge}
+        WHERE n.id IN [${idList}]
+        RETURN n.id AS nodeId, count(DISTINCT other.id) AS total
+      `,
+      ).catch(() => []);
+      for (const r of rows) {
+        const nid = r.nodeId || r[0];
+        if (nid) counts.set(nid, Number(r.total ?? r[1] ?? 0));
+      }
+      return counts;
+    };
+
     // Keyed by nodeId, like the process/cohesion enrichments below — positional
     // arrays would put two lookup disciplines in one object literal and make
     // "stays index-aligned with uniqueSymbols" an unenforced invariant.
@@ -265,6 +339,7 @@ export async function augment(pattern: string, cwd?: string): Promise<string> {
         MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
         WHERE n.id IN [${idList}]
         RETURN n.id AS nodeId, p.heuristicLabel AS label, r.step AS step, p.stepCount AS stepCount
+        ORDER BY nodeId, p.id
       `,
         );
         for (const r of rows) {
@@ -312,12 +387,15 @@ export async function augment(pattern: string, cwd?: string): Promise<string> {
     // results, so serializing them behind the fan-out bought nothing. Each query
     // keeps its own try/catch, so one failing still degrades to an empty map
     // instead of taking the others down.
-    const [callerMap, calleeMap, processesMap, cohesionMap] = await Promise.all([
-      neighbourMap(true),
-      neighbourMap(false),
-      fetchProcesses(),
-      fetchCohesion(),
-    ]);
+    const [callerMap, calleeMap, callerTotals, calleeTotals, processesMap, cohesionMap] =
+      await Promise.all([
+        neighbourMap(true),
+        neighbourMap(false),
+        neighbourCounts(true),
+        neighbourCounts(false),
+        fetchProcesses(),
+        fetchCohesion(),
+      ]);
 
     // Assemble enriched results
     const enriched: Array<{
@@ -325,6 +403,8 @@ export async function augment(pattern: string, cwd?: string): Promise<string> {
       filePath: string;
       callers: string[];
       callees: string[];
+      callerTotal: number;
+      calleeTotal: number;
       processes: string[];
       cohesion: number;
     }> = [];
@@ -335,6 +415,8 @@ export async function augment(pattern: string, cwd?: string): Promise<string> {
         filePath: sym.filePath,
         callers: callerMap.get(sym.nodeId) || [],
         callees: calleeMap.get(sym.nodeId) || [],
+        callerTotal: callerTotals.get(sym.nodeId) ?? 0,
+        calleeTotal: calleeTotals.get(sym.nodeId) ?? 0,
         processes: processesMap.get(sym.nodeId) || [],
         cohesion: cohesionMap.get(sym.nodeId) || 0,
       });
@@ -350,13 +432,15 @@ export async function augment(pattern: string, cwd?: string): Promise<string> {
     for (const item of enriched) {
       lines.push(`${item.name} (${item.filePath})`);
       if (item.callers.length > 0) {
-        lines.push(`  Called by: ${item.callers.join(', ')}`);
+        lines.push(`  Called by: ${withMore(item.callers, item.callerTotal)}`);
       }
       if (item.callees.length > 0) {
-        lines.push(`  Calls: ${item.callees.join(', ')}`);
+        lines.push(`  Calls: ${withMore(item.callees, item.calleeTotal)}`);
       }
       if (item.processes.length > 0) {
-        lines.push(`  Flows: ${item.processes.join(', ')}`);
+        lines.push(
+          `  Flows: ${withMore(item.processes.slice(0, NEIGHBOUR_CAP), item.processes.length)}`,
+        );
       }
       lines.push('');
     }

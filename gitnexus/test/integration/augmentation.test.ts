@@ -47,6 +47,66 @@ const AUGMENT_SEED_DATA = [
    CREATE (a)-[:CodeRelation {type: 'STEP_IN_PROCESS', confidence: 1.0, reason: '', step: 1}]->(p)`,
   `MATCH (a:Function), (p:Process) WHERE a.id = 'func:validate' AND p.id = 'proc:login-flow'
    CREATE (a)-[:CodeRelation {type: 'STEP_IN_PROCESS', confidence: 1.0, reason: '', step: 2}]->(p)`,
+
+  // Exact-name vs partial-name symbols (BM25 only ever sees the partial's file)
+  `CREATE (n:Function {id: 'func:load_settings', name: 'load_settings', filePath: 'src/config.ts', startLine: 1, endLine: 5, isExported: true, content: 'config loader', description: 'loader'})`,
+  `CREATE (n:Function {id: 'a:load_settings_cache', name: 'load_settings_cache', filePath: 'src/cache.ts', startLine: 1, endLine: 5, isExported: true, content: 'cache of settings', description: 'cache'})`,
+  `CREATE (n:Function {id: 'func:read_json', name: 'read_json', filePath: 'src/io.ts', startLine: 1, endLine: 5, isExported: true, content: 'reads json', description: 'json reader'})`,
+
+  // hotTarget: 5 callers, 4 callees, 5 flows (over the cap of 3)
+  `CREATE (n:Function {id: 'func:hotTarget', name: 'hotTarget', filePath: 'src/hot.ts', startLine: 1, endLine: 5, isExported: true, content: 'hot', description: 'hot'})`,
+  // coldTarget: 2 callers, 1 callee, 1 flow (within the cap)
+  `CREATE (n:Function {id: 'func:coldTarget', name: 'coldTarget', filePath: 'src/cold.ts', startLine: 1, endLine: 5, isExported: true, content: 'cold', description: 'cold'})`,
+  ...Array.from(
+    { length: 5 },
+    (_, i) =>
+      `CREATE (n:Function {id: 'func:hotCaller${i}', name: 'hotCaller${i}', filePath: 'src/hot-callers.ts', startLine: ${i + 1}, endLine: ${i + 1}, isExported: true, content: 'c', description: 'c'})`,
+  ),
+  ...Array.from(
+    { length: 4 },
+    (_, i) =>
+      `CREATE (n:Function {id: 'func:hotCallee${i}', name: 'hotCallee${i}', filePath: 'src/hot-callees.ts', startLine: ${i + 1}, endLine: ${i + 1}, isExported: true, content: 'c', description: 'c'})`,
+  ),
+  ...Array.from(
+    { length: 2 },
+    (_, i) =>
+      `CREATE (n:Function {id: 'func:coldCaller${i}', name: 'coldCaller${i}', filePath: 'src/cold-callers.ts', startLine: ${i + 1}, endLine: ${i + 1}, isExported: true, content: 'c', description: 'c'})`,
+  ),
+  `CREATE (n:Function {id: 'func:coldCallee', name: 'coldCallee', filePath: 'src/cold-callees.ts', startLine: 1, endLine: 1, isExported: true, content: 'c', description: 'c'})`,
+  ...Array.from(
+    { length: 5 },
+    (_, i) =>
+      `CREATE (n:Process {id: 'proc:hot-${i}', label: 'Hot${i}', heuristicLabel: 'HotFlow${i}', processType: 'intra_community', stepCount: 3, communities: [], entryPointId: 'func:hotTarget', terminalId: 'func:hotTarget'})`,
+  ),
+  `CREATE (n:Process {id: 'proc:cold', label: 'Cold', heuristicLabel: 'ColdFlow', processType: 'intra_community', stepCount: 2, communities: [], entryPointId: 'func:coldTarget', terminalId: 'func:coldTarget'})`,
+  ...Array.from(
+    { length: 5 },
+    (_, i) =>
+      `MATCH (a:Function), (b:Function) WHERE a.id = 'func:hotCaller${i}' AND b.id = 'func:hotTarget'
+   CREATE (a)-[:CodeRelation {type: 'CALLS', confidence: 1.0, reason: 'direct', step: 0}]->(b)`,
+  ),
+  ...Array.from(
+    { length: 4 },
+    (_, i) =>
+      `MATCH (a:Function), (b:Function) WHERE a.id = 'func:hotTarget' AND b.id = 'func:hotCallee${i}'
+   CREATE (a)-[:CodeRelation {type: 'CALLS', confidence: 1.0, reason: 'direct', step: 0}]->(b)`,
+  ),
+  ...Array.from(
+    { length: 2 },
+    (_, i) =>
+      `MATCH (a:Function), (b:Function) WHERE a.id = 'func:coldCaller${i}' AND b.id = 'func:coldTarget'
+   CREATE (a)-[:CodeRelation {type: 'CALLS', confidence: 1.0, reason: 'direct', step: 0}]->(b)`,
+  ),
+  `MATCH (a:Function), (b:Function) WHERE a.id = 'func:coldTarget' AND b.id = 'func:coldCallee'
+   CREATE (a)-[:CodeRelation {type: 'CALLS', confidence: 1.0, reason: 'direct', step: 0}]->(b)`,
+  ...Array.from(
+    { length: 5 },
+    (_, i) =>
+      `MATCH (a:Function), (p:Process) WHERE a.id = 'func:hotTarget' AND p.id = 'proc:hot-${i}'
+   CREATE (a)-[:CodeRelation {type: 'STEP_IN_PROCESS', confidence: 1.0, reason: '', step: 1}]->(p)`,
+  ),
+  `MATCH (a:Function), (p:Process) WHERE a.id = 'func:coldTarget' AND p.id = 'proc:cold'
+   CREATE (a)-[:CodeRelation {type: 'STEP_IN_PROCESS', confidence: 1.0, reason: '', step: 1}]->(p)`,
 ];
 
 const AUGMENT_FTS_INDEXES = [
@@ -172,6 +232,65 @@ withTestLbugDB(
         } finally {
           spy.mockRestore();
         }
+      });
+
+      describe('exact identifier lookup', () => {
+        const mockBm25Files = async (filePaths: string[]) => {
+          const bm25 = await import('../../src/core/search/bm25-index.js');
+          return vi.spyOn(bm25, 'searchFTSFromLbug').mockResolvedValue({
+            results: filePaths.map((filePath, i) => ({
+              filePath,
+              score: 100 - i,
+              rank: i + 1,
+              nodeIds: [`file:${i}`],
+            })),
+            ftsAvailable: true,
+          });
+        };
+
+        it('prefers an exact-name symbol over partial matches in the files BM25 ranks', async () => {
+          const spy = await mockBm25Files(['src/cache.ts']);
+          try {
+            const result = await augment('load_settings', handle.dbPath);
+            expect(result).toMatch(/^load_settings \(src\/config\.ts\)$/m);
+            expect(result).not.toContain('load_settings_cache');
+          } finally {
+            spy.mockRestore();
+          }
+        });
+
+        it.each([
+          ['read_json\\(', 'read_json (src/io.ts)'],
+          ['def\\s+load_settings', 'load_settings (src/config.ts)'],
+        ])('resolves the regex-escaped pattern %s to its identifier', async (pattern, header) => {
+          const spy = await mockBm25Files([]);
+          try {
+            const result = await augment(pattern, handle.dbPath);
+            expect(result.split('\n')).toContain(header);
+          } finally {
+            spy.mockRestore();
+          }
+        });
+      });
+
+      describe('neighbour totals', () => {
+        it('shows how many callers, callees and flows are not listed', async () => {
+          const result = await augment('hotTarget', handle.dbPath);
+          expect(result).toContain('Called by: ');
+          expect(result).toMatch(/Called by: (\w+, ){2}\w+ \(\+2 more\)$/m);
+          expect(result).toMatch(/Calls: (\w+, ){2}\w+ \(\+1 more\)$/m);
+          expect(result).toMatch(
+            /Flows: (HotFlow\d \(step 1\/3\), ){2}HotFlow\d \(step 1\/3\) \(\+2 more\)$/m,
+          );
+        });
+
+        it('omits "+N more" when everything fits in the cap', async () => {
+          const result = await augment('coldTarget', handle.dbPath);
+          expect(result).toMatch(/Called by: coldCaller0, coldCaller1$/m);
+          expect(result).toMatch(/Calls: coldCallee$/m);
+          expect(result).toMatch(/Flows: ColdFlow \(step 1\/2\)$/m);
+          expect(result).not.toContain('more)');
+        });
       });
 
       describe('root path matching', () => {
