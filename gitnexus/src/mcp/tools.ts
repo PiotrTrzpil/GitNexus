@@ -300,9 +300,6 @@ EXAMPLES:
 • Find all methods of a class:
   MATCH (c:Class {name: "UserService"})-[r:CodeRelation {type: 'HAS_METHOD'}]->(m:Method) RETURN m.name, m.parameterCount, m.returnType
 
-• Find all properties of a class:
-  MATCH (c:Class {name: "User"})-[r:CodeRelation {type: 'HAS_PROPERTY'}]->(p:Property) RETURN p.name, p.declaredType
-
 • Find all writers of a field:
   MATCH (f:Function)-[r:CodeRelation {type: 'ACCESSES', reason: 'write'}]->(p:Property) WHERE p.name = "address" RETURN f.name, f.filePath
 
@@ -312,15 +309,11 @@ EXAMPLES:
 • Find DI-injected providers (provider Classes or synthetic factory declarations):
   MATCH (c:Class {name: 'OrderService'})-[r:CodeRelation]->(provider) WHERE r.type = 'INJECTS' RETURN provider.name, r.reason
 
-• Detect diamond inheritance:
-  MATCH (d:Class)-[:CodeRelation {type: 'EXTENDS'}]->(b1), (d)-[:CodeRelation {type: 'EXTENDS'}]->(b2), (b1)-[:CodeRelation {type: 'EXTENDS'}]->(a), (b2)-[:CodeRelation {type: 'EXTENDS'}]->(a) WHERE b1 <> b2 RETURN d.name, b1.name, b2.name, a.name
-
 OUTPUT: Returns { markdown, row_count } — results formatted as a Markdown table for easy reading.
 
 TIPS:
 - All relationships use single CodeRelation table — filter with {type: 'CALLS'} etc.
-- Community = auto-detected functional area (Leiden algorithm). Properties: heuristicLabel, cohesion, symbolCount, keywords, description, enrichedBy
-- Process = execution flow trace from entry point to terminal. Properties: heuristicLabel, processType, stepCount, communities, entryPointId, terminalId
+- Community = functional area (Leiden); Process = execution flow, entry point to terminal. Both have heuristicLabel, stepCount/symbolCount, etc. (see schema resource)
 - Use heuristicLabel (not label) for human-readable community/process names
 - PDG layers (only when indexed with \`--pdg\`): BasicBlock nodes + CFG / CDG (control dependence, branch sense 'T'|'F' in reason) / REACHING_DEF (def→use, variable in reason) edges, all BasicBlock→BasicBlock. Prefer the \`pdg_query\` tool — it anchors + bounds these for you (raw \`[:CDG*]\`/\`[:REACHING_DEF*]\` path scans are unindexed and unbounded).
 
@@ -419,7 +412,7 @@ ${HOT_READ_STALENESS_NOTE}`,
           minimum: 0,
           maximum: CONTEXT_CHAIN_MAX_DEPTH,
           default: 0,
-          description: `Optional: walk CALLS edges up to N hops (0-${CONTEXT_CHAIN_MAX_DEPTH}) and return the result as a \`chain\` field (downstream callees + upstream callers layered by depth). 0 = disabled (default). 1 = direct neighbours only. 2-${CONTEXT_CHAIN_MAX_DEPTH} = procedure→workflow→sub-workflow depth. Useful for revealing the full tRPC/RPC call chain in a single call instead of chaining context() invocations.`,
+          description: `Optional: walk CALLS edges up to N hops (0-${CONTEXT_CHAIN_MAX_DEPTH}); returns a \`chain\` field (callees + callers by depth). 0 = off (default), 1 = direct neighbours.`,
         },
         verbose: { type: 'boolean', description: 'Full JSON, not compact text.' },
         maxTokens: {
@@ -454,8 +447,8 @@ GIT WORKTREE SUPPORT: GitNexus automatically detects a server launched inside a 
 
 Returns: changed symbols, affected processes, and a risk summary.
 - detail: "symbols" adds "semantic": per changed symbol, change (Added/Removed/Renamed/SignatureChanged/VisibilityChanged/BodyChanged), breaking (exported symbol removed/renamed/re-signatured/made private) and from/to; unanalysed files: semantic.skipped.
-- partial: true — mapping is incomplete, so risk_level is "unknown" instead of a ranked level. A failed symbol query (or an unparseable diff) degrades changed_symbols, both counts, and derived processes; a failed process lookup degrades only affected_processes and risk, leaving changed-symbol counts sound. unmapped_files lists changed supported source files with no mapped symbols, including source renames without hunks: their symbols may be missing, unindexed, or outside indexed ranges even when every query succeeded. Rebuild the index and inspect those diffs; retry alone may not resolve this state. changed_count:0 with partial:true is NOT a clean pre-commit check.
-- truncated: true — the changed_symbols LISTING was capped for this response. summary.changed_count counts every symbol the run observed: the true total normally, a LOWER BOUND when partial:true. Compare it with the array length rather than trusting the array.`,
+- partial: true — mapping is incomplete, so risk_level is "unknown". A failed symbol query or unparseable diff degrades changed_symbols, counts and processes; a failed process lookup degrades only affected_processes and risk. unmapped_files lists changed source files with no mapped symbols (including renames without hunks). Rebuild the index and inspect those diffs. changed_count:0 with partial:true is NOT a clean pre-commit check.
+- truncated: true — the changed_symbols LISTING was capped. summary.changed_count counts every observed symbol (a LOWER BOUND when partial:true); compare it with the array length.`,
     annotations: READ_ONLY_TOOL_ANNOTATIONS,
     inputSchema: {
       type: 'object',
@@ -886,6 +879,35 @@ Returns: tool nodes with their handler files and descriptions.`,
     },
   },
   {
+    name: 'quality_query',
+    description:
+      'Code-quality triage, one line per symbol (name file:line metric). Presets: high_complexity (cx, sloc); dead_code (CANDIDATES: no callers/uses, not exported/entry/route/test/override); god_functions (sloc>=50, cx>=10, fan-out>=8); hotspots (most incoming CALLS); high_fan_out (most outgoing CALLS); unused_injections (INJECTS consumer never calls provider; Spring/Kotlin DI only). cx/sloc: TS/JS, Python, Java, Go, Rust, C/C++, C#; older indexes need re-analyze.',
+    annotations: READ_ONLY_TOOL_ANNOTATIONS,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        preset: {
+          type: 'string',
+          enum: [
+            'high_complexity',
+            'dead_code',
+            'god_functions',
+            'hotspots',
+            'high_fan_out',
+            'unused_injections',
+          ],
+        },
+        limit: { type: 'number', description: 'Default 20, max 500.', minimum: 1 },
+        path: { type: 'string', description: 'File path prefix filter.' },
+        repo: {
+          type: 'string',
+          description: `Repository name or path. ${CWD_AWARE_REPO_OMISSION}`,
+        },
+      },
+      required: ['preset'],
+    },
+  },
+  {
     name: 'shape_check',
     description: `Check response shapes for API routes against their consumers' property accesses.
 
@@ -1218,6 +1240,7 @@ export const REPO_SCOPED_TOOLS = new Set([
   'shape_check',
   'api_impact',
   'trace',
+  'quality_query',
   'refresh_index',
 ]);
 

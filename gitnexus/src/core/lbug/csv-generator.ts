@@ -538,7 +538,7 @@ export const streamAllCSVsToDisk = async (
     const codeElementHeader = 'id,name,filePath,startLine,endLine,isExported,content,description';
     const functionWriter = new BufferedCSVWriter(
       path.join(csvDir, 'function.csv'),
-      `${codeElementHeader},convexEndpointFactory`,
+      `${codeElementHeader},convexEndpointFactory,complexity,sloc`,
     );
     const classWriter = new BufferedCSVWriter(
       path.join(csvDir, 'class.csv'),
@@ -549,7 +549,7 @@ export const streamAllCSVsToDisk = async (
       codeElementHeader,
     );
     const methodHeader =
-      'id,name,filePath,startLine,endLine,isExported,content,description,parameterCount,returnType';
+      'id,name,filePath,startLine,endLine,isExported,content,description,parameterCount,returnType,complexity,sloc';
     const methodWriter = new BufferedCSVWriter(path.join(csvDir, 'method.csv'), methodHeader);
     const codeElemWriter = new BufferedCSVWriter(
       path.join(csvDir, 'codeelement.csv'),
@@ -725,6 +725,8 @@ export const streamAllCSVsToDisk = async (
               escapeCSVField(formatFtsDescription(node.properties.description || '')),
               escapeCSVNumber(node.properties.parameterCount, 0),
               escapeCSVField(node.properties.returnType || ''),
+              escapeCSVNumber(node.properties.complexity, 0),
+              escapeCSVNumber(node.properties.sloc, 0),
             ].join(','),
           );
           break;
@@ -848,6 +850,8 @@ export const streamAllCSVsToDisk = async (
               row.push(escapeCSVField(formatCSVStringArray(node.properties.frameworkAnnotations)));
             } else if (node.label === 'Function') {
               row.push(escapeCSVField(String(node.properties.convexEndpointFactory ?? '')));
+              row.push(escapeCSVNumber(node.properties.complexity, 0));
+              row.push(escapeCSVNumber(node.properties.sloc, 0));
             }
             pending = writer.addRow(row.join(','));
           } else {

@@ -21,6 +21,7 @@ export const MCP_READ_ONLY_TOOLS = new Set([
   'shape_check',
   'api_impact',
   'trace',
+  'quality_query',
 ]);
 
 const READ_ONLY_RENAME_SUMMARY =

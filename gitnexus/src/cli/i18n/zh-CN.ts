@@ -122,6 +122,8 @@ export const zhCN = {
   'tool.usage.trace':
     '用法：gitnexus trace <起点> <终点> [-f|--file <路径>] [--from-file <路径>] [--to-file <路径>] [--from-uid <uid>] [--to-uid <uid>] [--depth <n>]',
   'tool.usage.cypher': '用法：gitnexus cypher <Cypher 查询>',
+  'tool.usage.quality':
+    '用法：gitnexus quality <high_complexity|dead_code|god_functions|hotspots|high_fan_out|unused_injections> [--limit <n>] [--path <前缀>] [-r <仓库>]',
   'tool.warn.unknownKind':
     "--kind '{{kind}}' 不是已知的符号类型（如 Function、Class、Method），不会用于缩小结果范围。",
   'tool.detectChanges.noChanges': '未检测到变更。',
@@ -237,6 +239,8 @@ export const zhCN = {
   'help.command.impact.description': '影响面分析：修改符号会影响什么',
   'help.command.trace.description': '查找两个符号之间的最短有向路径（调用与类成员边）',
   'help.command.cypher.description': '对知识图谱执行原始 Cypher 查询',
+  'help.command.quality.description':
+    '代码质量分诊：high_complexity、dead_code、god_functions、hotspots、high_fan_out、unused_injections',
   'help.command.detectChanges.description': '将 git diff hunk 映射到已索引符号和受影响执行流程',
   'help.command.check.description': '对已索引图谱运行结构检查',
   'help.command.evalServer.description': '启动轻量 HTTP 服务器，用于评测期间的快速工具调用',
@@ -363,7 +367,8 @@ export const zhCN = {
   'help.option.trace.fromFile': '源文件路径，用于消除常见名称歧义',
   'help.option.trace.toUid': '目标符号 UID（零歧义查找）',
   'help.option.trace.toFile': '目标文件路径，用于消除常见名称歧义',
-  'help.command.rename.description': '重命名符号，或移动文件/目录并改写其导入（默认仅预览，加 --apply 才会应用）',
+  'help.command.rename.description':
+    '重命名符号，或移动文件/目录并改写其导入（默认仅预览，加 --apply 才会应用）',
   'help.option.rename.uid': '直接指定符号 UID（零歧义查找；--type symbol）',
   'help.option.rename.file': '用于消除常见符号名歧义的文件路径（--type symbol）',
   'help.option.rename.type': '重命名对象：symbol（默认）、file 或 directory',
@@ -376,6 +381,8 @@ export const zhCN = {
   'help.option.detectChanges.detail': '使用 "symbols" 获取带破坏性变更标记的符号级语义差异',
   'help.option.detectChanges.limit': '最多返回的已变更符号数',
   'help.option.cypher.limit': '最多返回的结果行数',
+  'help.option.quality.limit': '最多返回的结果数（默认 20）',
+  'help.option.quality.path': '仅限文件路径以此前缀开头的符号',
   'help.option.check.cycles': '检测循环导入，并在发现循环时失败',
   'help.option.evalServer.host':
     '绑定地址或可解析的主机名（默认：127.0.0.1；非回环绑定需要 GITNEXUS_AUTH_TOKEN；主机名解析为 IPv4）',

@@ -132,6 +132,7 @@ import {
   LOCAL_SCOPE_BODY_NODE_TYPES,
   type SyntaxNode,
 } from '../utils/ast-helpers.js';
+import { computeCallableMetrics } from '../complexity.js';
 import { isPositionQualifiedLocalLabel } from '../utils/callable-labels.js';
 import { extractCallArgTypes, type MixedChainStep } from '../utils/call-analysis.js';
 import { buildTypeEnv } from '../type-env.js';
@@ -3133,6 +3134,16 @@ const processFileGroupFiles = (
             ),
         );
         if (definitionProperties !== undefined) Object.assign(methodProps, definitionProperties);
+      }
+
+      // Cyclomatic complexity + SLOC: only Function/Method rows persist them
+      // (Constructor shares the generic code-element table, which has no such columns).
+      if (definitionNode && (nodeLabel === 'Function' || nodeLabel === 'Method')) {
+        const metrics = computeCallableMetrics(definitionNode, language);
+        if (metrics) {
+          methodProps.complexity = metrics.complexity;
+          methodProps.sloc = metrics.sloc;
+        }
       }
 
       result.nodes.push({
