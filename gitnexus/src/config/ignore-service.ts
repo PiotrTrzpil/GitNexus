@@ -62,7 +62,6 @@ const DEFAULT_IGNORE_LIST = new Set([
   'dist',
   'build',
   'out',
-  'output',
   'bin',
   'obj',
   'target', // Java/Rust
@@ -108,11 +107,12 @@ const DEFAULT_IGNORE_LIST = new Set([
   '.jest',
 
   // Logs & Temp
-  'logs',
+  // 'logs', 'cache', 'output' and 'fixtures' removed - bare names that often hold
+  // real source (src/**/output, test fixtures worth indexing, cache layers).
+  // Dot-prefixed build/cache names (.cache, .output) and `log` remain.
   'log',
   'tmp',
   'temp',
-  'cache',
   '.cache',
   '.tmp',
   '.temp',
@@ -134,7 +134,6 @@ const DEFAULT_IGNORE_LIST = new Set([
   '.github', // GitHub config, not code
   '.circleci',
   '.gitlab',
-  'fixtures', // Test fixtures
   'snapshots', // Jest snapshots
   '__snapshots__',
 ]);

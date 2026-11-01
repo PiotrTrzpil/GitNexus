@@ -72,7 +72,6 @@ describe('shouldIgnorePath', () => {
       'dist',
       'build',
       'out',
-      'output',
       'bin',
       'obj',
       'target',
@@ -83,6 +82,36 @@ describe('shouldIgnorePath', () => {
       '.turbo',
     ])('ignores %s directory', (dir) => {
       expect(shouldIgnorePath(`${dir}/bundle.js`)).toBe(true);
+    });
+  });
+
+  describe('directory names that often hold real source are not ignored by default', () => {
+    // `output`, `cache`, `logs` and `fixtures` were once in the default
+    // directory list; they routinely name real source modules (src/**/output/,
+    // logs/ loggers, fixtures/ builders), and only a !negation could bring them
+    // back. Dot-prefixed build caches (.cache, .output) remain ignored.
+    it.each(['output', 'cache', 'logs', 'fixtures'])('indexes files under %s/', (dir) => {
+      expect(shouldIgnorePath(`src/startups/${dir}/render.ts`)).toBe(false);
+      expect(shouldIgnorePath(`${dir}/render.ts`)).toBe(false);
+      expect(isHardcodedIgnoredDirectory(dir)).toBe(false);
+    });
+
+    it.each(['.output', '.cache', 'log'])('still ignores %s/', (dir) => {
+      expect(shouldIgnorePath(`${dir}/render.ts`)).toBe(true);
+    });
+
+    it('createIgnoreFilter walks into fixtures/ and output/ with no ignore files', async () => {
+      const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-ignore-defaults-'));
+      try {
+        const filter = await createIgnoreFilter(tmp);
+        const mk = (rel: string) => ({ relative: () => rel, name: rel }) as any;
+        for (const dir of ['fixtures', 'output', 'src/output', 'test/fixtures']) {
+          expect(filter.childrenIgnored(mk(dir))).toBe(false);
+          expect(filter.ignored(mk(`${dir}/a.ts`))).toBe(false);
+        }
+      } finally {
+        await fs.rm(tmp, { recursive: true, force: true });
+      }
     });
   });
 
