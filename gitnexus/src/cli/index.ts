@@ -491,6 +491,7 @@ program
     '--content',
     'Include retained symbol source text (reports availability when disabled by retention)',
   )
+  .option('--verbose', 'Print the full structured JSON instead of compact text')
   .action(createLbugLazyAction(() => import('./tool.js'), 'contextCommand'));
 
 program
@@ -526,6 +527,7 @@ program
     '--max-tokens <n>',
     'Fit compact JSON into about N tokens; trim deepest callgraph symbols or fail if required content cannot fit. PDG/group results must fit intact',
   )
+  .option('--verbose', 'Print the full structured JSON instead of compact text')
   .action(createLbugLazyAction(() => import('./tool.js'), 'impactCommand'));
 
 program

@@ -49,6 +49,7 @@ import {
   McpRepositoryPolicy,
   mcpRepositoryPolicyConfigured,
 } from './repository-policy.js';
+import { compactToolResult, withoutMcpVerboseArg } from './compact-output.js';
 import { applyMcpMaxTokens, resolveMcpMaxTokens, withoutMcpBudgetArg } from './output-budget.js';
 import {
   ImpactBudgetExceededError,
@@ -333,8 +334,10 @@ export function createMCPServer(
       const responseFilter = resolveMcpResponseFilter(schemaSource, typedArgs);
       maxTokens = resolveMcpMaxTokens(name, typedArgs);
       const isImpact = schemaSource === 'impact';
+      // `verbose` only picks the output format; the backend never sees it.
+      const verbose = typedArgs?.verbose === true;
       const strippedArgs = withoutMcpResponseFilterArgs(
-        withoutMcpBudgetArg(typedArgs),
+        withoutMcpVerboseArg(withoutMcpBudgetArg(typedArgs)),
         responseFilter,
       );
       const backendArgs = isImpact ? withImpactAgentDefaults(strippedArgs) : strippedArgs;
@@ -361,10 +364,18 @@ export function createMCPServer(
       const result = isImpact
         ? shapeImpactForAgent(rawResult, maxTokens, Buffer.byteLength(hint, 'utf8'))
         : rawResult;
+      // Agents get compact text for impact/context unless they ask for the
+      // full structure; unrecognised results (errors, ambiguous) stay JSON.
+      const compactText = verbose ? null : compactToolResult(schemaSource, result);
       const resultText =
-        name === 'query' && result !== null && typeof result === 'object' && !Array.isArray(result)
-          ? JSON.stringify({ ...result, next: hint })
-          : (typeof result === 'string' ? result : JSON.stringify(result)) + hint;
+        compactText !== null
+          ? compactText + hint
+          : name === 'query' &&
+              result !== null &&
+              typeof result === 'object' &&
+              !Array.isArray(result)
+            ? JSON.stringify({ ...result, next: hint })
+            : (typeof result === 'string' ? result : JSON.stringify(result)) + hint;
 
       return {
         content: [

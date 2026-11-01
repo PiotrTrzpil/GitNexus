@@ -602,6 +602,7 @@ describe('MCP output budgets', () => {
       target: 'auth',
       direction: 'upstream',
       maxTokens: 800,
+      verbose: true,
     });
 
     expect(isError).toBe(false);
@@ -1007,7 +1008,10 @@ describe('MCP response filters', () => {
   it('returns compact JSON with all default evidence and hints', async () => {
     const backend = createMockBackend({ callTool: vi.fn().mockResolvedValue(payload) });
     const args = { uid: payload.symbol.uid };
-    const { text, isError } = await callToolThroughServer(backend, 'context', args);
+    const { text, isError } = await callToolThroughServer(backend, 'context', {
+      ...args,
+      verbose: true,
+    });
     expect(isError).toBe(false);
     expect(text).toBe(JSON.stringify(payload) + getNextStepHint('context', args, false, payload));
     expect(backend.callTool).toHaveBeenCalledWith('context', args);
@@ -1022,7 +1026,10 @@ describe('MCP response filters', () => {
     };
     const backend = createMockBackend({ callTool: vi.fn().mockResolvedValue(result) });
     const args = { uid: payload.symbol.uid, include_content: true };
-    const { text, isError } = await callToolThroughServer(backend, 'context', args);
+    const { text, isError } = await callToolThroughServer(backend, 'context', {
+      ...args,
+      verbose: true,
+    });
     const hint = getNextStepHint('context', args, false, result);
     expect(isError).toBe(false);
     expect(text.endsWith(hint)).toBe(true);
@@ -1040,6 +1047,7 @@ describe('MCP response filters', () => {
     const { text, isError } = await callToolThroughServer(backend, 'context', {
       ...args,
       maxTokens,
+      verbose: true,
     });
     expect(isError).toBe(false);
     expect(text).toBe(complete);
@@ -1061,6 +1069,7 @@ describe('MCP response filters', () => {
         uid: payload.symbol.uid,
         response_sections: ['incoming'],
         relationTypes: ['CALLS'],
+        verbose: true,
       });
       expect(isError).toBe(false);
       const result = JSON.parse(text.split('\n\n---')[0]);
