@@ -24,6 +24,7 @@ import {
   shapeImpactForAgent,
   withImpactAgentDefaults,
 } from '../mcp/impact-agent-output.js';
+import { compactContext, compactImpact } from '../mcp/compact-output.js';
 import { resolveMcpMaxTokens } from '../mcp/output-budget.js';
 
 let _backend: LocalBackend | null = null;
@@ -183,6 +184,7 @@ export async function contextCommand(
     uid?: string;
     limit?: string;
     content?: boolean;
+    verbose?: boolean;
   },
 ): Promise<void> {
   // Reject a `--`-prefixed uid swallowed from a following flag (see impactCommand).
@@ -223,7 +225,16 @@ export async function contextCommand(
       result.typed_properties = result.typed_properties.slice(0, limit);
     if (Array.isArray(result.processes)) result.processes = result.processes.slice(0, limit);
   }
-  output(result);
+  if (options?.verbose) {
+    output(result);
+  } else {
+    // Compact text by default; not-found and ambiguous results stay JSON.
+    output(
+      result,
+      (data) =>
+        compactContext(data) ?? JSON.stringify(data, null, process.stdout.isTTY ? 2 : undefined),
+    );
+  }
 }
 
 export async function impactCommand(
@@ -243,6 +254,7 @@ export async function impactCommand(
     offset?: string;
     summaryOnly?: boolean;
     maxTokens?: string;
+    verbose?: boolean;
   },
 ): Promise<void> {
   // A `--`-prefixed uid means Commander swallowed a following flag as the uid
@@ -308,8 +320,13 @@ export async function impactCommand(
         result.affected_routes = result.affected_routes.slice(0, parsedLimit);
     }
     const shaped = shapeImpactForAgent(result, maxTokens);
-    // The budget is measured on compact JSON, even when stdout is a terminal.
-    output(shaped, maxTokens === undefined ? undefined : (data) => JSON.stringify(data));
+    if (options?.verbose) {
+      // The budget is measured on compact JSON, even when stdout is a terminal.
+      output(shaped, maxTokens === undefined ? undefined : (data) => JSON.stringify(data));
+    } else {
+      // Compact text by default; errors, ambiguity and PDG/group shapes stay JSON.
+      output(shaped, (data) => compactImpact(data) ?? JSON.stringify(data));
+    }
   } catch (err: unknown) {
     if (err instanceof ImpactBudgetExceededError) {
       output(err.toJSONText());

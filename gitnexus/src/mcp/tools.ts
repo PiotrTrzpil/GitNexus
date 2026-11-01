@@ -342,22 +342,22 @@ ${HOT_READ_STALENESS_NOTE}`,
   {
     name: 'context',
     description: `Inspect a symbol's references, processes, and location when query results need more detail.
-Use uid, or name with file_path/kind. Ambiguous results return ranked candidates, totalCandidates (full count), and candidatesTruncated.
+Use uid, or name with file_path/kind. Ambiguous results return ranked candidates, totalCandidates, and candidatesTruncated.
 
 include_content returns retained source. Leave chain_depth:0 unless layered CALLS neighbours are needed. routes:[{url,method?}] and is_entry_point describe HTTP handlers and process entries. ACCESSES references carry reason "read"/"write"; CALLS can follow field and method chains.
 
-COMPLETENESS: epistemic "lower-bound" means incoming is a floor (missed callers/failed probes). Read boundaries; branch on causes. Empty callers do not prove safety.
+COMPLETENESS: epistemic "lower-bound" means incoming is a floor (missed callers/failed probes). Branch on causes; empty callers do not prove safety.
 - scopeExtractionFiles: files missing scope edges; analyze --force, inspect warnings.
 - receiverTyping: sites with unknown receiver types; corroborate by text search.
 - overloadResolution: unique unresolved overload/implementation sites matched by symbol/declaring owner. Missing/invalid/capped receipts imply lower-bound even at 0; analyze --force.
-- externalBoundary: calls outside indexed code; compatible with "exact", not a defect.
+- externalBoundary: calls outside indexed code; compatible with "exact".
 - dispatchBoundary: DI/interface symbols, not sites. Runtime-proxy gaps may be uncountable (0 with lower-bound).
-- undecidedSatisfaction: unjudged interface/type pairs without IMPLEMENTS; check dependencies.
-- callableValueReferences: symbols holding the callable as a value via USES, without a modeled later invocation. Follow the registrations/readers. Zig registrations and JS/TS object properties are captured; bare JS/TS callback arguments are not counted. Synthesized dispatch excludes the whole symbol, so mixed followed/unfollowed registrations can report 0. Zero means no unfollowed registration was proven, not no escapes; a failed probe also reports 0 with lower-bound.
+- undecidedSatisfaction: unjudged interface/type pairs lacking IMPLEMENTS; check dependencies.
+- callableValueReferences: symbols holding the callable as a value via USES, without a modeled later invocation. Follow the registrations/readers. Zig registrations and JS/TS object properties are captured; bare JS/TS callback arguments are not counted. Synthesized dispatch excludes the whole symbol, so mixed registrations can report 0. Zero means none proven, not none escaping; a failed probe also reports 0 with lower-bound.
 
-Older indexes can lack captures/metadata; re-analyze before trusting zero causes or exact coverage. Use impact() before edits; read gitnexus://repo/{name}/process/{processName} for a full flow.
+Older indexes may lack captures; re-analyze before trusting zero causes. Use impact() before edits; read gitnexus://repo/{name}/process/{processName} for a full flow.
 
-GROUP MODE: repo "@<groupName>" aggregates member results; "@<groupName>/<groupRepoPath>" selects one member using group.yaml keys.
+GROUP MODE: repo "@<groupName>" aggregates members; "@<groupName>/<groupRepoPath>" selects one member using group.yaml keys.
 
 SERVICE: case-sensitive path prefix in @group mode; members whose symbol is outside it return an empty payload. Ignored for a normal repository.
 
@@ -410,6 +410,7 @@ ${HOT_READ_STALENESS_NOTE}`,
           default: 0,
           description: `Optional: walk CALLS edges up to N hops (0-${CONTEXT_CHAIN_MAX_DEPTH}) and return the result as a \`chain\` field (downstream callees + upstream callers layered by depth). 0 = disabled (default). 1 = direct neighbours only. 2-${CONTEXT_CHAIN_MAX_DEPTH} = procedure→workflow→sub-workflow depth. Useful for revealing the full tRPC/RPC call chain in a single call instead of chaining context() invocations.`,
         },
+        verbose: { type: 'boolean', description: 'Full JSON, not compact text.' },
         maxTokens: {
           type: 'integer',
           minimum: 1,
@@ -557,10 +558,10 @@ COMPLETENESS: epistemic "lower-bound" makes impactedCount a floor (missed caller
 - scopeExtractionFiles: files missing scope edges; analyze --force, inspect warnings.
 - receiverTyping: sites with unknown receiver types; corroborate before deletion/rename.
 - overloadResolution: when traversing CALLS, unique unresolved overload/implementation sites in the expanded traversal before pagination. Missing/invalid/capped receipts imply lower-bound even at 0; analyze --force.
-- externalBoundary: calls outside indexed code; compatible with "exact", not a defect.
+- externalBoundary: calls outside indexed code; compatible with "exact".
 - dispatchBoundary: DI/interface symbols, not sites. Runtime-proxy gaps may be uncountable (0 with lower-bound).
-- undecidedSatisfaction: unjudged interface/type pairs without IMPLEMENTS; check dependencies.
-- callableValueReferences counts symbols registering the callable VALUE via USES without a modeled later invocation. Follow registrations/readers; low risk/counts remain floors. Zig registrations and JS/TS object properties are captured; bare JS/TS callback arguments are not counted. Synthesized property dispatch excludes the whole symbol, so mixed followed/unfollowed registrations can report 0. Zero means no unfollowed registration was proven, not no escapes; a failed probe also reports 0 with lower-bound.
+- undecidedSatisfaction: unjudged interface/type pairs lacking IMPLEMENTS; check dependencies.
+- callableValueReferences counts symbols registering the callable VALUE via USES without a modeled later invocation. Follow registrations/readers; low risk/counts remain floors. Zig registrations and JS/TS object properties are captured; bare JS/TS callback arguments are not counted. Synthesized property dispatch excludes the whole symbol, so mixed followed/unfollowed registrations can report 0. Zero means none proven, not none escaping; a failed probe also reports 0 with lower-bound.
 Older indexes can lack captures/metadata; re-analyze before trusting zero causes or apparently exact coverage from an older analyzer.
 
 PDG MODE: mode:"pdg" requires analyze --pdg; incompatible with crossDepth/@group. relationTypes/minConfidence filter inter-symbol reach. A statement-anchored slice uses a 1-based line inside the target; omit line for whole-symbol dependence.
@@ -699,6 +700,7 @@ ${HOT_READ_STALENESS_NOTE}`,
             'When true, returns target, summary, risk, byDepthCounts, affected_processes, and affected_modules — omits byDepth. Single-repo only; ignored in group mode (@groupName). Use for hub symbols to get actionable signal without output explosion.',
           default: false,
         },
+        verbose: { type: 'boolean', description: 'Full JSON, not compact text.' },
         maxTokens: {
           type: 'integer',
           minimum: 1,
