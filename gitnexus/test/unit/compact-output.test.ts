@@ -119,8 +119,35 @@ describe('compactImpact', () => {
     const lines = compactImpact(result)!.split('\n');
     expect(lines.slice(-2)).toEqual([
       'routes (1): POST /login',
-      'usually changes with: web/client.ts (0.8), docs/auth.md (0.5)',
+      'usually changes with: web/client.ts (8×), docs/auth.md (4×)',
     ]);
+  });
+
+  it('drops overload arity tags from names but keeps JS private names', () => {
+    const item = (id: string, name: string, processCount: number) => ({
+      depth: 1,
+      id,
+      name,
+      type: 'Method',
+      filePath: 'src/x.ts',
+      relationType: 'CALLS',
+      confidence: 1,
+      processCount,
+    });
+    const result: any = {
+      ...impactResult(),
+      byDepthCounts: { 1: 3 },
+      byDepth: {
+        1: [
+          item('Method:src/x.ts:Store.load#0', 'load', 0),
+          item('Method:src/x.ts:Store.save#2', 'save', 6),
+          item('Method:src/x.ts:Store.#flush', '#flush', 0),
+        ],
+      },
+    };
+    expect(compactImpact(result)!.split('\n')[2]).toBe(
+      '  src/x.ts: Store.load, Store.save#6f, Store.#flush',
+    );
   });
 
   it('shows processCount from a trimmed item and the pagination state', () => {

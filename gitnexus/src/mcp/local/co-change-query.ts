@@ -56,7 +56,9 @@ export async function queryCoChanged(
     out.set(row.file, list);
   }
   for (const list of out.values()) {
-    list.sort((x, y) => y.strength - x.strength || y.count - x.count || x.file.localeCompare(y.file));
+    // Most shared commits first: strength alone ranks a file that changed three
+    // times (always with this one) above a page that changed with it five times.
+    list.sort((x, y) => y.count - x.count || y.strength - x.strength || x.file.localeCompare(y.file));
   }
   return out;
 }
@@ -68,7 +70,7 @@ export interface UnchangedPartner extends CoChangedFile {
 
 /**
  * For a diff: files that usually change with the changed ones but are not in
- * the diff, strongest first, capped to `limit`.
+ * the diff, most shared commits first, capped to `limit`.
  */
 export function partnersMissingFromDiff(
   byFile: ReadonlyMap<string, readonly CoChangedFile[]>,
@@ -84,7 +86,7 @@ export function partnersMissingFromDiff(
         merged.set(p.file, { ...p, with: [changed] });
       } else {
         existing.with.push(changed);
-        if (p.strength > existing.strength) {
+        if (p.count > existing.count || (p.count === existing.count && p.strength > existing.strength)) {
           existing.strength = p.strength;
           existing.count = p.count;
         }
@@ -94,7 +96,7 @@ export function partnersMissingFromDiff(
   return [...merged.values()]
     .sort(
       (x, y) =>
-        y.strength - x.strength || y.count - x.count || x.file.localeCompare(y.file),
+        y.count - x.count || y.strength - x.strength || x.file.localeCompare(y.file),
     )
     .slice(0, limit)
     .map((p) => ({ ...p, with: p.with.sort() }));

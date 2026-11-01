@@ -140,11 +140,12 @@ export function computeCoChangePairs(
     scored.push({ fileA, fileB, count, strength });
   }
 
-  // Strongest first; ties broken by support then path so output is deterministic.
+  // Most shared commits first, then strength, then path so output is deterministic.
   scored.sort(
     (x, y) =>
-      y.strength - x.strength ||
+      // Most shared commits first, strength as tie-break (see co-change-query).
       y.count - x.count ||
+      y.strength - x.strength ||
       (x.fileA < y.fileA ? -1 : x.fileA > y.fileA ? 1 : 0) ||
       (x.fileB < y.fileB ? -1 : x.fileB > y.fileB ? 1 : 0),
   );

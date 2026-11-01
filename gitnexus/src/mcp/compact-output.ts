@@ -43,7 +43,12 @@ function qualifiedName(ref: SymbolRef, file: string): string {
   const uid = ref.uid ?? ref.id ?? '';
   const marker = `:${file}:`;
   const at = file ? uid.indexOf(marker) : -1;
-  if (at >= 0 && uid.length > at + marker.length) return uid.slice(at + marker.length);
+  if (at >= 0 && uid.length > at + marker.length) {
+    // Drop the overload tag (`#<arity>` plus optional type/const tags) that
+    // method ids carry: it reads like the `#Nf` flow marker and adds nothing
+    // to a one-line listing. JS private names (`Foo.#bar`) start with a letter.
+    return uid.slice(at + marker.length).replace(/#\d+[^.#]*$/, '');
+  }
   return ref.name ?? uid;
 }
 
@@ -194,7 +199,7 @@ export function compactImpact(result: unknown): string | null {
   const coChanged: Rec[] = Array.isArray(result.co_changed) ? result.co_changed : [];
   if (coChanged.length > 0) {
     lines.push(
-      `usually changes with: ${capped(coChanged.map((c) => `${c.file} (${c.strength})`))}`,
+      `usually changes with: ${capped(coChanged.map((c) => `${c.file} (${c.count}×)`))}`,
     );
   }
 

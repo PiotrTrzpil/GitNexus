@@ -80,6 +80,20 @@ describe('computeCoChangePairs', () => {
     expect(kept.map((p) => p.fileB).sort()).toEqual(['p1.ts', 'p2.ts', 'p3.ts']);
   });
 
+  it('ranks by shared commits before strength', () => {
+    // router~page: 5 together, page changes 9 -> strength 5/8 = 0.625
+    // router~schema: 3 together, schema only ever changes with router -> strength 1
+    const commits = [
+      ...repeat(5, ['router.py', 'page.tsx']),
+      ...repeat(4, ['page.tsx']),
+      ...repeat(3, ['router.py', 'schema.py']),
+    ];
+    expect(computeCoChangePairs(commits, all).map((p) => `${p.fileA}~${p.fileB}`)).toEqual([
+      'page.tsx~router.py',
+      'router.py~schema.py',
+    ]);
+  });
+
   it('drops an edge when both endpoints already hold their top-N partners', () => {
     // Changes: a=9, b=8, c=7. Strengths: ab 5/8, ac 4/7, bc 3/7.
     const commits = [
@@ -93,7 +107,7 @@ describe('computeCoChangePairs', () => {
 });
 
 describe('partnersMissingFromDiff', () => {
-  it('lists partners absent from the diff, strongest first, with the files they go with', () => {
+  it('lists partners absent from the diff with the files they go with', () => {
     const byFile = new Map([
       [
         'api.py',
@@ -109,6 +123,18 @@ describe('partnersMissingFromDiff', () => {
     expect(out).toEqual([
       { file: 'tests/api_test.py', strength: 0.7, count: 7, with: ['api.py'] },
       { file: 'schema.sql', strength: 0.6, count: 6, with: ['api.py', 'models.py'] },
+    ]);
+  });
+
+  it('orders by shared commits before strength and keeps the busier pairing', () => {
+    const byFile = new Map([
+      ['router.py', [{ file: 'schema.py', strength: 1, count: 3 }, { file: 'page.tsx', strength: 0.56, count: 5 }]],
+      ['api.py', [{ file: 'schema.py', strength: 0.4, count: 6 }]],
+    ]);
+    const out = partnersMissingFromDiff(byFile, new Set(['router.py', 'api.py']));
+    expect(out).toEqual([
+      { file: 'schema.py', strength: 0.4, count: 6, with: ['api.py', 'router.py'] },
+      { file: 'page.tsx', strength: 0.56, count: 5, with: ['router.py'] },
     ]);
   });
 
