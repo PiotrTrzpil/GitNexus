@@ -556,6 +556,10 @@ program
   .description('Map git diff hunks to indexed symbols and affected execution flows')
   .option('-s, --scope <scope>', 'What to analyze: unstaged, staged, all, or compare', 'unstaged')
   .option('-b, --base-ref <ref>', 'Branch/commit for compare scope (e.g. main)')
+  .option(
+    '-d, --detail <level>',
+    'Use "symbols" for a per-symbol semantic diff with breaking-change flags',
+  )
   .option('-r, --repo <name>', 'Target repository')
   .option('--branch <name>', 'Scope to a specific branch index (multi-branch repos)')
   .option('-l, --limit <n>', 'Max changed symbols to return')

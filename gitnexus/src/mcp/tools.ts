@@ -438,9 +438,10 @@ Maps git diff hunks to indexed symbols, then traces which processes are impacted
 WHEN TO USE: Before committing — to understand what your changes affect. Pre-commit review, PR preparation.
 AFTER THIS: Review affected processes. Use context() on high-risk symbols. READ gitnexus://repo/{name}/process/{name} for full traces.
 
-GIT WORKTREE SUPPORT: GitNexus automatically detects when the MCP server was launched from inside a linked git worktree and runs git diff against that worktree — no extra parameters needed in the common case. Pass "worktree" explicitly only when the server was started from a different directory than the worktree you are editing (e.g., the server runs from the canonical root but your changes are in a linked worktree at a different path).
+GIT WORKTREE SUPPORT: GitNexus automatically detects a server launched inside a linked git worktree and diffs it. Pass "worktree" only when the server was started elsewhere than the worktree you are editing.
 
 Returns: changed symbols, affected processes, and a risk summary.
+- detail: "symbols" adds "semantic": per changed symbol, change (Added/Removed/Renamed/SignatureChanged/VisibilityChanged/BodyChanged), breaking (exported symbol removed/renamed/re-signatured/made private) and from/to; unanalysed files: semantic.skipped.
 - partial: true — mapping is incomplete, so risk_level is "unknown" instead of a ranked level. A failed symbol query (or an unparseable diff) degrades changed_symbols, both counts, and derived processes; a failed process lookup degrades only affected_processes and risk, leaving changed-symbol counts sound. unmapped_files lists changed supported source files with no mapped symbols, including source renames without hunks: their symbols may be missing, unindexed, or outside indexed ranges even when every query succeeded. Rebuild the index and inspect those diffs; retry alone may not resolve this state. changed_count:0 with partial:true is NOT a clean pre-commit check.
 - truncated: true — the changed_symbols LISTING was capped for this response. summary.changed_count counts every symbol the run observed: the true total normally, a LOWER BOUND when partial:true. Compare it with the array length rather than trusting the array.`,
     annotations: READ_ONLY_TOOL_ANNOTATIONS,
@@ -457,10 +458,15 @@ Returns: changed symbols, affected processes, and a risk summary.
           type: 'string',
           description: 'Branch/commit for "compare" scope (e.g., "main")',
         },
+        detail: {
+          type: 'string',
+          description: '"symbols": per-symbol semantic diff with breaking flags.',
+          enum: ['symbols'],
+        },
         worktree: {
           type: 'string',
           description:
-            'Absolute path to a linked git worktree. Pass this when your changes are in a worktree (the .git entry at that path is a file, not a directory). GitNexus will run git diff from that worktree so staged/unstaged changes are correctly detected.',
+            'Absolute path to a linked git worktree holding your changes; git diff runs from there.',
         },
         repo: {
           type: 'string',

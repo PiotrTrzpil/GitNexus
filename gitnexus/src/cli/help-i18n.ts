@@ -152,6 +152,7 @@ const OPTION_DESCRIPTION_KEYS = {
   'cypher|-l, --limit <n>': 'help.option.cypher.limit',
   'detect-changes|-s, --scope <scope>': 'help.option.detectChanges.scope',
   'detect-changes|-b, --base-ref <ref>': 'help.option.detectChanges.baseRef',
+  'detect-changes|-d, --detail <level>': 'help.option.detectChanges.detail',
   'detect-changes|-l, --limit <n>': 'help.option.detectChanges.limit',
   'detect-changes|-r, --repo <name>': 'help.option.repo.target',
   'detect-changes|--branch <name>': 'help.option.branch',
