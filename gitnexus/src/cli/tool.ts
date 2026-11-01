@@ -375,6 +375,7 @@ export async function cypherCommand(
 export async function detectChangesCommand(options?: {
   scope?: string;
   baseRef?: string;
+  detail?: string;
   repo?: string;
   branch?: string;
   limit?: string;
@@ -384,6 +385,7 @@ export async function detectChangesCommand(options?: {
   const result = await backend.callTool('detect_changes', {
     scope: options?.scope || 'unstaged',
     base_ref: options?.baseRef,
+    detail: options?.detail,
     repo: options?.repo,
     branch: options?.branch,
   });

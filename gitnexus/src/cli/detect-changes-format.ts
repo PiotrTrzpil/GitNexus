@@ -34,9 +34,58 @@ type DetectChangesResult = {
   changed_symbols?: ChangedSymbol[];
   affected_processes?: AffectedProcess[];
   unmapped_files?: string[];
+  semantic?: {
+    changes?: SemanticChangeLine[];
+    breaking_count?: number;
+    skipped?: { file: string; reason: string }[];
+  };
 };
 
+type SemanticChangeLine = {
+  change: string;
+  type: string;
+  name: string;
+  file: string;
+  breaking: boolean;
+  old_name?: string;
+  from?: string;
+  to?: string;
+};
+
+/** One compact line per symbol: `! Removed Function foo (src/a.ts)  old -> new`; `!` marks breaking. */
+function formatSemanticLine(c: SemanticChangeLine): string {
+  const renamed = c.old_name ? `${c.old_name} -> ${c.name}` : c.name;
+  const sig =
+    c.from !== undefined || c.to !== undefined ? `  ${c.from ?? ''} -> ${c.to ?? ''}` : '';
+  return `${c.breaking ? '!' : '-'} ${c.change} ${c.type} ${renamed} (${formatPathForTerminal(c.file)})${sig}`;
+}
+
 export function formatDetectChangesResult(result: unknown): string {
+  const base = formatDetectChangesBase(result);
+  const semantic = (result as DetectChangesResult | null)?.semantic;
+  if (!semantic) return base;
+  const changes = semantic.changes ?? [];
+  const lines = [base, ''];
+  lines.push(
+    t('tool.detectChanges.semanticHeader', {
+      count: changes.length,
+      breaking: semantic.breaking_count ?? 0,
+    }),
+  );
+  for (const c of changes) lines.push(formatSemanticLine(c));
+  if (semantic.skipped?.length) {
+    lines.push(
+      t('tool.detectChanges.semanticSkipped', {
+        files: semantic.skipped
+          .map((s) => `${formatPathForTerminal(s.file)} (${s.reason})`)
+          .join(', '),
+      }),
+    );
+  }
+  return lines.join('\n');
+}
+
+function formatDetectChangesBase(result: unknown): string {
   const payload = (result ?? {}) as DetectChangesResult;
   if (payload.error) return t('common.error', { message: String(payload.error) });
 

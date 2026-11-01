@@ -1625,9 +1625,7 @@ const isMissingRouteOptionalPropertyError = (error: unknown): boolean => {
  * form; any guard failure returns `{ error }`.
  */
 type ApiImpactResult =
-  | ApiImpactRoute
-  | { routes: ApiImpactRoute[]; total: number }
-  | { error: string };
+  ApiImpactRoute | { routes: ApiImpactRoute[]; total: number } | { error: string };
 
 /**
  * One repository entry as returned by {@link LocalBackend.listRepos} and in each
@@ -6900,11 +6898,17 @@ export class LocalBackend {
       scope?: string;
       base_ref?: string;
       worktree?: string;
+      detail?: string;
     },
   ): Promise<any> {
     await this.ensureInitialized(repo);
 
     const scope = params.scope || 'unstaged';
+    if (params.detail !== undefined && params.detail !== 'symbols') {
+      return { error: `detail must be "symbols" when provided, got: "${params.detail}"` };
+    }
+    // The directory git diff ran in; the semantic diff reads file versions from the same place.
+    let diffRoot = repo.repoPath;
     const { execFileSync } = await import('child_process');
 
     // Ignore CR-only EOL differences, while preserving meaningful whitespace changes.
@@ -6953,6 +6957,7 @@ export class LocalBackend {
         }
         diffCwd = providedResolved;
       }
+      diffRoot = diffCwd;
 
       // maxBuffer raised from Node's 1MB default to 256MB to avoid ENOBUFS on
       // repos with large unstaged/untracked diffs (e.g. unignored build folders).
@@ -7260,6 +7265,21 @@ export class LocalBackend {
       DETECT_CHANGES_MAX_LISTED_SYMBOLS,
     );
 
+    // `detail: 'symbols'` — re-parse each changed file at both versions and
+    // classify per-symbol changes (see core/diff/semantic-diff.ts). Independent
+    // of the graph, so it also covers files the index has not seen.
+    const semantic =
+      params.detail === 'symbols'
+        ? await (
+            await import('../../core/diff/semantic-diff.js')
+          ).computeSemanticDiff(
+            diffRoot,
+            fileDiffs.map(({ filePath, oldFilePath }) => ({ filePath, oldFilePath })),
+            scope,
+            params.base_ref,
+          )
+        : undefined;
+
     return {
       summary: {
         changed_count: changedSymbols.size,
@@ -7282,6 +7302,7 @@ export class LocalBackend {
       // the safety gate must not treat that as a clean result (#2283).
       ...(queryDegraded && { partial: true }),
       ...(listedSymbols.length < changedSymbols.size && { truncated: true }),
+      ...(semantic && { semantic }),
     };
   }
 
@@ -9992,8 +10013,7 @@ export class LocalBackend {
             'individual indexed repository instead.',
           target: groupRejectTarget,
           direction: (params.direction === 'downstream' ? 'downstream' : 'upstream') as
-            | 'upstream'
-            | 'downstream',
+            'upstream' | 'downstream',
         });
         return pdgErr;
       }

@@ -151,6 +151,8 @@ export const en = {
   'tool.detectChanges.riskLevel': 'Risk level: {{risk}}',
   'tool.detectChanges.unknownRisk': 'unknown',
   'tool.detectChanges.changedSymbols': 'Changed symbols:',
+  'tool.detectChanges.semanticHeader': 'Semantic changes ({{count}}, {{breaking}} breaking):',
+  'tool.detectChanges.semanticSkipped': 'Not analysed: {{files}}',
   'tool.detectChanges.overflowMore': '... and {{count}} more',
   'tool.detectChanges.affectedExecutionFlows': 'Affected execution flows:',
   'tool.detectChanges.steps': '{{count}} steps',
@@ -401,6 +403,8 @@ export const en = {
   'help.option.trace.includeTests': 'Traverse through test-file symbols (default: false)',
   'help.option.detectChanges.scope': 'What to analyze: unstaged, staged, all, or compare',
   'help.option.detectChanges.baseRef': 'Branch/commit for compare scope (e.g. main)',
+  'help.option.detectChanges.detail':
+    'Use "symbols" for a per-symbol semantic diff with breaking-change flags',
   'help.option.detectChanges.limit': 'Max changed symbols to return',
   'help.option.cypher.limit': 'Max result rows to return',
   'help.option.check.cycles': 'Detect circular imports and fail when any are found',
