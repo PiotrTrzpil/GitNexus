@@ -3357,6 +3357,15 @@ export const deleteAllInjects = async (): Promise<{ edgesDeleted: number }> =>
 export const deleteAllAdvisedBy = async (): Promise<{ edgesDeleted: number }> =>
   deleteAllRelationshipsOfType('ADVISED_BY', 'spring-aop', 'duplicate ADVISED_BY edges');
 
+/**
+ * Drop every `CO_CHANGES_WITH` relationship before incremental writeback. The
+ * pair set is a function of git history, not of any one file's content, so the
+ * `coChange` phase recomputes it whole and `extractChangedSubgraph` re-includes
+ * all of it (delete-all-then-rebuild, like {@link deleteAllInjects}).
+ */
+export const deleteAllCoChanges = async (): Promise<{ edgesDeleted: number }> =>
+  deleteAllRelationshipsOfType('CO_CHANGES_WITH', 'co-change', 'duplicate CO_CHANGES_WITH edges');
+
 /** Drop all synthetic Spring AOP evidence nodes before incremental writeback. */
 export const deleteSpringAopEvidenceNodes = async (): Promise<{ nodesDeleted: number }> => {
   const c = conn;

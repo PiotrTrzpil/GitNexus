@@ -32,6 +32,11 @@ import {
   getLbugDbIdentity,
 } from '../../core/lbug/pool-adapter.js';
 import { queryClassBeanMetadata } from './bean-metadata.js';
+import {
+  queryCoChanged,
+  partnersMissingFromDiff,
+  IMPACT_CO_CHANGED_LIMIT,
+} from './co-change-query.js';
 import { GUARD_TAINT_LIMITATION } from '../taint-limitations.js';
 import { querySpringAopMetadata } from './aop-metadata.js';
 import {
@@ -7284,6 +7289,13 @@ export class LocalBackend {
           )
         : undefined;
 
+    // Files that usually change with the changed ones but are not in this diff.
+    const diffFiles = new Set(fileDiffs.map((fileDiff) => fileDiff.filePath));
+    const coChangedNotInDiff = partnersMissingFromDiff(
+      await queryCoChanged(repo.lbugPath, [...diffFiles]),
+      diffFiles,
+    );
+
     return {
       summary: {
         changed_count: changedSymbols.size,
@@ -7302,6 +7314,7 @@ export class LocalBackend {
       changed_symbols: listedSymbols,
       affected_processes: Array.from(affectedProcesses.values()),
       ...(unmappedFiles.length > 0 && { unmapped_files: unmappedFiles }),
+      ...(coChangedNotInDiff.length > 0 && { co_changed_not_in_diff: coChangedNotInDiff }),
       // Failed queries or unmapped source files leave counts/risk incomplete;
       // the safety gate must not treat that as a clean result (#2283).
       ...(queryDegraded && { partial: true }),
@@ -7701,6 +7714,13 @@ export class LocalBackend {
     try {
       const result = await this._impactImpl(repo, params);
       if (!result.error) assertResponseIdentities(result);
+      // Files that usually change with the target's file (git history). Advisory,
+      // so a missing index layer or failed query just omits the key.
+      const targetFile = result.target?.filePath;
+      if (!result.error && params.mode !== 'pdg' && typeof targetFile === 'string' && targetFile) {
+        const partners = (await queryCoChanged(repo.lbugPath, [targetFile])).get(targetFile);
+        if (partners?.length) result.co_changed = partners.slice(0, IMPACT_CO_CHANGED_LIMIT);
+      }
       return result;
     } catch (err: any) {
       // Return structured error instead of crashing (#321)

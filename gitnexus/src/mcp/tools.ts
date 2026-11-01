@@ -448,6 +448,7 @@ GIT WORKTREE SUPPORT: GitNexus automatically detects a server launched inside a 
 Returns: changed symbols, affected processes, and a risk summary.
 - detail: "symbols" adds "semantic": per changed symbol, change (Added/Removed/Renamed/SignatureChanged/VisibilityChanged/BodyChanged), breaking (exported symbol removed/renamed/re-signatured/made private) and from/to; unanalysed files: semantic.skipped.
 - partial: true — mapping is incomplete, so risk_level is "unknown". A failed symbol query or unparseable diff degrades changed_symbols, counts and processes; a failed process lookup degrades only affected_processes and risk. unmapped_files lists changed source files with no mapped symbols (including renames without hunks). Rebuild the index and inspect those diffs. changed_count:0 with partial:true is NOT a clean pre-commit check.
+- co_changed_not_in_diff:[{file,strength,count,with}]: files that usually change with changed files, not in this diff.
 - truncated: true — the changed_symbols LISTING was capped. summary.changed_count counts every observed symbol (a LOWER BOUND when partial:true); compare it with the array length.`,
     annotations: READ_ONLY_TOOL_ANNOTATIONS,
     inputSchema: {
@@ -565,6 +566,7 @@ RESULTS: target, impactedCount, summary, affected_processes, affected_modules, b
 - byDepth rows include processes:[{id,label,processType,step}]. With partial:true, processes:[] can mean capped enrichment; cross-check affected_processes.
 - staticGated:true marks a provably compile-time-unreachable edge (currently Zig); absence proves neither reachability nor coverage. Traversal/risk do not filter on it.
 - affected_routes and row routes:[{url,method?}] are callgraph-only HTTP enrichment, not risk inputs.
+- co_changed:[{file,strength,count}]: files that usually change with the target's file (git history).
 
 COMPLETENESS: epistemic "lower-bound" makes impactedCount a floor (missed callers/failed probes). Read boundaries; branch on causes. Ambiguous/group results may omit this envelope.
 - scopeExtractionFiles: files missing scope edges; analyze --force, inspect warnings.

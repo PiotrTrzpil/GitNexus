@@ -42,6 +42,7 @@ import {
   pruneLocalSymbolsPhase,
   taintSummariesPhase,
   callSummariesPhase,
+  coChangePhase,
   mroPhase,
   diPhase,
   communitiesPhase,
@@ -53,6 +54,7 @@ import {
   type CommunitiesOutput,
   type ProcessesOutput,
 } from './pipeline-phases/index.js';
+import { isCoChangeDisabledByEnv } from './pipeline-phases/co-change.js';
 
 export interface PipelineOptions {
   /**
@@ -68,6 +70,11 @@ export interface PipelineOptions {
    * Community/Process rows can be kept instead of wipe+rewrite.
    */
   skipDerivedGraphPhases?: boolean;
+  /**
+   * Skip the git co-change mining phase (`CO_CHANGES_WITH` edges). On by default;
+   * `GITNEXUS_NO_CO_CHANGE=1` has the same effect.
+   */
+  skipCoChange?: boolean;
   /**
    * Explicit local Spring Boot Actuator snapshot input. Accepts a directory
    * containing endpoint-named JSON files or a JSON bundle keyed by endpoint.
@@ -358,6 +365,10 @@ export function buildPhaseList(options?: PipelineOptions): PipelinePhase[] {
       // phase depends on it (a filtered-out dep would throw in getPhaseOutput).
       .register(taintSummariesPhase, { enabledWhen: (o) => o.pdg === true })
       .register(callSummariesPhase, { enabledWhen: (o) => o.pdg === true })
+      // Git-history co-change edges: one bounded `git log`, whole-repo derived data.
+      .register(coChangePhase, {
+        enabledWhen: (o) => !o.skipGraphPhases && !o.skipCoChange && !isCoChangeDisabledByEnv(),
+      })
       .register(mroPhase, { enabledWhen: (o) => !o.skipGraphPhases })
       .register(springAopInheritancePhase, { enabledWhen: (o) => !o.skipGraphPhases })
       .register(diPhase, { enabledWhen: (o) => !o.skipGraphPhases })

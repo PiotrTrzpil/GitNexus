@@ -93,6 +93,9 @@ export const REL_TYPES = [
   // reusing the existing FROM BasicBlock TO BasicBlock pair in RELATION_SCHEMA.
   'CDG',
   'POST_DOMINATE',
+  // Files that usually change together in git history (File→File). `confidence`
+  // carries the strength, `step` the co-change count.
+  'CO_CHANGES_WITH',
 ] as const;
 
 export type RelType = (typeof REL_TYPES)[number];
