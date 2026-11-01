@@ -448,7 +448,7 @@ GIT WORKTREE SUPPORT: GitNexus automatically detects a server launched inside a 
 Returns: changed symbols, affected processes, and a risk summary.
 - detail: "symbols" adds "semantic": per changed symbol, change (Added/Removed/Renamed/SignatureChanged/VisibilityChanged/BodyChanged), breaking (exported symbol removed/renamed/re-signatured/made private) and from/to; unanalysed files: semantic.skipped.
 - partial: true — mapping is incomplete, so risk_level is "unknown". A failed symbol query or unparseable diff degrades changed_symbols, counts and processes; a failed process lookup degrades only affected_processes and risk. unmapped_files lists changed source files with no mapped symbols (including renames without hunks). Rebuild the index and inspect those diffs. changed_count:0 with partial:true is NOT a clean pre-commit check.
-- co_changed_not_in_diff:[{file,strength,count,with}]: files that usually change with changed files, not in this diff.
+- co_changed_not_in_diff: files often committed with changed files but absent from this diff.
 - truncated: true — the changed_symbols LISTING was capped. summary.changed_count counts every observed symbol (a LOWER BOUND when partial:true); compare it with the array length.`,
     annotations: READ_ONLY_TOOL_ANNOTATIONS,
     inputSchema: {
@@ -566,7 +566,7 @@ RESULTS: target, impactedCount, summary, affected_processes, affected_modules, b
 - byDepth rows include processes:[{id,label,processType,step}]. With partial:true, processes:[] can mean capped enrichment; cross-check affected_processes.
 - staticGated:true marks a provably compile-time-unreachable edge (currently Zig); absence proves neither reachability nor coverage. Traversal/risk do not filter on it.
 - affected_routes and row routes:[{url,method?}] are callgraph-only HTTP enrichment, not risk inputs.
-- co_changed:[{file,strength,count}]: files that usually change with the target's file (git history).
+- co_changed: files often committed with the target's file.
 
 COMPLETENESS: epistemic "lower-bound" makes impactedCount a floor (missed callers/failed probes). Read boundaries; branch on causes. Ambiguous/group results may omit this envelope.
 - scopeExtractionFiles: files missing scope edges; analyze --force, inspect warnings.
@@ -575,8 +575,8 @@ COMPLETENESS: epistemic "lower-bound" makes impactedCount a floor (missed caller
 - externalBoundary: calls outside indexed code; compatible with "exact".
 - dispatchBoundary: DI/interface symbols, not sites. Runtime-proxy gaps may be uncountable (0 with lower-bound).
 - undecidedSatisfaction: unjudged interface/type pairs lacking IMPLEMENTS; check dependencies.
-- callableValueReferences counts symbols registering the callable VALUE via USES without a modeled later invocation. Follow registrations/readers; low risk/counts remain floors. Zig registrations and JS/TS object properties are captured; bare JS/TS callback arguments are not counted. Synthesized property dispatch excludes the whole symbol, so mixed followed/unfollowed registrations can report 0. Zero means none proven, not none escaping; a failed probe also reports 0 with lower-bound.
-Older indexes can lack captures/metadata; re-analyze before trusting zero causes or apparently exact coverage from an older analyzer.
+- callableValueReferences counts symbols registering the callable VALUE via USES without a modeled later invocation. Follow registrations/readers; low risk/counts remain floors. Zig registrations and JS/TS object properties are captured; bare JS/TS callback arguments are not. Mixed followed/unfollowed registrations can report 0. Zero means none proven, not none escaping; a failed probe also reports 0 with lower-bound.
+Older indexes can lack this metadata; re-analyze before trusting zero causes or exact coverage.
 
 PDG MODE: mode:"pdg" requires analyze --pdg; incompatible with crossDepth/@group. relationTypes/minConfidence filter inter-symbol reach. A statement-anchored slice uses a 1-based line inside the target; omit line for whole-symbol dependence.
 Every PDG result carries pdgResultVersion:3, risk:"UNKNOWN", and target metadata when resolved. Successful results include mode:"pdg", affectedStatements/affectedStatementCount, interproceduralByDepth/pdgInterprocedural, compatibility byDepth/byDepthCounts, and diagnostics. Missing-layer/degraded results keep UNKNOWN plus note/remediation; empty buckets are not safe zeros. truncatedByReasons lists simultaneous bounds while truncatedBy stays scalar.
