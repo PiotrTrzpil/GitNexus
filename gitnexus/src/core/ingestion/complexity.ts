@@ -12,7 +12,7 @@
  * Languages without an entry in {@link RULES} get `undefined` rather than a
  * guess. Adding one is a node-type table plus a test snippet.
  */
-import { SupportedLanguages } from '../../config/supported-languages.js';
+import { SupportedLanguages } from 'gitnexus-shared';
 import type { SyntaxNode } from './utils/ast-helpers.js';
 
 export interface CallableMetrics {

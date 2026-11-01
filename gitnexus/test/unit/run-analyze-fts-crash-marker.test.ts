@@ -141,6 +141,7 @@ const mockLbugAdapter = async () => {
     deleteAllInterprocTaintPaths: vi.fn(async () => undefined),
     deleteAllCallSummaries: vi.fn(async () => undefined),
     deleteAllInjects: vi.fn(async () => undefined),
+    deleteAllCoChanges: vi.fn(async () => undefined),
     deleteAllAdvisedBy: vi.fn(async () => undefined),
     deleteAllDestinations: vi.fn(async () => undefined),
     deleteSpringAopEvidenceNodes: vi.fn(async () => undefined),

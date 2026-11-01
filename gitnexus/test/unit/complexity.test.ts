@@ -10,11 +10,13 @@ import Python from 'tree-sitter-python';
 import Java from 'tree-sitter-java';
 import Go from 'tree-sitter-go';
 import Rust from 'tree-sitter-rust';
-import C from 'tree-sitter-c';
 import CSharp from 'tree-sitter-c-sharp';
 import { computeCallableMetrics } from '../../src/core/ingestion/complexity.js';
+import { requireVendoredGrammar } from '../../src/core/tree-sitter/vendored-grammars.js';
 import { SupportedLanguages } from '../../src/config/supported-languages.js';
 import type { SyntaxNode } from '../../src/core/ingestion/utils/ast-helpers.js';
+
+const C = requireVendoredGrammar('tree-sitter-c');
 
 function parse(grammar: unknown, src: string): SyntaxNode {
   const parser = new Parser();
