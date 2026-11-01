@@ -562,6 +562,16 @@ program
   .action(createLbugLazyAction(() => import('./tool.js'), 'detectChangesCommand'));
 
 program
+  .command('rename <target> <new_name>')
+  .description('Rename a symbol, or move a file or directory and rewrite its imports')
+  .option('-r, --repo <name>', 'Target repository')
+  .option('-u, --uid <uid>', 'Direct symbol UID (zero-ambiguity lookup)')
+  .option('-f, --file <path>', 'File path to disambiguate common symbol names')
+  .option('-t, --type <type>', 'What to rename: symbol (default), file, or directory')
+  .option('--apply', 'Apply after previewing (default is preview only)')
+  .action(createLbugLazyAction(() => import('./tool.js'), 'renameCommand'));
+
+program
   .command('check')
   .description('Run structural checks against the indexed graph')
   .option('--cycles', 'Detect circular imports and fail when any are found')

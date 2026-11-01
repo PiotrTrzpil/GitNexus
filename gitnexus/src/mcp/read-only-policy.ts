@@ -29,7 +29,8 @@ const READ_ONLY_RENAME_SUMMARY =
 const READ_ONLY_RENAME_DESCRIPTION = `Preview a rename using the indexed graph and GitNexus's own semantic layer in the current checkout. Preview-only in MCP read-only mode: dry_run must be omitted or true, and any other value is rejected before dispatch. No file is ever written.
 Graph identities and language-provider scope resolution select exact UTF-16 name spans. No compiler, language service, or text-search replacement is used.
 Pass symbol_uid from context() to select the declaration. Unsupported syntax, ambiguous bindings, stale declarations, and incomplete occurrence coverage fail closed.
-Returns result_version:2 with semantic_edits, exact UTF-16 spans, and coverage describing the indexed source scope and limitations. Ambiguous symbol_name returns context()'s ranked candidates; re-call with symbol_uid.`;
+Returns result_version:2 with semantic_edits, exact UTF-16 spans, and coverage describing the indexed source scope and limitations. Ambiguous symbol_name returns context()'s ranked candidates; re-call with symbol_uid.
+type:"file" or "directory" (with path and new_name as destination) previews a file/directory move and the TS/JS import edits it would make; it is likewise preview-only here and nothing is moved.`;
 
 const MCP_READ_ONLY_ALIASES = new Set(['search', 'explore', 'overview']);
 

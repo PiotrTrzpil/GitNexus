@@ -59,6 +59,7 @@ const allHelpCommands = [
   ['impact'],
   ['cypher'],
   ['detect-changes'],
+  ['rename'],
   ['eval-server'],
   ['embeddings'],
   ['embeddings', 'install'],

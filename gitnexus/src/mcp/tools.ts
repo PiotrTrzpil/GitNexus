@@ -127,6 +127,17 @@ const RENAME_PROPERTIES: ToolDefinition['inputSchema']['properties'] = {
   symbol_uid: { type: 'string', description: 'Direct symbol UID from prior tool results' },
   new_name: { type: 'string', description: 'The new identifier for the symbol' },
   file_path: { type: 'string', description: 'File path to disambiguate common names' },
+  type: {
+    type: 'string',
+    enum: ['symbol', 'file', 'directory'],
+    default: 'symbol',
+    description:
+      '"symbol" (default), or "file"/"directory" to move one: path is the source, new_name the destination, repo-relative.',
+  },
+  path: {
+    type: 'string',
+    description: 'Source path to move (type "file" or "directory").',
+  },
 };
 
 export const GITNEXUS_TOOLS: ToolDefinition[] = [
@@ -514,7 +525,9 @@ A graph too large to analyze at all returns \`{ error, truncated: true }\` with 
     description: `Rename using the indexed graph and GitNexus's own semantic layer. Previews by default: dry_run omitted or true never writes; dry_run:false requires the plan_token returned by a successful preview and applies exactly that captured edit set after checking source snapshots and targets. Preview first, review semantic_edits and coverage, then re-call with dry_run:false and plan_token.
 Pass symbol_uid from context() to select the declaration. Unsupported syntax, ambiguous bindings, and incomplete coverage fail closed; no compiler or text-search fallback is used.
 Returns result_version:2 with semantic_edits (occurrence count), exact UTF-16 spans, indexed-source coverage, and explicit planning/application status. Preview plan_token is single-use, expires after 15 minutes or a server restart, and can be evicted when retained previews reach 16 plans or 64 MiB. Apply rejects changed sources (including untracked files), source-file inventories, graph targets, repositories, and destination names; it never replans edits. Legacy graph_edits and text_search_edits are zero. Partial writes are not transactional: changes lists only landed edits, failed_files the file that failed, and unattempted_files later files never touched; reconcile and preview again before retrying.
-Ambiguous symbol_name returns context()'s ranked candidates and totalCandidates verbatim; re-call with symbol_uid. After application, run tests and detect_changes().`,
+Ambiguous symbol_name returns context()'s ranked candidates and totalCandidates verbatim; re-call with symbol_uid. After application, run tests and detect_changes().
+
+MOVE: type:"file"|"directory" with path (source) and new_name (destination path) moves it and rewrites TS/JS imports repo-wide, same preview/plan_token/apply protocol (edits, files_moved; stale sources fail plan_stale). Python is unsupported (unsupported_language, nothing touched).`,
     annotations: DESTRUCTIVE_TOOL_ANNOTATIONS,
     inputSchema: {
       type: 'object',

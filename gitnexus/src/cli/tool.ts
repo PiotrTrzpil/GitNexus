@@ -398,6 +398,56 @@ export async function detectChangesCommand(options?: {
   output(result, formatDetectChangesResult);
 }
 
+/**
+ * `gitnexus rename <target> <new_name> [--type symbol|file|directory] [--apply]`.
+ *
+ * Always previews first. With --apply the plan_token of that preview is carried
+ * into the apply call, so the applied edits are exactly the ones just computed
+ * (the engine still refuses if sources changed in between).
+ */
+export async function renameCommand(
+  target: string,
+  newName: string,
+  options?: {
+    repo?: string;
+    uid?: string;
+    file?: string;
+    type?: string;
+    apply?: boolean;
+  },
+): Promise<void> {
+  const type = options?.type ?? 'symbol';
+  if (!['symbol', 'file', 'directory'].includes(type)) {
+    process.stderr.write(`Invalid --type "${type}": use symbol, file or directory.\n`);
+    process.exitCode = 1;
+    return;
+  }
+  if (!target?.trim() || !newName?.trim()) {
+    process.stderr.write(
+      'Usage: gitnexus rename <target> <new_name> [--type symbol|file|directory] [--apply]\n',
+    );
+    process.exitCode = 1;
+    return;
+  }
+
+  const backend = await getBackend();
+  const base: Record<string, unknown> = {
+    new_name: newName,
+    type,
+    repo: options?.repo,
+    ...(type === 'symbol'
+      ? { symbol_name: options?.uid ? undefined : target, symbol_uid: options?.uid, file_path: options?.file }
+      : { path: target }),
+  };
+  const preview = await backend.callTool('rename', { ...base, dry_run: true });
+  const token = (preview as { plan_token?: unknown } | undefined)?.plan_token;
+  if (!options?.apply || preview?.error || preview?.status !== 'success' || typeof token !== 'string') {
+    output(preview);
+    return;
+  }
+  output(await backend.callTool('rename', { ...base, dry_run: false, plan_token: token }));
+}
+
 export async function checkCommand(options?: {
   cycles?: boolean;
   json?: boolean;
