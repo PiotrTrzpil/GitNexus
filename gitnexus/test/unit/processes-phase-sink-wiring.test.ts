@@ -205,8 +205,7 @@ describe('processes phase — truncation is disclosed proportionately (#2899)', 
   /**
    * Trips ONLY the whole-flow ceilings: 40 independent three-step chains against
    * a `maxProcesses` of 20 (the floor `computeDynamicMaxProcesses` gives 120
-   * symbols), so half the deduplicated flows are dropped outright and the trace
-   * quota stops the loop with entry points still unvisited. Nothing here is
+   * symbols), so half the deduplicated flows are dropped at maxProcesses. Nothing here is
    * deep enough or wide enough to hit `maxTraceDepth` or `maxBranching`.
    */
   const flowsMissing = (): KnowledgeGraph => {
@@ -248,7 +247,6 @@ describe('processes phase — truncation is disclosed proportionately (#2899)', 
     expect(truncation.calleesDropped).toBeGreaterThan(0);
     // ...and truncated in NO other way, so the assertions below are attributable.
     expect(truncation.entryPointCandidatesDropped).toBe(0);
-    expect(truncation.entryPointsUnexplored).toBe(0);
     expect(truncation.processesDropped).toBe(0);
 
     const lines = records.filter((r) => PROCESS_LINES.test(String(r.msg)));
@@ -261,7 +259,6 @@ describe('processes phase — truncation is disclosed proportionately (#2899)', 
     const { truncation } = output.processResult.stats;
 
     expect(truncation.processesDropped).toBeGreaterThan(0);
-    expect(truncation.entryPointsUnexplored).toBeGreaterThan(0);
     // Neither shape ceiling fired here, so the warn is attributable to the
     // whole-flow counters and not to a chain that merely ran long.
     expect(truncation.tracesDepthCapped).toBe(0);
@@ -288,15 +285,14 @@ describe('processes phase — truncation is disclosed proportionately (#2899)', 
   it('reports the entry-point candidate cap in the warn payload', async () => {
     // The dominant ceiling on any real repository, and the one that stays in the
     // loud set precisely because it is the only counter that grows with repo
-    // size — `entryPointsUnexplored` and `processesDropped` can only fire while
-    // `maxProcesses` is small enough to bind.
+    // size. Pinned with an explicit pool of 200; the default scales (next test).
     const graph = createKnowledgeGraph();
     for (let c = 0; c < 205; c++) {
       for (let i = 0; i < 3; i++) addFn(graph, `func:m${c}_${i}`);
       for (let i = 0; i < 2; i++) addCallEdge(graph, `func:m${c}_${i}`, `func:m${c}_${i + 1}`);
     }
 
-    const { output, records } = await runCaptured(graph);
+    const { output, records } = await runCaptured(graph, { maxEntryPointCandidates: 200 });
 
     expect(output.processResult.stats.truncation.entryPointCandidatesDropped).toBe(210);
     const lines = records.filter((r) => PROCESS_LINES.test(String(r.msg)));
@@ -307,15 +303,25 @@ describe('processes phase — truncation is disclosed proportionately (#2899)', 
     expect(lines[0]?.effectiveLimits).toEqual(
       expect.objectContaining({
         maxEntryPointCandidates: 200,
-        maxProcessTraces: expect.any(Number),
       }),
     );
+  });
+
+  it('scales the default entry-point pool with the repository instead of capping at 200', async () => {
+    const graph = createKnowledgeGraph();
+    for (let c = 0; c < 205; c++) {
+      for (let i = 0; i < 3; i++) addFn(graph, `func:s${c}_${i}`);
+      for (let i = 0; i < 2; i++) addCallEdge(graph, `func:s${c}_${i}`, `func:s${c}_${i + 1}`);
+    }
+    const { output } = await runCaptured(graph);
+    // 205 chains x 2 callers = 410 candidate entry points, all ranked in.
+    expect(output.processResult.stats.entryPointsFound).toBe(410);
+    expect(output.processResult.stats.truncation.entryPointCandidatesDropped).toBe(0);
   });
 
   it('honors an explicit maxProcesses instead of the dynamic formula (#3313)', async () => {
     const { output } = await runCaptured(flowsMissing(), { maxProcesses: 40 });
     expect(output.processResult.stats.truncation.processesDropped).toBe(0);
-    expect(output.processResult.stats.truncation.entryPointsUnexplored).toBe(0);
   });
 
   it('clears the entry-point drop when the candidate cap is raised (#3313 AE2)', async () => {
@@ -334,7 +340,10 @@ describe('processes phase — truncation is disclosed proportionately (#2899)', 
       for (let i = 0; i < 3; i++) addFn(graph, `func:s${c}_${i}`);
       for (let i = 0; i < 2; i++) addCallEdge(graph, `func:s${c}_${i}`, `func:s${c}_${i + 1}`);
     }
-    const { output, records } = await runCaptured(graph, { maxProcesses: 1000 });
+    const { output, records } = await runCaptured(graph, {
+      maxProcesses: 1000,
+      maxEntryPointCandidates: 200,
+    });
     expect(output.processResult.stats.truncation.entryPointCandidatesDropped).toBe(210);
     const lines = records.filter((r) => PROCESS_LINES.test(String(r.msg)));
     expect(lines.map((r) => r.level)).toEqual([40]);
@@ -350,7 +359,7 @@ describe('processes phase — truncation is disclosed proportionately (#2899)', 
     // 210 chains × 3 = 630 symbols. Dynamic maxProcesses needs ≥ 210, so pad.
     for (let i = 0; i < 1470; i++) addFn(graph, `func:pad_${i}`);
 
-    const baseline = await runCaptured(graph);
+    const baseline = await runCaptured(graph, { maxEntryPointCandidates: 200 });
     const raised = await runCaptured(graph, {
       maxEntryPointCandidates: 420,
       maxProcesses: 300,

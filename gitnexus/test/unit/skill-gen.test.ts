@@ -129,7 +129,6 @@ function buildPipelineResult(opts: {
           truncation: {
             truncated: false,
             entryPointCandidatesDropped: 0,
-            entryPointsUnexplored: 0,
             walksCutByBudget: 0,
             tracesDepthCapped: 0,
             calleesDropped: 0,

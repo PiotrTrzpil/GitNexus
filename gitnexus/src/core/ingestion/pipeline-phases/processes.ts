@@ -98,7 +98,10 @@ export const processesPhase: PipelinePhase<ProcessesOutput> = {
       {},
     );
     let symbolCount = 0;
-    if (resolvedBudget.maxProcesses === undefined) {
+    if (
+      resolvedBudget.maxProcesses === undefined ||
+      !resolvedBudget.overridden.maxEntryPointCandidates
+    ) {
       ctx.graph.forEachNode((n) => {
         if (n.label !== 'File') symbolCount++;
       });
@@ -164,7 +167,7 @@ export const processesPhase: PipelinePhase<ProcessesOutput> = {
     //
     // But it is only a `warn` when a ceiling removed WHOLE FLOWS from the
     // report. That split is the one `ProcessTruncationStats` already documents —
-    // "unexplored entry points mean whole flows are missing, while a
+    // "dropped entry points mean whole flows are missing, while a
     // depth-capped trace means a flow is present but shorter than it really is"
     // — and it is what keeps the line worth reading. Warning on every counter
     // meant warning on every run: at the shipped defaults (`maxBranching: 4`,
@@ -177,14 +180,13 @@ export const processesPhase: PipelinePhase<ProcessesOutput> = {
     // an already-represented region was walked. A warning that always fires is a
     // warning nobody reads, so those three go to `debug`.
     //
-    // `entryPointCandidatesDropped` IS in the loud set even though it fires on
-    // any repository with more than 200 candidates, because it is the only
-    // ceiling that grows with the repository: `entryPointsUnexplored` and
-    // `processesDropped` can only fire while `maxProcesses` (symbols / 10) is
-    // small enough to bind, so gating on those two alone would go quiet on
-    // exactly the large repositories where 200 of several thousand entry points
-    // is the thinnest sample. The message leads with that ratio so the line
-    // carries a fact rather than an alarm.
+    // `entryPointCandidatesDropped` and `processesDropped` are the loud set.
+    // Every ranked entry point is traced, so a flow is only missing when the
+    // entry-point pool was capped (the default pool scales with the repository,
+    // so that needs an explicit `--max-entry-point-candidates`) or when more
+    // distinct deduplicated flows exist than `maxProcesses` (symbols / 10) keeps.
+    // The latter is a ranked sample, not an accident, and the message says how
+    // many did not fit.
     //
     // `stats.truncation` on the RESULT is untouched and still reports all six
     // counters; this only decides which of them are loud.
@@ -192,13 +194,12 @@ export const processesPhase: PipelinePhase<ProcessesOutput> = {
     const entryPointCandidates =
       processResult.stats.entryPointsFound + truncation.entryPointCandidatesDropped;
     const flowsMissing =
-      truncation.entryPointCandidatesDropped > 0 ||
-      truncation.entryPointsUnexplored > 0 ||
-      truncation.processesDropped > 0;
-    const effectiveLimits = processDetectionEffectiveLimits(
-      detectionConfig.maxProcesses,
-      resolvedBudget,
-    );
+      truncation.entryPointCandidatesDropped > 0 || truncation.processesDropped > 0;
+    const effectiveLimits = {
+      ...processDetectionEffectiveLimits(detectionConfig.maxProcesses, resolvedBudget),
+      // The pool actually used, which scales with the repo unless overridden.
+      maxEntryPointCandidates: detectionConfig.maxEntryPointCandidates,
+    };
     const remedies = formatWholeFlowsMissingRemedies(
       truncation,
       effectiveLimits,
@@ -206,7 +207,6 @@ export const processesPhase: PipelinePhase<ProcessesOutput> = {
     );
     const shape =
       `${truncation.entryPointCandidatesDropped} of ${entryPointCandidates} candidate entry point(s) never ranked in, ` +
-      `${truncation.entryPointsUnexplored} ranked entry point(s) never traced, ` +
       `${truncation.processesDropped} deduplicated flow(s) dropped at maxProcesses, ` +
       `${truncation.tracesDepthCapped} trace(s) cut at maxTraceDepth, ` +
       `${truncation.calleesDropped} callee(s) skipped at maxBranching, ` +

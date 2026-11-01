@@ -90,12 +90,6 @@ export type ProcessDetectionEffectiveLimits = {
   maxProcessBranching: number;
   maxProcessTraceDepth: number;
   maxEntryPointCandidates: number;
-  /**
-   * Pre-entry gate: `processProcesses` does not start the next entry once
-   * collected traces already reach `maxProcesses * 2`. One started entry can
-   * still append every trace `traceFromEntryPoint` returns.
-   */
-  maxProcessTraces: number;
 };
 
 export type InvalidBudgetHandler = (knob: string, raw: string) => void;
@@ -248,7 +242,15 @@ export const buildProcessDetectionPhaseConfig = (
   maxProcesses: resolved.maxProcesses ?? computeDynamicMaxProcesses(symbolCount),
   maxBranching: resolved.maxProcessBranching,
   maxTraceDepth: resolved.maxProcessTraceDepth,
-  maxEntryPointCandidates: resolved.maxEntryPointCandidates,
+  // Not overridden: the pool scales with the repository instead of the fixed
+  // baseline, because every ranked entry point is now traced (cost per entry is
+  // bounded by maxBranching x maxTraceDepth) and a fixed 200 sampled away most
+  // flows on large repos. Entry points are a subset of the symbols, so
+  // `symbolCount` is a ceiling, never a restriction. An explicit override keeps
+  // its exact value.
+  maxEntryPointCandidates: resolved.overridden.maxEntryPointCandidates
+    ? resolved.maxEntryPointCandidates
+    : Math.max(resolved.maxEntryPointCandidates, symbolCount),
   minSteps: PROCESS_DETECTION_BUDGET_DEFAULTS.minSteps,
 });
 
@@ -260,13 +262,12 @@ export const processDetectionEffectiveLimits = (
   maxProcessBranching: resolved.maxProcessBranching,
   maxProcessTraceDepth: resolved.maxProcessTraceDepth,
   maxEntryPointCandidates: resolved.maxEntryPointCandidates,
-  maxProcessTraces: maxProcesses * 2,
 });
 
 export const formatWholeFlowsMissingRemedies = (
   truncation: Pick<
     ProcessTruncationStats,
-    'entryPointCandidatesDropped' | 'entryPointsUnexplored' | 'processesDropped'
+    'entryPointCandidatesDropped' | 'processesDropped'
   >,
   limits: ProcessDetectionEffectiveLimits,
   observedEntryPointCandidates: number,
@@ -278,11 +279,11 @@ export const formatWholeFlowsMissingRemedies = (
         `(this run ranked ${observedEntryPointCandidates} candidate(s))`,
     );
   }
-  if (truncation.entryPointsUnexplored > 0 || truncation.processesDropped > 0) {
+  if (truncation.processesDropped > 0) {
     parts.push(
       `${PROCESS_DETECTION_CLI_FLAGS.maxProcesses} ` +
-        `(this run used ${limits.maxProcesses}; next entry is skipped once ` +
-        `collected traces reach ${limits.maxProcessTraces})`,
+        `(this run used ${limits.maxProcesses}; ${truncation.processesDropped} ` +
+        `deduplicated flow(s) did not fit)`,
     );
   }
   return parts.length === 0 ? '' : ` Raise ${parts.join('; ')}.`;

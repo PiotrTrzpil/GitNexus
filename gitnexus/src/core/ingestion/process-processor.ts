@@ -30,7 +30,7 @@ export interface ProcessDetectionConfig {
   maxBranching: number; // Max branches to follow per node (default: 4)
   maxProcesses: number; // Maximum processes to detect (default: 75)
   minSteps: number; // Minimum steps for a valid process (default: 3)
-  maxEntryPointCandidates: number; // Ranked entry-point pool (default: 200)
+  maxEntryPointCandidates: number; // Ranked entry-point pool (default: scales with repo size, see buildProcessDetectionPhaseConfig)
 }
 
 export const DEFAULT_CONFIG: ProcessDetectionConfig = {
@@ -40,6 +40,14 @@ export const DEFAULT_CONFIG: ProcessDetectionConfig = {
   minSteps: PROCESS_DETECTION_BUDGET_DEFAULTS.minSteps, // 3+ steps = genuine multi-hop flow (2-step is just "A calls B")
   maxEntryPointCandidates: PROCESS_DETECTION_BUDGET_DEFAULTS.maxEntryPointCandidates,
 };
+
+/**
+ * Traces kept per entry point before deduplication. `traceFromEntryPoint`
+ * returns up to `maxBranching * 3` (12 by default); the extra ones are variants
+ * of the same few flows and dedup/endpoint-dedup discards most of them anyway.
+ * Capping here keeps the list that dedup sees linear in the entry-point count.
+ */
+const MAX_TRACES_PER_ENTRY = 3;
 
 // ============================================================================
 // TYPES
@@ -84,7 +92,7 @@ export interface ProcessStep {
  * recording because the comment deriving `truncated` claimed "a new ceiling
  * added later cannot be forgotten here" while an EXISTING one already had been:
  * `findEntryPoints` ranks every scoring candidate and then keeps 200, so
- * `entryPointsUnexplored` — computed over the list it RETURNS — could only ever
+ * `entryPointsFound` — computed over the list it RETURNS — could only ever
  * see the survivors. On any repository with more than 200 candidate entry
  * points that slice is the dominant ceiling, and it was invisible.
  */
@@ -97,8 +105,6 @@ export interface ProcessTruncationStats {
    * Counted BEFORE the slice, so it sees what `entryPointsFound` cannot.
    */
   entryPointCandidatesDropped: number;
-  /** Entry points never traced at all — the trace-collection loop stopped first. */
-  entryPointsUnexplored: number;
   /** Entry-point walks abandoned with branches still on the stack. */
   walksCutByBudget: number;
   /** Traces that end at `maxTraceDepth`, i.e. are a PREFIX of a longer flow. */
@@ -126,7 +132,6 @@ export interface ProcessDetectionResult {
 const emptyTruncation = (): ProcessTruncationStats => ({
   truncated: false,
   entryPointCandidatesDropped: 0,
-  entryPointsUnexplored: 0,
   walksCutByBudget: 0,
   tracesDepthCapped: 0,
   calleesDropped: 0,
@@ -170,7 +175,7 @@ export const processProcesses = async (
   for (const n of knowledgeGraph.iterNodes()) nodeMap.set(n.id, n);
 
   // Declared before Step 1 because `findEntryPoints` has a ceiling of its own
-  // (`cfg.maxEntryPointCandidates`, default 200) and reports it through the same record.
+  // (`cfg.maxEntryPointCandidates`) and reports it through the same record.
   const truncation = emptyTruncation();
 
   // Step 1: Find entry points (functions that call others but have few callers)
@@ -184,35 +189,35 @@ export const processProcesses = async (
 
   onProgress?.(`Found ${entryPoints.length} entry points, tracing flows...`, 20);
 
-  onProgress?.(`Found ${entryPoints.length} entry points, tracing flows...`, 20);
-
-  // Step 2: Trace processes from each entry point
+  // Step 2: Trace EVERY ranked entry point.
+  //
+  // This loop used to stop once `allTraces` reached `maxProcesses * 2`, so a
+  // ranked entry point past that point was never looked at and whole flows
+  // were missing. Tracing cost per entry point is already bounded
+  // (`traceFromEntryPoint` spends at most `maxBranching * 3` traces, each at
+  // most `maxTraceDepth` long), so tracing all of them is linear in the number
+  // of entry points. `maxProcesses` is applied once, after dedup, where
+  // ranking decides what a reader sees.
+  //
+  // Each entry point keeps only its best `MAX_TRACES_PER_ENTRY` traces (sink-
+  // terminated first, then deepest, then path) so the list that dedup and
+  // ranking see stays at most `MAX_TRACES_PER_ENTRY * entryPoints` long.
   const allTraces: string[][] = [];
 
-  let tracedEntryPoints = 0;
-  for (let i = 0; i < entryPoints.length && allTraces.length < cfg.maxProcesses * 2; i++) {
+  for (let i = 0; i < entryPoints.length; i++) {
     const entryId = entryPoints[i];
-    const traces = traceFromEntryPoint(entryId, callsEdges, cfg, isSink, truncation);
-    tracedEntryPoints = i + 1;
+    const traces = traceFromEntryPoint(entryId, callsEdges, cfg, isSink, truncation).filter(
+      (t) => t.length >= cfg.minSteps,
+    );
+    for (const t of keepBestTraces(traces, isSink, MAX_TRACES_PER_ENTRY)) allTraces.push(t);
 
-    // Filter out traces that are too short
-    traces.filter((t) => t.length >= cfg.minSteps).forEach((t) => allTraces.push(t));
-
-    if (i % 10 === 0) {
+    if (i % 100 === 0) {
       onProgress?.(
         `Tracing entry point ${i + 1}/${entryPoints.length}...`,
         20 + (i / entryPoints.length) * 40,
       );
     }
   }
-  // The loop exits on the TRACE quota, not on running out of entry points, so
-  // the remainder are not "no flows found" — they were never looked at.
-  //
-  // Counted over the list `findEntryPoints` RETURNS, which is already capped at
-  // `maxEntryPointCandidates`; candidates beyond that cap are invisible here
-  // by construction and are reported separately as
-  // `entryPointCandidatesDropped`.
-  truncation.entryPointsUnexplored = entryPoints.length - tracedEntryPoints;
 
   onProgress?.(`Found ${allTraces.length} traces, deduplicating...`, 60);
 
@@ -411,7 +416,6 @@ export const processProcesses = async (
   // that every cap in the file actually has one.
   truncation.truncated =
     truncation.entryPointCandidatesDropped > 0 ||
-    truncation.entryPointsUnexplored > 0 ||
     truncation.walksCutByBudget > 0 ||
     truncation.tracesDepthCapped > 0 ||
     truncation.calleesDropped > 0 ||
@@ -584,7 +588,7 @@ const findEntryPoints = (
   // how much of a repository process detection ever looks at: on anything with
   // more scoring candidates than `maxEntryPointCandidates` the reported flows
   // are a sample of the top-ranked ones, and every downstream count
-  // (`entryPointsFound`, `entryPointsUnexplored`) is computed over the
+  // (`entryPointsFound`) is computed over the
   // survivors, so none of them can see what was cut here.
   if (truncation !== undefined && sorted.length > maxEntryPointCandidates) {
     truncation.entryPointCandidatesDropped = sorted.length - maxEntryPointCandidates;
@@ -821,6 +825,27 @@ const sortByDepthThenPath = (traces: readonly string[][]): string[][] => {
   return decorated.map((d) => d.trace);
 };
 
+/**
+ * The best `limit` traces of ONE entry point: sink-terminated first (the same
+ * rule the final ranking applies), then deepest, then path order.
+ */
+const keepBestTraces = (
+  traces: readonly string[][],
+  isSink: (nodeId: string) => boolean,
+  limit: number,
+): string[][] => {
+  if (traces.length <= limit) return [...traces];
+  const decorated = traces.map((trace) => ({
+    trace,
+    sink: isSink(trace[trace.length - 1] ?? '') ? 1 : 0,
+    key: traceOrderKey(trace),
+  }));
+  decorated.sort(
+    (a, b) => b.sink - a.sink || b.trace.length - a.trace.length || compareOrderKeys(a.key, b.key),
+  );
+  return decorated.slice(0, limit).map((d) => d.trace);
+};
+
 // ============================================================================
 // HELPER: Deduplicate traces
 // ============================================================================
@@ -842,19 +867,18 @@ export const deduplicateTraces = (
   // representative is otherwise decided by insertion order.
   const sorted = sortByDepthThenPath(traces);
   const unique: string[][] = [];
-  // Keys for `unique`, built ONCE per surviving trace rather than once per
-  // COMPARISON. The join used to sit inside the `some()` callback below, so
-  // every already-kept trace had its key rebuilt from scratch against every
-  // candidate — O(T*U) joins of O(depth * id-length) characters, and it is that
-  // allocation, not the substring scan, that dominates the pass.
+  // Every CONTIGUOUS sub-path of every kept trace, keyed by node ids joined with
+  // NUL. A candidate is redundant exactly when its own key is in this set, so
+  // the pass is one hash lookup per trace instead of a substring scan against
+  // every kept trace (it was O(T*U)). Memory is O(kept * depth^2) keys, with
+  // depth bounded by `maxTraceDepth`.
   //
-  // Nothing about breadth-first search made that safe; it only kept the cost
-  // small by keeping traces short. Measured on this repo, the walk went from an
-  // average of 4.3 steps to 9.4 when D1 made it depth-first, which roughly
-  // doubles both the number of surviving traces and the length of every key —
-  // so the same quadratic that was affordable under BFS is ~6x the work under
-  // DFS. Hoisting the join removes the multiplication entirely.
-  const uniqueKeys: string[] = [];
+  // Keying on whole elements joined by a separator that cannot occur in a node
+  // id keeps the whole-step semantics of #2894: `['A','B']` is never found
+  // inside `['XA','B']`, because the key `A\0B` is not a sub-path key of
+  // `XA\0B`. (The old test got the same property by padding with `->` on both
+  // ends.) `traceOrderKey` documents why NUL is safe.
+  const covered = new Set<string>();
 
   for (const trace of sorted) {
     // A SINK-TERMINATED trace is never redundant (R3-6), even though it is by
@@ -864,34 +888,16 @@ export const deduplicateTraces = (
     // from ever being processes. Emitting one at the walk and deleting it one
     // step later would have been a no-op fix.
     const terminal = trace[trace.length - 1];
-    // PADDED with the separator on both ends, so `includes` can only match whole
-    // steps (#2894). Unpadded, the test is not anchored to a step boundary and a
-    // match may begin in the MIDDLE of a node id:
-    //
-    //   'X->AA->B'.includes('A->B')   ->  true
-    //
-    // which discards `A -> B` as redundant against a chain `A` is not a step of
-    // at all. Measured inert on every corpus tried — the collision needs one id
-    // to be a strict suffix of another, which real ids
-    // (`Function:<path>:<name>`) do not produce — but the predicate did not mean
-    // what the surrounding code says it means, and this is a function whose
-    // entire job is deciding what to delete.
-    //
-    // Note the encoding assumes `->` never appears IN a node id. A C++
-    // `operator->` would defeat the join regardless of padding; out of scope
-    // here, but the assumption is real.
-    const traceKey = `->${trace.join('->')}->`;
-    if (terminal !== undefined && isSink(terminal)) {
-      unique.push(trace);
-      uniqueKeys.push(traceKey);
+    if (!(terminal !== undefined && isSink(terminal)) && covered.has(traceOrderKey(trace))) {
       continue;
     }
-    // Check if this trace is a subset of any already-added trace
-    const isSubset = uniqueKeys.some((existingKey) => existingKey.includes(traceKey));
-
-    if (!isSubset) {
-      unique.push(trace);
-      uniqueKeys.push(traceKey);
+    unique.push(trace);
+    for (let start = 0; start < trace.length; start++) {
+      let key = '';
+      for (let end = start; end < trace.length; end++) {
+        key = end === start ? trace[end] : `${key}\u0000${trace[end]}`;
+        covered.add(key);
+      }
     }
   }
 
