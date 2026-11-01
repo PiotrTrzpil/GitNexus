@@ -8,6 +8,7 @@ import {
   isHardcodedIgnoredDirectory,
   loadIgnoreRules,
   createIgnoreFilter,
+  createWatchIgnorePredicate,
 } from '../../src/config/ignore-service.js';
 import { _captureLogger } from '../../src/core/logger.js';
 import * as git from '../../src/storage/git.js';
@@ -476,6 +477,53 @@ describe('.gitnexusignore negation overrides hardcoded DEFAULT_IGNORE_LIST (#771
     // the directory-descent level, so ingestion never walks in.
     expect(filter.ignored(mkPath('__tests__/generated/foo.ts'))).toBe(true);
     expect(filter.childrenIgnored(mkPath('__tests__/generated'))).toBe(true);
+  });
+
+  describe('binary / never-index file types cannot be un-ignored', () => {
+    const png = 'docs/assets/logo.png';
+
+    it('createIgnoreFilter keeps a PNG ignored despite `!docs/assets/*.png`', async () => {
+      await fs.writeFile(path.join(tmpDir, '.gitignore'), '*.png\n!docs/assets/*.png\n');
+      const filter = await createIgnoreFilter(tmpDir);
+      expect(filter.ignored(mkPath(png))).toBe(true);
+    });
+
+    it('createIgnoreFilter keeps a PNG ignored when the negation is in .gitnexusignore', async () => {
+      await fs.writeFile(path.join(tmpDir, '.gitnexusignore'), '!docs/assets/\n!*.png\n');
+      const filter = await createIgnoreFilter(tmpDir);
+      expect(filter.ignored(mkPath(png))).toBe(true);
+    });
+
+    it('createIgnoreFilter keeps a PNG ignored when a nested .gitignore negates it', async () => {
+      await fs.mkdir(path.join(tmpDir, 'docs'), { recursive: true });
+      await fs.writeFile(path.join(tmpDir, '.gitignore'), '*.png\n');
+      await fs.writeFile(path.join(tmpDir, 'docs', '.gitignore'), '!assets/*.png\n');
+      const filter = await createIgnoreFilter(tmpDir);
+      expect(filter.ignored(mkPath(png))).toBe(true);
+    });
+
+    it('createIgnoreFilter keeps a lock file ignored despite `!package-lock.json`', async () => {
+      await fs.writeFile(path.join(tmpDir, '.gitnexusignore'), '!package-lock.json\n');
+      const filter = await createIgnoreFilter(tmpDir);
+      expect(filter.ignored(mkPath('package-lock.json'))).toBe(true);
+    });
+
+    it('createWatchIgnorePredicate keeps a PNG ignored despite `!docs/assets/*.png`', async () => {
+      await fs.writeFile(path.join(tmpDir, '.gitignore'), '*.png\n!docs/assets/*.png\n');
+      const isIgnored = await createWatchIgnorePredicate(tmpDir);
+      expect(isIgnored(png)).toBe(true);
+      expect(isIgnored(path.join(tmpDir, png))).toBe(true);
+    });
+
+    it('directory negations still re-include source files next to the PNG', async () => {
+      await fs.writeFile(path.join(tmpDir, '.gitnexusignore'), '!__tests__/\n');
+      const filter = await createIgnoreFilter(tmpDir);
+      const isIgnored = await createWatchIgnorePredicate(tmpDir);
+      expect(filter.ignored(mkPath('__tests__/a.test.ts'))).toBe(false);
+      expect(isIgnored('__tests__/a.test.ts')).toBe(false);
+      expect(filter.ignored(mkPath('__tests__/logo.png'))).toBe(true);
+      expect(isIgnored('__tests__/logo.png')).toBe(true);
+    });
   });
 
   it('shouldIgnorePath (raw hardcoded check) is unchanged — wiki / external callers unaffected', async () => {

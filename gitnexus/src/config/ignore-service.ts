@@ -316,6 +316,47 @@ const IGNORED_FILES = new Set([
   '.env.example',
 ]);
 
+/**
+ * File-name rules for files that are never source: binary and media
+ * extensions, lock files, minified/bundled/generated output (the
+ * IGNORED_EXTENSIONS and IGNORED_FILES lists). Unlike the directory defaults,
+ * these cannot be re-included with a `!pattern` in `.gitignore` or
+ * `.gitnexusignore`: a repo that tracks `docs/assets/*.png` (`*.png` +
+ * `!docs/assets/*.png`) wants git to keep them, not the index to parse them.
+ * Both `createIgnoreFilter` and `createWatchIgnorePredicate` apply this
+ * before they consult any negation.
+ */
+const isNeverIndexedFile = (filePath: string): boolean => {
+  const fileName = filePath.replace(/\\/g, '/').split('/').pop() ?? '';
+  const fileNameLower = fileName.toLowerCase();
+
+  // Check exact filename matches
+  if (IGNORED_FILES.has(fileName) || IGNORED_FILES.has(fileNameLower)) {
+    return true;
+  }
+
+  // Check extension
+  const lastDotIndex = fileNameLower.lastIndexOf('.');
+  if (lastDotIndex !== -1) {
+    const ext = fileNameLower.substring(lastDotIndex);
+    if (IGNORED_EXTENSIONS.has(ext)) return true;
+
+    // Handle compound extensions like .min.js, .bundle.js
+    const secondLastDot = fileNameLower.lastIndexOf('.', lastDotIndex - 1);
+    if (secondLastDot !== -1) {
+      const compoundExt = fileNameLower.substring(secondLastDot);
+      if (IGNORED_EXTENSIONS.has(compoundExt)) return true;
+    }
+  }
+
+  // Ignore files that look like generated/bundled code
+  return (
+    fileNameLower.includes('.bundle.') ||
+    fileNameLower.includes('.chunk.') ||
+    fileNameLower.includes('.generated.')
+  );
+};
+
 // The hardcoded DEFAULT_IGNORE_LIST is the "safety net" default: directories
 // that are almost never source code (node_modules, .git, dist, __tests__,
 // etc.). Users who legitimately need to index one of these can negate the
@@ -351,35 +392,7 @@ export const shouldIgnorePath = (filePath: string): boolean => {
     }
   }
 
-  // Check exact filename matches
-  if (IGNORED_FILES.has(fileName) || IGNORED_FILES.has(fileNameLower)) {
-    return true;
-  }
-
-  // Check extension
-  const lastDotIndex = fileNameLower.lastIndexOf('.');
-  if (lastDotIndex !== -1) {
-    const ext = fileNameLower.substring(lastDotIndex);
-    if (IGNORED_EXTENSIONS.has(ext)) return true;
-
-    // Handle compound extensions like .min.js, .bundle.js
-    const secondLastDot = fileNameLower.lastIndexOf('.', lastDotIndex - 1);
-    if (secondLastDot !== -1) {
-      const compoundExt = fileNameLower.substring(secondLastDot);
-      if (IGNORED_EXTENSIONS.has(compoundExt)) return true;
-    }
-  }
-
-  // Ignore files that look like generated/bundled code
-  if (
-    fileNameLower.includes('.bundle.') ||
-    fileNameLower.includes('.chunk.') ||
-    fileNameLower.includes('.generated.')
-  ) {
-    return true;
-  }
-
-  return false;
+  return isNeverIndexedFile(normalizedPath);
 };
 
 /** Check if a directory name is in the hardcoded ignore list */
@@ -492,6 +505,8 @@ export const createWatchIgnorePredicate = async (
     const rel = nodePath.relative(repoRoot, absolute).replace(/\\/g, '/');
     if (!rel) return false;
     if (rel === '..' || rel.startsWith('../') || nodePath.isAbsolute(rel)) return true;
+    // Binary/lock/generated file types are never source; no negation rescues them.
+    if (isNeverIndexedFile(rel)) return true;
 
     if (ig && hasExplicitUnignore(ig, rel) && !ig.ignores(isDirectory ? `${rel}/` : rel)) {
       return false;
@@ -726,6 +741,9 @@ export const createIgnoreFilter = async (repoPath: string, options?: IgnoreOptio
       // native separators on Windows when called through glob.
       const rel = p.relative().replace(/\\/g, '/');
       if (!rel) return false;
+      // Binary/lock/generated file types are never source; no negation
+      // (root, nested or .gitnexusignore) rescues them.
+      if (isNeverIndexedFile(rel)) return true;
       // Nested .gitignore files below the root (#2675). .gitnexusignore
       // comes first, then the deepest nested .gitignore, which outranks the
       // root .gitignore as in git. The nested matcher preserves independent
