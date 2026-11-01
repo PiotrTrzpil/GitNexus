@@ -372,6 +372,7 @@ export const zhCN = {
   'help.option.trace.includeTests': '遍历时包含测试文件中的符号（默认：false）',
   'help.option.detectChanges.scope': '分析范围：unstaged、staged、all 或 compare',
   'help.option.detectChanges.baseRef': 'compare 范围的分支/提交（例如 main）',
+  'help.option.compactVerbose': '输出完整的结构化 JSON，而不是精简文本',
   'help.option.detectChanges.detail': '使用 "symbols" 获取带破坏性变更标记的符号级语义差异',
   'help.option.detectChanges.limit': '最多返回的已变更符号数',
   'help.option.cypher.limit': '最多返回的结果行数',
