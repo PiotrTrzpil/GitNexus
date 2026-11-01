@@ -184,7 +184,7 @@ export async function contextCommand(
     uid?: string;
     limit?: string;
     content?: boolean;
-    verbose?: boolean;
+    compact?: boolean;
   },
 ): Promise<void> {
   // Reject a `--`-prefixed uid swallowed from a following flag (see impactCommand).
@@ -225,15 +225,16 @@ export async function contextCommand(
       result.typed_properties = result.typed_properties.slice(0, limit);
     if (Array.isArray(result.processes)) result.processes = result.processes.slice(0, limit);
   }
-  if (options?.verbose) {
-    output(result);
-  } else {
-    // Compact text by default; not-found and ambiguous results stay JSON.
+  if (options?.compact) {
+    // Compact text on request (CLI output is JSON by default: scripts parse it).
+    // Not-found and ambiguous results stay JSON.
     output(
       result,
       (data) =>
         compactContext(data) ?? JSON.stringify(data, null, process.stdout.isTTY ? 2 : undefined),
     );
+  } else {
+    output(result);
   }
 }
 
@@ -254,7 +255,7 @@ export async function impactCommand(
     offset?: string;
     summaryOnly?: boolean;
     maxTokens?: string;
-    verbose?: boolean;
+    compact?: boolean;
   },
 ): Promise<void> {
   // A `--`-prefixed uid means Commander swallowed a following flag as the uid
@@ -320,12 +321,12 @@ export async function impactCommand(
         result.affected_routes = result.affected_routes.slice(0, parsedLimit);
     }
     const shaped = shapeImpactForAgent(result, maxTokens);
-    if (options?.verbose) {
+    if (options?.compact) {
+      // Compact text on request; errors, ambiguity and PDG/group shapes stay JSON.
+      output(shaped, (data) => compactImpact(data) ?? JSON.stringify(data));
+    } else {
       // The budget is measured on compact JSON, even when stdout is a terminal.
       output(shaped, maxTokens === undefined ? undefined : (data) => JSON.stringify(data));
-    } else {
-      // Compact text by default; errors, ambiguity and PDG/group shapes stay JSON.
-      output(shaped, (data) => compactImpact(data) ?? JSON.stringify(data));
     }
   } catch (err: unknown) {
     if (err instanceof ImpactBudgetExceededError) {

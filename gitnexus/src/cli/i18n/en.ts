@@ -410,7 +410,7 @@ export const en = {
   'help.option.trace.includeTests': 'Traverse through test-file symbols (default: false)',
   'help.option.detectChanges.scope': 'What to analyze: unstaged, staged, all, or compare',
   'help.option.detectChanges.baseRef': 'Branch/commit for compare scope (e.g. main)',
-  'help.option.compactVerbose': 'Print the full structured JSON instead of compact text',
+  'help.option.compactText': 'Print a compact text summary instead of JSON (fewer tokens for agents)',
   'help.option.detectChanges.detail':
     'Use "symbols" for a per-symbol semantic diff with breaking-change flags',
   'help.option.detectChanges.limit': 'Max changed symbols to return',
