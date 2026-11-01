@@ -123,6 +123,8 @@ export const en = {
   'remove.deleteTarget': 'This will delete the GitNexus index for: {{name}}',
   'remove.removed': 'Removed: {{name}}',
   'remove.failed': 'Failed to remove {{name}}: {{message}}',
+  'whyIgnored.notGitRepo': 'Not a git repository. Run inside one, or pass --repo <path>.',
+  'whyIgnored.outsideRepo': 'Path "{{path}}" is outside the repository {{repo}}',
   'tool.noIndexed': 'GitNexus: No indexed repositories found. Run: gitnexus analyze',
   'tool.usage.query': 'Usage: gitnexus query [search_query]  or  gitnexus query --query <text>',
   'tool.usage.context': 'Usage: gitnexus context <symbol_name> [--uid <uid>] [--file <path>]',
@@ -240,6 +242,8 @@ export const en = {
   'help.command.embeddings.install.description':
     'Install the local embedding stack (@huggingface/transformers + onnxruntime-node) on demand. The stack is not part of a default npm install. CPU installs download only from your configured npm registry — mirrors and proxies apply. `--cuda` additionally runs onnxruntime-node postinstall, which fetches CUDA binaries from NuGet (set GLOBAL_AGENT_HTTPS_PROXY behind a proxy).',
   'help.command.clean.description': 'Delete GitNexus index for current repo',
+  'help.command.whyIgnored.description':
+    'Explain whether each path is indexed and which rule excludes it',
   'help.command.remove.description':
     'Delete the GitNexus index for a registered repo (by alias, name, or absolute path). Unlike `clean`, does not require being inside the repo. Idempotent on unknown targets.',
   'help.command.wiki.description': 'Generate repository wiki from knowledge graph',
@@ -341,6 +345,8 @@ export const en = {
   'help.option.force.confirmation': 'Skip confirmation prompt',
   'help.option.uninstall.force': 'Apply the changes (default is a dry-run preview)',
   'help.option.clean.all': 'Clean all indexed repos',
+  'help.option.whyIgnored.repo':
+    'Repository root (default: the git root of the current directory)',
   'help.option.clean.branch': 'Delete only the named branch index (not the workspace index)',
   'help.option.clean.lbugSidecars':
     'Clean parked LadybugDB recovery sidecars (missing-shadow WAL quarantines and dirty-recovery parks)',

@@ -8,6 +8,7 @@ import {
   isHardcodedIgnoredDirectory,
   loadIgnoreRules,
   createIgnoreFilter,
+  createWatchIgnorePredicate,
 } from '../../src/config/ignore-service.js';
 import { _captureLogger } from '../../src/core/logger.js';
 import * as git from '../../src/storage/git.js';
@@ -71,7 +72,6 @@ describe('shouldIgnorePath', () => {
       'dist',
       'build',
       'out',
-      'output',
       'bin',
       'obj',
       'target',
@@ -82,6 +82,36 @@ describe('shouldIgnorePath', () => {
       '.turbo',
     ])('ignores %s directory', (dir) => {
       expect(shouldIgnorePath(`${dir}/bundle.js`)).toBe(true);
+    });
+  });
+
+  describe('directory names that often hold real source are not ignored by default', () => {
+    // `output`, `cache`, `logs` and `fixtures` were once in the default
+    // directory list; they routinely name real source modules (src/**/output/,
+    // logs/ loggers, fixtures/ builders), and only a !negation could bring them
+    // back. Dot-prefixed build caches (.cache, .output) remain ignored.
+    it.each(['output', 'cache', 'logs', 'fixtures'])('indexes files under %s/', (dir) => {
+      expect(shouldIgnorePath(`src/startups/${dir}/render.ts`)).toBe(false);
+      expect(shouldIgnorePath(`${dir}/render.ts`)).toBe(false);
+      expect(isHardcodedIgnoredDirectory(dir)).toBe(false);
+    });
+
+    it.each(['.output', '.cache', 'log'])('still ignores %s/', (dir) => {
+      expect(shouldIgnorePath(`${dir}/render.ts`)).toBe(true);
+    });
+
+    it('createIgnoreFilter walks into fixtures/ and output/ with no ignore files', async () => {
+      const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-ignore-defaults-'));
+      try {
+        const filter = await createIgnoreFilter(tmp);
+        const mk = (rel: string) => ({ relative: () => rel, name: rel }) as any;
+        for (const dir of ['fixtures', 'output', 'src/output', 'test/fixtures']) {
+          expect(filter.childrenIgnored(mk(dir))).toBe(false);
+          expect(filter.ignored(mk(`${dir}/a.ts`))).toBe(false);
+        }
+      } finally {
+        await fs.rm(tmp, { recursive: true, force: true });
+      }
     });
   });
 
@@ -476,6 +506,53 @@ describe('.gitnexusignore negation overrides hardcoded DEFAULT_IGNORE_LIST (#771
     // the directory-descent level, so ingestion never walks in.
     expect(filter.ignored(mkPath('__tests__/generated/foo.ts'))).toBe(true);
     expect(filter.childrenIgnored(mkPath('__tests__/generated'))).toBe(true);
+  });
+
+  describe('binary / never-index file types cannot be un-ignored', () => {
+    const png = 'docs/assets/logo.png';
+
+    it('createIgnoreFilter keeps a PNG ignored despite `!docs/assets/*.png`', async () => {
+      await fs.writeFile(path.join(tmpDir, '.gitignore'), '*.png\n!docs/assets/*.png\n');
+      const filter = await createIgnoreFilter(tmpDir);
+      expect(filter.ignored(mkPath(png))).toBe(true);
+    });
+
+    it('createIgnoreFilter keeps a PNG ignored when the negation is in .gitnexusignore', async () => {
+      await fs.writeFile(path.join(tmpDir, '.gitnexusignore'), '!docs/assets/\n!*.png\n');
+      const filter = await createIgnoreFilter(tmpDir);
+      expect(filter.ignored(mkPath(png))).toBe(true);
+    });
+
+    it('createIgnoreFilter keeps a PNG ignored when a nested .gitignore negates it', async () => {
+      await fs.mkdir(path.join(tmpDir, 'docs'), { recursive: true });
+      await fs.writeFile(path.join(tmpDir, '.gitignore'), '*.png\n');
+      await fs.writeFile(path.join(tmpDir, 'docs', '.gitignore'), '!assets/*.png\n');
+      const filter = await createIgnoreFilter(tmpDir);
+      expect(filter.ignored(mkPath(png))).toBe(true);
+    });
+
+    it('createIgnoreFilter keeps a lock file ignored despite `!package-lock.json`', async () => {
+      await fs.writeFile(path.join(tmpDir, '.gitnexusignore'), '!package-lock.json\n');
+      const filter = await createIgnoreFilter(tmpDir);
+      expect(filter.ignored(mkPath('package-lock.json'))).toBe(true);
+    });
+
+    it('createWatchIgnorePredicate keeps a PNG ignored despite `!docs/assets/*.png`', async () => {
+      await fs.writeFile(path.join(tmpDir, '.gitignore'), '*.png\n!docs/assets/*.png\n');
+      const isIgnored = await createWatchIgnorePredicate(tmpDir);
+      expect(isIgnored(png)).toBe(true);
+      expect(isIgnored(path.join(tmpDir, png))).toBe(true);
+    });
+
+    it('directory negations still re-include source files next to the PNG', async () => {
+      await fs.writeFile(path.join(tmpDir, '.gitnexusignore'), '!__tests__/\n');
+      const filter = await createIgnoreFilter(tmpDir);
+      const isIgnored = await createWatchIgnorePredicate(tmpDir);
+      expect(filter.ignored(mkPath('__tests__/a.test.ts'))).toBe(false);
+      expect(isIgnored('__tests__/a.test.ts')).toBe(false);
+      expect(filter.ignored(mkPath('__tests__/logo.png'))).toBe(true);
+      expect(isIgnored('__tests__/logo.png')).toBe(true);
+    });
   });
 
   it('shouldIgnorePath (raw hardcoded check) is unchanged — wiki / external callers unaffected', async () => {

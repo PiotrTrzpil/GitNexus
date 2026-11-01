@@ -51,6 +51,7 @@ const allHelpCommands = [
   ['update'],
   ['clean'],
   ['remove'],
+  ['why-ignored'],
   ['wiki'],
   ['augment'],
   ['publish'],

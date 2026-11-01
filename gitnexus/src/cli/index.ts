@@ -396,6 +396,12 @@ program
   .action(createLazyAction(() => import('./clean.js'), 'cleanCommand'));
 
 program
+  .command('why-ignored <paths...>')
+  .description('Explain whether each path is indexed and which rule excludes it')
+  .option('-r, --repo <path>', 'Repository root (default: the git root of the current directory)')
+  .action(createLazyAction(() => import('./why-ignored.js'), 'whyIgnoredCommand'));
+
+program
   .command('remove <target>')
   .description(
     'Delete the GitNexus index for a registered repo (by alias, name, or absolute path). ' +

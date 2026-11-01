@@ -114,6 +114,8 @@ export const zhCN = {
   'remove.deleteTarget': '将删除该仓库的 GitNexus 索引：{{name}}',
   'remove.removed': '已移除：{{name}}',
   'remove.failed': '移除 {{name}} 失败：{{message}}',
+  'whyIgnored.notGitRepo': '不是 git 仓库。请在仓库内运行，或传入 --repo <路径>。',
+  'whyIgnored.outsideRepo': '路径“{{path}}”不在仓库 {{repo}} 内',
   'tool.noIndexed': 'GitNexus：未找到已索引仓库。请运行：gitnexus analyze',
   'tool.usage.query': '用法：gitnexus query [搜索词]  或  gitnexus query --query <文本>',
   'tool.usage.context': '用法：gitnexus context <符号名> [--uid <uid>] [--file <路径>]',
@@ -226,6 +228,7 @@ export const zhCN = {
   'help.command.embeddings.install.description':
     '按需安装本地嵌入组件（@huggingface/transformers + onnxruntime-node）。默认 npm 安装不包含该组件。CPU 安装仅从你配置的 npm registry 下载 — 镜像和代理均生效。`--cuda` 还会运行 onnxruntime-node 的 postinstall，从 NuGet 获取 CUDA 二进制（代理后需设置 GLOBAL_AGENT_HTTPS_PROXY）。',
   'help.command.clean.description': '删除当前仓库的 GitNexus 索引',
+  'help.command.whyIgnored.description': '说明每个路径是否被索引，以及哪条规则将其排除',
   'help.command.remove.description':
     '删除已注册仓库的 GitNexus 索引（按别名、名称或绝对路径）。与 `clean` 不同，不要求位于仓库内；未知目标会幂等处理。',
   'help.command.wiki.description': '从知识图谱生成仓库 Wiki',
@@ -312,6 +315,7 @@ export const zhCN = {
   'help.option.force.confirmation': '跳过确认提示',
   'help.option.uninstall.force': '应用更改（默认仅为预演预览）',
   'help.option.clean.all': '清理所有已索引仓库',
+  'help.option.whyIgnored.repo': '仓库根目录（默认：当前目录所在的 git 根目录）',
   'help.option.clean.branch': '仅删除指定分支的索引（不影响工作区索引）',
   'help.option.clean.lbugSidecars':
     '清理已暂存的 LadybugDB 恢复 sidecar（missing-shadow WAL 隔离文件与 dirty-recovery 暂存文件）',
