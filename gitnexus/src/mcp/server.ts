@@ -31,6 +31,7 @@ import {
   REPO_SCOPED_TOOLS,
 } from './tools.js';
 import { installGlobalStdoutSentinel } from './stdio-context.js';
+import { armSigkillWatchdog } from '../utils/process-lifecycle.js';
 import type { LocalBackend, McpToolCallContext } from './local/local-backend.js';
 import { getResourceDefinitions, getResourceTemplates, readResource } from './resources.js';
 import {
@@ -580,6 +581,11 @@ export async function startMCPServer(
     if (shuttingDown) return;
     shuttingDown = true;
     stopParentWatch();
+    // Hard deadline on a worker thread: the timer below lives on the main
+    // thread and cannot fire if native teardown (LadybugDB's recursive
+    // QueryResult destructor) wedges it. Not disarmed on the success path:
+    // process.exit() below ends the worker with the process.
+    armSigkillWatchdog();
     // Safety net: if backend.disconnect()/server.close() hangs, still exit so a
     // SIGINT/SIGTERM reliably terminates the process. Unref'd so the timer alone
     // never keeps the event loop alive.
