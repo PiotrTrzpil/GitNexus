@@ -55,6 +55,7 @@ import { pathSuffixOf } from './path-predicate.js';
 import { isCobolFile, isJclFile } from '../../core/ingestion/cobol/file-types.js';
 import { toOneBasedLine } from '../../core/ingestion/utils/line-base.js';
 import { isTestFilePath } from '../../core/ingestion/utils/test-file-path.js';
+import { formatQualityResult, runQualityQuery, type QualityRows } from './quality-query.js';
 import { isTemplateRouteCandidate } from '../../core/ingestion/utils/template-file.js';
 import { isWalCorruptionError, WAL_RECOVERY_SUGGESTION } from '../../core/lbug/lbug-config.js';
 // Embedding imports are lazy (dynamic import) to avoid loading onnxruntime-node
@@ -3271,6 +3272,8 @@ export class LocalBackend {
         return this.shapeCheck(repo, p);
       case 'tool_map':
         return this.toolMap(repo, p);
+      case 'quality_query':
+        return this.qualityQuery(repo, p);
       case 'api_impact':
         return this.apiImpact(repo, p);
       case 'trace':
@@ -10711,6 +10714,28 @@ export class LocalBackend {
             ? `Found ${results.length} route(s) with response shape data. ${mismatchCount} route(s) have consumer/shape mismatches.`
             : `Found ${results.length} route(s) with response shape data and consumers.`,
     };
+  }
+
+  /** `quality_query`: preset Cypher over the graph; see quality-query.ts. */
+  private async qualityQuery(repo: RepoHandle, params: Record<string, unknown>): Promise<any> {
+    await this.ensureInitialized(repo);
+    if (!isLbugReady(repo.lbugPath)) {
+      return { error: 'LadybugDB not ready. Index may be corrupted.' };
+    }
+    try {
+      const result = await runQualityQuery(
+        (cypher, queryParams) =>
+          executeParameterized(repo.lbugPath, cypher, queryParams) as Promise<QualityRows>,
+        params,
+      );
+      // `format: 'json'` is for the CLI only (not in the advertised schema).
+      return this.withToolStaleness(
+        repo,
+        params.format === 'json' ? result : formatQualityResult(result),
+      );
+    } catch (err: any) {
+      return { error: err?.message || 'quality_query failed' };
+    }
   }
 
   private async toolMap(repo: RepoHandle, params: { tool?: string }): Promise<any> {

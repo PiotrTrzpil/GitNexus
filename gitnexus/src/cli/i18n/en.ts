@@ -133,6 +133,8 @@ export const en = {
   'tool.usage.trace':
     'Usage: gitnexus trace <from> <to> [-f|--file <path>] [--from-file <path>] [--to-file <path>] [--from-uid <uid>] [--to-uid <uid>] [--depth <n>]',
   'tool.usage.cypher': 'Usage: gitnexus cypher <cypher_query>',
+  'tool.usage.quality':
+    'Usage: gitnexus quality <high_complexity|dead_code|god_functions|hotspots|high_fan_out|unused_injections> [--limit <n>] [--path <prefix>] [-r <repo>]',
   'tool.warn.unknownKind':
     "--kind '{{kind}}' is not a known symbol kind (e.g. Function, Class, Method); it will not narrow the result.",
   'tool.detectChanges.noChanges': 'No changes detected.',
@@ -259,6 +261,8 @@ export const en = {
   'help.command.trace.description':
     'Find the shortest directed path between two symbols (call + class-member edges)',
   'help.command.cypher.description': 'Execute raw Cypher query against the knowledge graph',
+  'help.command.quality.description':
+    'Code-quality triage: high_complexity, dead_code, god_functions, hotspots, high_fan_out, unused_injections',
   'help.command.detectChanges.description':
     'Map git diff hunks to indexed symbols and affected execution flows',
   'help.command.check.description': 'Run structural checks against the indexed graph',
@@ -421,6 +425,8 @@ export const en = {
     'Use "symbols" for a per-symbol semantic diff with breaking-change flags',
   'help.option.detectChanges.limit': 'Max changed symbols to return',
   'help.option.cypher.limit': 'Max result rows to return',
+  'help.option.quality.limit': 'Max results (default 20)',
+  'help.option.quality.path': 'Only symbols whose file path starts with this prefix',
   'help.option.check.cycles': 'Detect circular imports and fail when any are found',
   'help.option.evalServer.host':
     'Bind address or resolvable hostname (default: 127.0.0.1; non-loopback requires GITNEXUS_AUTH_TOKEN; hostnames resolve to IPv4)',

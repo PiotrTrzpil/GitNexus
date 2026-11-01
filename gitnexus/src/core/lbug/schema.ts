@@ -52,6 +52,8 @@ CREATE NODE TABLE Function (
   content STRING,
   description STRING,
   convexEndpointFactory STRING,
+  complexity INT32,
+  sloc INT32,
   PRIMARY KEY (id)
 )`;
 
@@ -118,6 +120,8 @@ CREATE NODE TABLE Method (
   description STRING,
   parameterCount INT32,
   returnType STRING,
+  complexity INT32,
+  sloc INT32,
   PRIMARY KEY (id)
 )`;
 

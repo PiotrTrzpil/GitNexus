@@ -92,6 +92,10 @@ export type NodeProperties = {
   entryPointReason?: string;
   // Method/property
   parameterCount?: number;
+  /** Function/Method: McCabe cyclomatic complexity (absent when not computed). */
+  complexity?: number;
+  /** Function/Method: lines carrying code (comments/blank excluded). */
+  sloc?: number;
   level?: number;
   returnType?: string;
   declaredType?: string;

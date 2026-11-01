@@ -390,6 +390,28 @@ export async function cypherCommand(
   output(result);
 }
 
+export async function qualityCommand(
+  preset: string,
+  options?: { repo?: string; branch?: string; limit?: string; path?: string },
+): Promise<void> {
+  const limit = parseLimit(options?.limit);
+  if (options?.limit !== undefined && limit === undefined) {
+    cliErrorKey('tool.usage.quality');
+    process.exit(1);
+  }
+  const backend = await getBackend();
+  const result = await backend.callTool('quality_query', {
+    preset,
+    limit,
+    path: options?.path,
+    repo: options?.repo,
+    branch: options?.branch,
+    format: 'json',
+  });
+  output(result);
+  if (result?.error) process.exitCode = 1;
+}
+
 export async function detectChangesCommand(options?: {
   scope?: string;
   baseRef?: string;

@@ -30,7 +30,7 @@ describe('GITNEXUS_TOOLS', () => {
   });
 
   it('exports all tools (8 base + 1 explain + 1 pdg_query + 3 route/tool/shape + 1 api_impact + 1 trace + 2 group + read_file + grep)', () => {
-    expect(GITNEXUS_TOOLS).toHaveLength(19);
+    expect(GITNEXUS_TOOLS).toHaveLength(20);
   });
 
   it('exposes one rename tool; there is no separate rename_preview (use dry_run)', () => {

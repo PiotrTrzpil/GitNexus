@@ -559,6 +559,17 @@ program
   .action(createLbugLazyAction(() => import('./tool.js'), 'cypherCommand'));
 
 program
+  .command('quality <preset>')
+  .description(
+    'Code-quality triage: high_complexity, dead_code, god_functions, hotspots, high_fan_out, unused_injections',
+  )
+  .option('-r, --repo <name>', 'Target repository')
+  .option('--branch <name>', 'Scope to a specific branch index (multi-branch repos)')
+  .option('-l, --limit <n>', 'Max results (default 20)')
+  .option('-p, --path <prefix>', 'Only symbols whose file path starts with this prefix')
+  .action(createLbugLazyAction(() => import('./tool.js'), 'qualityCommand'));
+
+program
   .command('detect-changes')
   .alias('detect_changes')
   .description('Map git diff hunks to indexed symbols and affected execution flows')
